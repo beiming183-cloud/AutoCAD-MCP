@@ -12,9 +12,10 @@ import ezdxf
 import structlog
 
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
-from autocad_mcp.audit import audit_dxf_file, build_audit, normalize_ezdxf_entity
+from autocad_mcp.audit import INSUNITS_NAMES, audit_dxf_file, build_audit, normalize_ezdxf_entity
 from autocad_mcp.drafting import lineweight_hundredths
 from autocad_mcp.screenshot import MatplotlibScreenshotProvider
+from autocad_mcp.variables import validate_variable_updates
 
 log = structlog.get_logger()
 
@@ -138,6 +139,11 @@ class EzdxfBackend(AutoCADBackend):
                 space="model",
             )
             self._audit_fingerprints = fingerprints
+            units_code = int(self._doc.header.get("$INSUNITS", 0) or 0)
+            payload["units"] = {
+                "code": units_code,
+                "name": INSUNITS_NAMES.get(units_code, "unknown"),
+            }
             return CommandResult(ok=True, payload=payload)
         except Exception as exc:
             return CommandResult(ok=False, error=str(exc))
@@ -201,11 +207,42 @@ class EzdxfBackend(AutoCADBackend):
         result = {}
         header = self._doc.header
         for name in (names or []):
+            result_name = str(name)
+            header_name = f"${result_name.lstrip('$').upper()}"
             try:
-                result[name] = str(header[name])
+                result[result_name] = header[header_name]
             except (KeyError, ezdxf.DXFKeyError):
-                result[name] = None
+                result[result_name] = None
         return CommandResult(ok=True, payload=result)
+
+    async def drawing_set_variables(self, values: dict) -> CommandResult:
+        if not self._doc:
+            return CommandResult(ok=False, error="No document open")
+        try:
+            updates = validate_variable_updates(values)
+        except ValueError as exc:
+            return CommandResult(ok=False, error=str(exc), error_code="E_VARIABLE_REJECTED")
+        previous = {}
+        unsupported = []
+        applied = {}
+        for name, value in updates.items():
+            header_name = f"${name}"
+            try:
+                previous[name] = self._doc.header.get(header_name)
+                self._doc.header[header_name] = value
+                applied[name] = value
+            except ezdxf.DXFKeyError:
+                unsupported.append(name)
+        current = {name: self._doc.header.get(f"${name}") for name in applied}
+        return CommandResult(
+            ok=True,
+            payload={
+                "updated": current,
+                "previous": previous,
+                "unsupported": unsupported,
+                "verified": all(current[name] == value for name, value in applied.items()),
+            },
+        )
 
     # --- Entity operations ---
 

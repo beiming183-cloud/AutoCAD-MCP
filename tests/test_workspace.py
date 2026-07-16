@@ -15,6 +15,15 @@ from autocad_mcp.workspace import (
 )
 
 
+def test_default_workspace_is_portable_and_client_independent(monkeypatch):
+    from autocad_mcp.workspace import output_root
+
+    monkeypatch.delenv("AUTOCAD_MCP_OUTPUT_ROOT", raising=False)
+    root = output_root()
+    assert root.name == "AutoCAD-MCP"
+    assert root.parent.name == "Documents"
+
+
 def test_workspace_creates_standard_folders(monkeypatch, tmp_path):
     root = tmp_path / "CAD-Automation"
     monkeypatch.setenv("AUTOCAD_MCP_OUTPUT_ROOT", str(root))

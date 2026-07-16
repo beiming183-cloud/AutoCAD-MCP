@@ -3,7 +3,7 @@
 - Source: https://github.com/puran-water/autocad-mcp
 - Source commit: `95476a33a1c246308326eb4709d6379ef2efdbc1`
 - Installed: 2026-07-15
-- Runtime: bundled Codex Python 3.12 virtual environment in `.venv`
+- Runtime: Python 3.12 virtual environment in `.venv`
 
 ## Local changes
 
@@ -49,16 +49,28 @@
     AutoLISP dimensions remain available as the LT fallback.
 22. Geometry-changing operations automatically center and fit drawing extents;
     batch creation suspends intermediate fits and performs one final fit.
-23. All generated outputs are organized under `AUTOCAD_MCP_OUTPUT_ROOT`, which
-    defaults to `D:/CAD-Automation`; external output paths are contained unless
-    explicitly enabled.
+23. All generated outputs are organized under `AUTOCAD_MCP_OUTPUT_ROOT`. The
+    portable default is `~/Documents/AutoCAD-MCP`; this workstation overrides
+    it to `D:/CAD-Automation`. External output paths are contained unless enabled.
 24. `drawing.workspace` reports the managed specs, scripts, models, drawings,
     exports, reports, outputs, jobs, templates, incoming, archive, and log folders.
 25. `drawing.deliver` creates isolated industrial delivery jobs with source and
     exported-DXF audits, configurable validation gates, DWG/DXF/PDF artifacts,
     atomic manifests, and SHA-256 checksums.
+26. `system.ensure_ready` performs AutoCAD discovery/startup, active-document
+    creation, dispatcher loading, version handshake, and IPC ping without
+    misidentifying full AutoCAD as AutoCAD LT.
+27. MCP failures are emitted with `isError=true` and stable structured error
+    codes, recoverability, and recommended actions.
+28. `drawing.set_variables` safely updates a numeric whitelist; mechanical
+    setup applies millimeter, dimension, and linetype-scale defaults.
+29. Drawing and DXF audits include units, geometry digests, and line/polyline
+    DRC for zero/short segments, duplicate vertices/entities, and self-crossing.
+30. Delivery passes paper/orientation/style/scale/centering into native plotting
+    and verifies type/layer counts, bounds, units, digest, and exported DRC.
 
-## Codex registration
+## MCP client registration
 
-The server is registered as `[mcp_servers.autocad]` in the global Codex
-`config.toml`, with backend selection set to `file_ipc` on the local workstation.
+The server uses standard MCP stdio and can be registered in Codex, Claude Code,
+Claude Desktop, Cursor, or any compatible client. This workstation uses the
+`file_ipc` backend and a local D-drive output override.

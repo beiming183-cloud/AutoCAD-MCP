@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
+
+from autocad_mcp.errors import error_payload
 
 
 @dataclass
@@ -14,13 +16,23 @@ class CommandResult:
     ok: bool
     payload: Any = None
     error: str | None = None
+    error_code: str | None = None
+    recoverable: bool | None = None
+    recommended_action: str | None = None
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {"ok": self.ok}
         if self.ok:
             d["payload"] = self.payload
         else:
-            d["error"] = self.error
+            d["error"] = error_payload(
+                self.error,
+                code=self.error_code,
+                recoverable=self.recoverable,
+                recommended_action=self.recommended_action,
+            )
+            if self.payload is not None:
+                d["details"] = self.payload
         return d
 
 
@@ -78,7 +90,16 @@ class AutoCADBackend(ABC):
     async def drawing_purge(self) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
-    async def drawing_plot_pdf(self, path: str) -> CommandResult:
+    async def drawing_plot_pdf(
+        self,
+        path: str,
+        paper: str = "A4",
+        orientation: str = "auto",
+        plot_style: str = "monochrome.ctb",
+        scale_mode: str = "fit",
+        scale: str = "1:1",
+        center: bool = True,
+    ) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
     async def drawing_render_preview(
@@ -108,12 +129,16 @@ class AutoCADBackend(ABC):
     async def drawing_get_variables(self, names: list[str] | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def drawing_set_variables(self, values: dict[str, Any]) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
     async def drawing_open(self, path: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
-    async def drawing_setup_mechanical(self) -> CommandResult:
+    async def drawing_setup_mechanical(self, config: dict[str, Any] | None = None) -> CommandResult:
         """Create the standard monochrome mechanical-drafting layers."""
         from autocad_mcp.drafting import MECHANICAL_LAYERS
+        from autocad_mcp.variables import mechanical_variable_updates
 
         results = []
         for layer in MECHANICAL_LAYERS:
@@ -121,7 +146,28 @@ class AutoCADBackend(ABC):
             results.append(result.to_dict())
             if not result.ok:
                 return CommandResult(ok=False, payload={"layers": results}, error=result.error)
-        return CommandResult(ok=True, payload={"profile": "mechanical-gbt", "layers": results})
+        try:
+            updates = mechanical_variable_updates(config)
+        except ValueError as exc:
+            return CommandResult(ok=False, error=str(exc), error_code="E_VARIABLE_REJECTED")
+        variables = await self.drawing_set_variables(updates)
+        if not variables.ok:
+            return variables
+        options = dict(config or {})
+        return CommandResult(
+            ok=True,
+            payload={
+                "profile": "mechanical-gbt",
+                "standard": options.get("standard", "GB/T"),
+                "units": options.get("units", "mm"),
+                "sheet": options.get("sheet", "A3"),
+                "orientation": options.get("orientation", "landscape"),
+                "projection": options.get("projection", "first-angle"),
+                "scale": options.get("scale", "1:1"),
+                "layers": results,
+                "variables": variables.payload,
+            },
+        )
 
     async def recover(self) -> CommandResult:
         return CommandResult(ok=False, error="Recovery is not supported on this backend")

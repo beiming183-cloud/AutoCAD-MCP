@@ -45,6 +45,65 @@ def _validation_checks(audit: dict[str, Any], rules: dict[str, Any]) -> list[dic
             type_counts.get(normalized, 0),
             ">=1",
         )
+    drc = audit.get("geometry_drc") or {}
+    if drc and rules.get("require_geometry_clean", True):
+        add("geometry_drc", drc.get("status") == "PASS", drc.get("issue_count", 0), 0)
+    return checks
+
+
+def _export_checks(
+    source: dict[str, Any], exported: dict[str, Any], tolerance: float
+) -> list[dict[str, Any]]:
+    checks = []
+
+    def add(name: str, passed: bool, actual: Any, expected: Any) -> None:
+        checks.append(
+            {"name": name, "passed": bool(passed), "actual": actual, "expected": expected}
+        )
+
+    add(
+        "dxf_entity_count_matches_source",
+        exported.get("entity_count") == source.get("entity_count"),
+        exported.get("entity_count"),
+        source.get("entity_count"),
+    )
+    add(
+        "dxf_type_counts_match_source",
+        exported.get("counts_by_type") == source.get("counts_by_type"),
+        exported.get("counts_by_type"),
+        source.get("counts_by_type"),
+    )
+    add(
+        "dxf_layer_counts_match_source",
+        exported.get("counts_by_layer") == source.get("counts_by_layer"),
+        exported.get("counts_by_layer"),
+        source.get("counts_by_layer"),
+    )
+    source_bounds, exported_bounds = source.get("bounds"), exported.get("bounds")
+    if source_bounds is not None and exported_bounds is not None:
+        differences = [
+            abs(float(source_bounds[edge][axis]) - float(exported_bounds[edge][axis]))
+            for edge in ("min", "max")
+            for axis in (0, 1)
+        ]
+        add("dxf_bounds_match_source", max(differences) <= tolerance, max(differences), f"<={tolerance}")
+    if source.get("geometry_digest") and exported.get("geometry_digest"):
+        add(
+            "dxf_geometry_digest_matches_source",
+            exported["geometry_digest"] == source["geometry_digest"],
+            exported["geometry_digest"],
+            source["geometry_digest"],
+        )
+    if source.get("units") and exported.get("units"):
+        add(
+            "dxf_units_match_source",
+            exported["units"].get("code") == source["units"].get("code"),
+            exported["units"],
+            source["units"],
+        )
+    exported_drc = exported.get("geometry_drc") or {}
+    if exported_drc:
+        add("dxf_geometry_drc", exported_drc.get("status") == "PASS", exported_drc.get("issue_count"), 0)
     return checks
 
 
@@ -73,6 +132,18 @@ async def deliver_drawing(
         "manifest": root / "manifest.json",
     }
     rules = dict(request.get("validation") or {})
+    plot = dict(request.get("plot") or {})
+    metadata_sheet = str((request.get("metadata") or {}).get("sheet", ""))
+    if metadata_sheet and "paper" not in plot:
+        plot["paper"] = metadata_sheet.split()[0]
+    if "landscape" in metadata_sheet.lower() and "orientation" not in plot:
+        plot["orientation"] = "landscape"
+    plot.setdefault("paper", "A4")
+    plot.setdefault("orientation", "auto")
+    plot.setdefault("plot_style", "monochrome.ctb")
+    plot.setdefault("scale_mode", "fit")
+    plot.setdefault("scale", "1:1")
+    plot.setdefault("center", True)
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "job_id": job["job_id"],
@@ -82,6 +153,7 @@ async def deliver_drawing(
         "backend": backend.name,
         "autocad_mcp_version": __version__,
         "metadata": request.get("metadata") or {},
+        "plot": {"requested": plot, "actual": None},
         "validation": {"rules": rules, "checks": []},
         "steps": [],
         "artifacts": {},
@@ -131,9 +203,51 @@ async def deliver_drawing(
     save_dwg = await run_step("save-dwg", backend.drawing_save(str(paths["dwg"])))
     if not save_dwg.ok:
         return fail(save_dwg.error or "DWG save failed")
-    plot_pdf = await run_step("plot-pdf", backend.drawing_plot_pdf(str(paths["pdf"])))
+    plot_pdf = await run_step(
+        "plot-pdf",
+        backend.drawing_plot_pdf(
+            str(paths["pdf"]),
+            plot["paper"],
+            plot["orientation"],
+            plot["plot_style"],
+            plot["scale_mode"],
+            plot["scale"],
+            plot["center"],
+        ),
+    )
     if not plot_pdf.ok:
         return fail(plot_pdf.error or "PDF plot failed")
+    if isinstance(plot_pdf.payload, dict):
+        manifest["plot"]["actual"] = plot_pdf.payload
+        compare_keys = ["paper", "scale_mode", "center"]
+        if plot["orientation"] != "auto":
+            compare_keys.append("orientation")
+        if plot["scale_mode"] == "fixed":
+            compare_keys.append("scale")
+        for key in compare_keys:
+            if key in plot_pdf.payload:
+                expected = plot[key]
+                actual = plot_pdf.payload[key]
+                manifest["validation"]["checks"].append(
+                    {
+                        "name": f"plot_{key}_applied",
+                        "passed": actual == expected,
+                        "actual": actual,
+                        "expected": expected,
+                    }
+                )
+        if "paper_units" in plot_pdf.payload:
+            expected_units = "millimeters" if str(plot["paper"]).upper().startswith("A") else "inches"
+            manifest["validation"]["checks"].append(
+                {
+                    "name": "plot_paper_units_applied",
+                    "passed": plot_pdf.payload["paper_units"] == expected_units,
+                    "actual": plot_pdf.payload["paper_units"],
+                    "expected": expected_units,
+                }
+            )
+        if not all(check["passed"] for check in manifest["validation"]["checks"]):
+            return fail("Requested plot configuration was not applied")
     save_dxf = await run_step("save-dxf", backend.drawing_save_as_dxf(str(paths["dxf"])))
     if not save_dxf.ok:
         return fail(save_dxf.error or "DXF save failed")
@@ -145,21 +259,20 @@ async def deliver_drawing(
         return fail(dxf_audit.error or "DXF audit failed")
     write_json_atomic(paths["audit"], dxf_audit.payload)
 
-    source_count = int(audit.payload.get("entity_count", 0))
-    dxf_count = int(dxf_audit.payload.get("entity_count", 0))
-    parity = {
-        "name": "dxf_entity_count_matches_source",
-        "passed": source_count == dxf_count,
-        "actual": dxf_count,
-        "expected": source_count,
-    }
-    manifest["validation"]["checks"].append(parity)
-    if not parity["passed"]:
-        return fail("DXF entity count does not match the source drawing")
+    export_checks = _export_checks(
+        audit.payload, dxf_audit.payload, float(rules.get("geometry_tolerance", 0.000001))
+    )
+    manifest["validation"]["checks"].extend(export_checks)
+    if not all(check["passed"] for check in export_checks):
+        return fail("DXF geometry or metadata does not match the source drawing")
 
     restore = await run_step("restore-dwg", backend.drawing_save(str(paths["dwg"])))
     if not restore.ok:
         return fail(restore.error or "Failed to restore the active DWG after DXF export")
+    if isinstance(restore.payload, dict) and restore.payload.get("active_document"):
+        active_document = Path(restore.payload["active_document"]).resolve()
+        if active_document != paths["dwg"].resolve():
+            return fail("AutoCAD did not return to the primary DWG after DXF export")
 
     write_json_atomic(paths["validation"], manifest["validation"])
     for key in ("dwg", "dxf", "pdf", "audit", "request", "validation"):

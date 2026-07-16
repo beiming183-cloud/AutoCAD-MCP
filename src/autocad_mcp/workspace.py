@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_OUTPUT_ROOT = "D:/CAD-Automation"
+DEFAULT_OUTPUT_ROOT = str(Path.home() / "Documents" / "AutoCAD-MCP")
 WORKSPACE_FOLDERS = (
     "specs",
     "scripts",

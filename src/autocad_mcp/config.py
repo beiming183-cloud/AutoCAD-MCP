@@ -145,7 +145,7 @@ def detect_backend() -> str:
                 elif backend_env == "file_ipc":
                     raise RuntimeError(
                         "AUTOCAD_MCP_BACKEND=file_ipc but no AutoCAD window found. "
-                        "Start AutoCAD LT and open a .dwg file."
+                        "Start AutoCAD and open or create a drawing."
                     )
             except ImportError:
                 if backend_env == "file_ipc":

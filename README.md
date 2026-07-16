@@ -1,4 +1,4 @@
-# AutoCAD MCP Server - Codex Edition
+# AutoCAD MCP Server
 
 MCP server for full AutoCAD automation, AutoCAD LT automation, and headless DXF generation.
 
@@ -11,12 +11,12 @@ Two backends, one API:
 | **File IPC** | Windows Python | Yes - full AutoCAD or AutoCAD LT 2024+ | Structured audit + native PDF plot |
 | **ezdxf** | Any platform | No (headless) | Structured audit + deterministic PNG |
 
-The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `block`, `annotation`, `pid`, `view`, `system`) over the MCP stdio transport. An MCP client (Claude Desktop, Claude Code, etc.) connects and drives AutoCAD through natural-language requests.
+The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `block`, `annotation`, `pid`, `view`, `system`) over the standard MCP stdio transport. It is client-independent and works with Codex, Claude Code, Claude Desktop, Cursor, and other MCP-compatible clients.
 
 ## Prerequisites (File IPC backend)
 
 - **Windows 10/11** (the File IPC backend uses Win32 APIs for focus-free window messaging)
-- **AutoCAD LT 2024 or newer** — AutoLISP support was added in LT 2024 for Windows. AutoCAD LT for Mac exists but does **not** support AutoLISP.
+- **Full AutoCAD or AutoCAD LT 2024+ on Windows** - AutoLISP support was added to LT in 2024; full AutoCAD also uses the native COM path.
 - **Python 3.10+** (Windows native — not WSL Python)
 - **uv** package manager ([install guide](https://docs.astral.sh/uv/getting-started/installation/))
 
@@ -34,12 +34,12 @@ uv sync
 
 ### 2. Load the LISP dispatcher in AutoCAD
 
-Open AutoCAD LT and load `mcp_dispatch.lsp` using **APPLOAD**:
+Open AutoCAD or AutoCAD LT and load `mcp_dispatch.lsp` using **APPLOAD**:
 
 1. Type `APPLOAD` in the AutoCAD command line
 2. Browse to `<repo>/lisp-code/mcp_dispatch.lsp`
 3. Click **Load**
-4. You should see: `=== MCP Dispatch v3.5.0 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
+4. You should see: `=== MCP Dispatch v3.6.0 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
 
 > **Tip:** Add the file to your AutoCAD Startup Suite (in the APPLOAD dialog) so it loads automatically with every drawing.
 
@@ -56,6 +56,26 @@ Add to your MCP client configuration (e.g. Claude Desktop `claude_desktop_config
       "env": {
         "AUTOCAD_MCP_BACKEND": "file_ipc",
         "AUTOCAD_MCP_LISP_PATH": "C:\\path\\to\\autocad-mcp\\lisp-code\\mcp_dispatch.lsp"
+      }
+    }
+  }
+}
+```
+
+The same server command can be used in Claude Code project-level `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "autocad": {
+      "type": "stdio",
+      "command": "C:\\path\\to\\autocad-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "autocad_mcp"],
+      "env": {
+        "PYTHONPATH": "C:\\path\\to\\autocad-mcp\\src",
+        "AUTOCAD_MCP_BACKEND": "file_ipc",
+        "AUTOCAD_MCP_AUTOSTART": "true",
+        "AUTOCAD_MCP_VISIBLE": "true"
       }
     }
   }
@@ -112,10 +132,12 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 | `workspace` | Create and report the managed output workspace | Yes | Yes |
 | `deliver` | Validated DWG/DXF/PDF package with manifest and checksums | Yes | No |
 | `audit` | Compact structured entity audit with change tracking | Yes | Yes |
+| `audit_geometry` | Geometry DRC for zero/short segments, duplicate vertices/entities, and self-intersections | Yes | Yes |
 | `audit_dxf` | Parse an existing DXF into normalized JSON | Yes | Yes |
-| `setup_mechanical` | Create seven monochrome GB/T drafting layers | Yes | Yes |
+| `setup_mechanical` | Configure mm units, dimensions, sheet metadata, and seven GB/T layers | Yes | Yes |
 | `purge` | Purge unused objects | Yes | Yes |
 | `get_variables` | Get system variables by name | Yes | Yes |
+| `set_variables` | Set a bounded whitelist of units/dimension/linetype variables | Yes | Yes |
 | `undo` | Undo last operation | Yes | No |
 | `redo` | Redo last undone operation | Yes | No |
 
@@ -174,13 +196,13 @@ Normal validation is data-first: use `drawing.audit` after edits and `drawing.re
 edit entities -> drawing.audit -> native render_preview -> audit_dxf for final delivery
 ```
 
-`drawing.audit` returns entity counts by type and layer, drawing bounds, limited normalized entity geometry, and added/modified/removed handles since the previous audit. `limit` is clamped to 500 so large drawings do not flood model context. Set `changed_only=true` to return only changed entity details.
+`drawing.audit` returns entity counts by type and layer, drawing bounds, units, a handle-independent geometry digest, geometry DRC, limited normalized entity geometry, and added/modified/removed handles since the previous audit. DRC detects zero/short segments, consecutive duplicate vertices, duplicate closed endpoints, polyline self-intersections, and duplicate entities. `limit` is clamped to 500 so large drawings do not flood model context.
 
 `drawing.render_preview` uses full AutoCAD's native `PlotToFile` for PDF output, preserving plot styles and avoiding desktop/window capture. The ezdxf backend writes a deterministic PNG instead.
 
 ### Industrial delivery jobs
 
-`drawing.deliver` turns the active drawing into a traceable job rather than treating a successful script as a finished drawing. It creates an isolated folder under `jobs`, records the request under `specs`, audits the source, applies validation gates, saves DWG/DXF/PDF, audits the exported DXF, verifies entity-count parity, writes `reports/validation.json`, and records artifact sizes and SHA-256 hashes.
+`drawing.deliver` turns the active drawing into a traceable job rather than treating a successful script as a finished drawing. It creates an isolated folder under `jobs`, records the request under `specs`, audits the source, applies geometry gates, saves DWG/DXF/PDF, audits the exported DXF, compares type/layer counts, bounds, units and geometry digests, writes `reports/validation.json`, and records artifact sizes and SHA-256 hashes.
 
 ```json
 {
@@ -188,10 +210,20 @@ edit entities -> drawing.audit -> native render_preview -> audit_dxf for final d
   "data": {
     "name": "gearbox-output-shaft",
     "metadata": {"drawing_number": "GB-OS-001", "revision": "A"},
+    "plot": {
+      "paper": "A3",
+      "orientation": "landscape",
+      "plot_style": "monochrome.ctb",
+      "scale_mode": "fixed",
+      "scale": "1:1",
+      "center": true
+    },
     "validation": {
       "min_entities": 20,
       "required_layers": ["OUTLINE", "CENTER", "DIM"],
-      "required_types": ["LINE", "CIRCLE", "DIMENSION"]
+      "required_types": ["LINE", "CIRCLE", "DIMENSION"],
+      "require_geometry_clean": true,
+      "geometry_tolerance": 0.000001
     }
   }
 }
@@ -201,14 +233,18 @@ The job contains `specs/request.json`, `manifest.json`, editable DWG and DXF fil
 
 ### Industrial automation roadmap
 
-- **v3.5 foundation (complete):** visible AutoCAD execution, automatic centered views, structured batches, managed D-drive jobs, native PDF, DXF re-audit, validation gates, manifests, and checksums.
-- **v3.6 specifications:** versioned JSON drawing specifications, template/title-block registry, units and standards declarations, drawing-number/revision rules, and spec-to-audit comparison.
-- **v3.7 orchestration:** transaction boundaries, rollback, idempotency keys, resumable job states, bounded retries, structured logs, and a local job queue.
+- **v3.6 reliability (complete):** self-healing startup, dispatcher version handshake, machine-readable MCP failures, controlled variables, geometry DRC, DXF units/digests, and enforced plot configuration.
+- **v3.7 specifications:** versioned JSON drawing specifications, template/title-block registry, units and standards declarations, drawing-number/revision rules, and spec-to-audit comparison.
+- **v3.8 orchestration:** transaction boundaries, rollback, idempotency keys, resumable job states, bounded retries, structured logs, and a local job queue.
 - **v4.0 hybrid CAD:** FreeCAD CLI/MCP as the parameterized 3D and STEP executor, AutoCAD as the visible DWG/2D drafting and release executor, with shared specs and acceptance reports.
 
 ### `system` — Server management
 
-`status`, `health`, `get_backend`, `runtime`, `init`, `recover`, `execute_lisp`
+`status`, `ensure_ready`, `health`, `get_backend`, `runtime`, `init`, `recover`, `execute_lisp`
+
+`status` is observational and does not start AutoCAD. `ensure_ready` performs the full discovery/start/document/dispatcher/version/ping sequence and reports the detected AutoCAD product without assuming AutoCAD LT.
+
+Tool failures use MCP `isError=true` and a stable structure containing `code`, `message`, `recoverable`, and `recommended_action`.
 
 `recover` cancels stale AutoCAD command-line state and removes abandoned IPC files without calling the potentially blocked dispatcher. Arbitrary AutoLISP remains disabled unless `AUTOCAD_MCP_ALLOW_ARBITRARY_LISP=true` is explicitly configured.
 
@@ -243,7 +279,7 @@ The File IPC backend sends `(c:mcp-dispatch)` to the active drawing. Full AutoCA
 | `AUTOCAD_MCP_VISIBLE` | `true` | Keep the AutoCAD window shown and restore it before drawing |
 | `AUTOCAD_MCP_ACTIVATE_ON_DRAW` | `false` | Bring AutoCAD to the foreground before each structured drawing command |
 | `AUTOCAD_MCP_AUTO_FIT` | `true` | Automatically center and fit drawing extents after geometry changes |
-| `AUTOCAD_MCP_OUTPUT_ROOT` | `D:/CAD-Automation` | Unified root for specs, scripts, models, drawings, reports, outputs, jobs, templates, logs, and archives |
+| `AUTOCAD_MCP_OUTPUT_ROOT` | `~/Documents/AutoCAD-MCP` | Unified root for specs, scripts, models, drawings, reports, outputs, jobs, templates, logs, and archives |
 | `AUTOCAD_MCP_ALLOW_EXTERNAL_OUTPUTS` | `false` | Permit writes outside the managed output root; disabled by default |
 | `AUTOCAD_MCP_ACAD_EXE` | empty | Full path to `acad.exe` used by automatic startup |
 | `AUTOCAD_MCP_ACAD_SCRIPT` | empty | Optional AutoCAD `.scr` file passed with `/b` during startup |
@@ -273,9 +309,18 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 
 The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
 
-## What's New in v3.5
+## What's New in v3.6
 
-- **Unified managed workspace** - output paths default to `D:/CAD-Automation` with standard folders for drawings, DXF, PDF, previews, audits, jobs, templates, incoming files, archives, and logs.
+- **Self-healing readiness** - `system.ensure_ready` discovers or starts AutoCAD, ensures an active document, loads the configured or bundled dispatcher, verifies its version, and pings IPC.
+- **Structured MCP errors** - failures are marked `isError=true` and use stable error codes such as `E_DISPATCHER_NOT_LOADED`, `E_IPC_TIMEOUT`, and `E_OUTPUT_PATH_REJECTED`.
+- **Safe variable updates** - `drawing.set_variables` exposes a validated whitelist; `setup_mechanical` now applies millimeter and dimension defaults in addition to layers.
+- **Geometry DRC** - source and exported DXF audits detect zero/short segments, duplicate vertices/endpoints/entities, and polyline self-intersections.
+- **Stronger DXF evidence** - audits report `$INSUNITS` and a handle-independent geometry digest; delivery compares types, layers, bounds, units, digest, and DRC.
+- **Enforced plotting** - `plot_pdf` and `deliver` apply and record paper, orientation, plot style, fixed/fit scale, centering, device, media, and paper units.
+
+### v3.5
+
+- **Unified managed workspace** - output paths default to the portable `~/Documents/AutoCAD-MCP`; each client can override it with `AUTOCAD_MCP_OUTPUT_ROOT` (for example `D:/CAD-Automation`).
 - **Output containment** - save/export paths outside the managed root are redirected unless external outputs are explicitly enabled.
 - **Validated delivery jobs** - `drawing.deliver` produces DWG, DXF, PDF, request/audit JSON, a step manifest, validation results, file sizes, and SHA-256 checksums.
 - **Quality gates** - delivery can require minimum/maximum entity counts plus required layers and entity types, and rejects DXF exports whose entity count differs from the source.

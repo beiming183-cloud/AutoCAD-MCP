@@ -2,10 +2,13 @@
 
 from pathlib import Path
 from unittest.mock import MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
 from autocad_mcp import config
+from autocad_mcp.backends.base import CommandResult
+from autocad_mcp.backends.file_ipc import FileIPCBackend
 
 
 def test_autostart_is_opt_in(monkeypatch):
@@ -46,3 +49,40 @@ def test_autostart_launches_and_waits(monkeypatch, tmp_path: Path):
         [str(executable), "/nologo", "/b", str(startup_script)],
         cwd=str(executable.parent),
     )
+
+
+async def test_file_ipc_ensure_ready_loads_and_version_checks_dispatcher(monkeypatch, tmp_path):
+    import autocad_mcp.backends.file_ipc as file_ipc
+
+    backend = FileIPCBackend()
+    backend._ipc_dir = tmp_path / "ipc"
+    monkeypatch.setattr(file_ipc, "find_autocad_window", lambda: 123)
+    monkeypatch.setattr(backend, "_ensure_autocad_visible", lambda: {"shown": True})
+    monkeypatch.setattr(backend, "_ensure_active_document", lambda: {"ready": True, "name": "Drawing1.dwg"})
+    monkeypatch.setattr(
+        backend,
+        "_discover_product",
+        lambda: {"installed": True, "product": "AutoCAD 2025", "version": "25.0", "exe": "acad.exe"},
+    )
+    monkeypatch.setattr(backend, "_find_command_line_hwnd", lambda: None)
+    monkeypatch.setattr(backend, "_cleanup_stale_files", lambda: None)
+    typed = []
+    monkeypatch.setattr(backend, "_type_command", typed.append)
+    monkeypatch.setattr(
+        backend,
+        "_dispatch",
+        AsyncMock(
+            return_value=CommandResult(
+                ok=True, payload={"pong": True, "dispatcher_version": "3.6.0"}
+            )
+        ),
+    )
+    monkeypatch.delenv("AUTOCAD_MCP_LISP_PATH", raising=False)
+
+    result = await backend.ensure_ready()
+
+    assert result.ok is True
+    assert result.payload["ready"] is True
+    assert result.payload["autocad"]["product"] == "AutoCAD 2025"
+    assert result.payload["dispatcher"]["version"] == "3.6.0"
+    assert typed and "mcp_dispatch.lsp" in typed[0]

@@ -1,6 +1,6 @@
 [project]
 name = "autocad-mcp"
-version = "3.5.0"
+version = "3.6.0"
 description = "MCP server for full AutoCAD, AutoCAD LT, and headless DXF generation"
 readme = "README.md"
 license = "MIT"

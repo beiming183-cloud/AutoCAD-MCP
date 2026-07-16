@@ -1,3 +1,3 @@
-"""AutoCAD MCP Server v3.5.0 with validated industrial delivery jobs."""
+"""AutoCAD MCP Server v3.6.0 with self-healing startup and geometry DRC."""
 
-__version__ = "3.5.0"
+__version__ = "3.6.0"

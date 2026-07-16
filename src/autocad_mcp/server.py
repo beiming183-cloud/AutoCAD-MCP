@@ -5,6 +5,8 @@ Tools: drawing, entity, layer, block, annotation, pid, view, system
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 from mcp.server.fastmcp import FastMCP
 
@@ -13,14 +15,16 @@ from autocad_mcp.client import (
     _json,
     _safe,
     add_screenshot_if_available,
+    ensure_backend_ready,
     get_backend,
+    tool_error,
 )
 from autocad_mcp.delivery import deliver_drawing
 from autocad_mcp.workspace import resolve_output_target, workspace_info
 
 # FastMCP validates return types via Pydantic. Tools that may return
 # ImageContent (screenshot) alongside TextContent need a union return type.
-ToolResult = str | list
+ToolResult = Any
 
 log = structlog.get_logger()
 
@@ -56,6 +60,8 @@ async def drawing(
       setup_mechanical — Create the seven monochrome GB/T mechanical-drafting layers.
       purge      — Purge unused objects.
       get_variables — Get system variables. data: {names: [...]}
+      set_variables — Safely set whitelisted system variables. data: {values: {...}}
+      audit_geometry — Run line/polyline geometry DRC and return structured findings.
       undo       — Undo last operation.
       redo       — Redo last undone operation.
     """
@@ -94,7 +100,15 @@ async def drawing(
             extension=".pdf",
             default_stem=data.get("name", "drawing"),
         )
-        result = await backend.drawing_plot_pdf(str(target.path))
+        result = await backend.drawing_plot_pdf(
+            str(target.path),
+            data.get("paper", "A4"),
+            data.get("orientation", "auto"),
+            data.get("plot_style", "monochrome.ctb"),
+            data.get("scale_mode", "fit"),
+            data.get("scale", "1:1"),
+            data.get("center", True),
+        )
     elif operation == "render_preview":
         extension = ".pdf" if backend.name == "file_ipc" else ".png"
         target = resolve_output_target(
@@ -111,7 +125,7 @@ async def drawing(
         )
     elif operation == "deliver":
         result = await deliver_drawing(backend, data)
-    elif operation == "audit":
+    elif operation in ("audit", "audit_geometry"):
         result = await backend.drawing_audit(
             data.get("limit", 50),
             data.get("include_entities", True),
@@ -124,11 +138,13 @@ async def drawing(
             data["path"], data.get("limit", 50), data.get("include_entities", True)
         )
     elif operation == "setup_mechanical":
-        result = await backend.drawing_setup_mechanical()
+        result = await backend.drawing_setup_mechanical(data)
     elif operation == "purge":
         result = await backend.drawing_purge()
     elif operation == "get_variables":
         result = await backend.drawing_get_variables(data.get("names"))
+    elif operation == "set_variables":
+        result = await backend.drawing_set_variables(data.get("values") or data)
     elif operation == "open":
         result = await backend.drawing_open(data["path"])
     elif operation == "undo":
@@ -136,7 +152,9 @@ async def drawing(
     elif operation == "redo":
         result = await backend.redo()
     else:
-        return _json({"error": f"Unknown drawing operation: {operation}"})
+        return tool_error(
+            f"Unknown drawing operation: {operation}", code="E_UNSUPPORTED_OPERATION"
+        )
 
     return await add_screenshot_if_available(result, include_screenshot)
 
@@ -249,7 +267,7 @@ async def entity(
     elif operation == "erase":
         result = await backend.entity_erase(entity_id)
     else:
-        return _json({"error": f"Unknown entity operation: {operation}"})
+        return tool_error(f"Unknown entity operation: {operation}", code="E_UNSUPPORTED_OPERATION")
 
     return await add_screenshot_if_available(result, include_screenshot)
 
@@ -303,7 +321,7 @@ async def layer(
     elif operation == "unlock":
         result = await backend.layer_unlock(data["name"])
     else:
-        return _json({"error": f"Unknown layer operation: {operation}"})
+        return tool_error(f"Unknown layer operation: {operation}", code="E_UNSUPPORTED_OPERATION")
 
     return await add_screenshot_if_available(result, include_screenshot)
 
@@ -352,7 +370,7 @@ async def block(
     elif operation == "define":
         result = await backend.block_define(data["name"], data.get("entities", []))
     else:
-        return _json({"error": f"Unknown block operation: {operation}"})
+        return tool_error(f"Unknown block operation: {operation}", code="E_UNSUPPORTED_OPERATION")
 
     return await add_screenshot_if_available(result, include_screenshot)
 
@@ -406,7 +424,9 @@ async def annotation(
     elif operation == "create_leader":
         result = await backend.create_leader(data["points"], data["text"])
     else:
-        return _json({"error": f"Unknown annotation operation: {operation}"})
+        return tool_error(
+            f"Unknown annotation operation: {operation}", code="E_UNSUPPORTED_OPERATION"
+        )
 
     return await add_screenshot_if_available(result, include_screenshot)
 
@@ -482,7 +502,7 @@ async def pid(
             data.get("scale", 1.0), data.get("attributes"),
         )
     else:
-        return _json({"error": f"Unknown pid operation: {operation}"})
+        return tool_error(f"Unknown pid operation: {operation}", code="E_UNSUPPORTED_OPERATION")
 
     return await add_screenshot_if_available(result, include_screenshot)
 
@@ -532,7 +552,7 @@ async def view(
             ]
         return _json(result.to_dict())
     else:
-        return _json({"error": f"Unknown view operation: {operation}"})
+        return tool_error(f"Unknown view operation: {operation}", code="E_UNSUPPORTED_OPERATION")
 
 
 # ==========================================================================
@@ -551,6 +571,7 @@ async def system(
 
     Operations:
       status        — Backend info, capabilities, health check.
+      ensure_ready  — Discover/start AutoCAD, open a document, load/version-check dispatcher, ping IPC.
       health        — Quick health check (ping backend).
       get_backend   — Return current backend name and capabilities.
       runtime       — Return process/runtime details for spawn diagnostics.
@@ -560,17 +581,43 @@ async def system(
     """
     data = data or {}
 
-    if operation == "status" or operation == "get_backend":
+    if operation == "status":
+        from autocad_mcp import client
+
+        if client._backend is None:
+            import os
+
+            return _json(
+                {
+                    "ok": True,
+                    "payload": {
+                        "initialized": False,
+                        "ready": False,
+                        "backend_env": os.environ.get("AUTOCAD_MCP_BACKEND", "auto"),
+                        "recommended_action": "system.ensure_ready",
+                    },
+                }
+            )
+        result = await client._backend.status()
+        return await add_screenshot_if_available(result, include_screenshot)
+    elif operation == "get_backend":
         backend = await get_backend()
         result = await backend.status()
         return await add_screenshot_if_available(result, include_screenshot)
+    elif operation == "ensure_ready":
+        result = await ensure_backend_ready()
+        return await add_screenshot_if_available(result, include_screenshot)
     elif operation == "health":
-        try:
-            backend = await get_backend()
-            result = await backend.status()
-            return _json({"ok": result.ok, "backend": backend.name})
-        except Exception as e:
-            return _json({"ok": False, "error": str(e)})
+        from autocad_mcp import client
+
+        if client._backend is None:
+            return tool_error(
+                "Backend is not initialized",
+                code="E_AUTOCAD_NOT_RUNNING",
+                recommended_action="system.ensure_ready",
+            )
+        result = await client._backend.status()
+        return await add_screenshot_if_available(result, False)
     elif operation == "runtime":
         import os
         import sys
@@ -589,9 +636,8 @@ async def system(
         # Force re-initialization
         from autocad_mcp import client
         client._backend = None
-        backend = await get_backend()
-        result = await backend.status()
-        return _json(result.to_dict())
+        result = await ensure_backend_ready()
+        return await add_screenshot_if_available(result, include_screenshot)
     elif operation == "recover":
         backend = await get_backend()
         result = await backend.recover()
@@ -604,21 +650,18 @@ async def system(
             "true",
             "yes",
         ):
-            return _json(
-                {
-                    "error": (
-                        "Arbitrary AutoLISP execution is disabled. Set "
-                        "AUTOCAD_MCP_ALLOW_ARBITRARY_LISP=true to enable it."
-                    )
-                }
+            return tool_error(
+                "Arbitrary AutoLISP execution is disabled. Set "
+                "AUTOCAD_MCP_ALLOW_ARBITRARY_LISP=true to enable it.",
+                code="E_UNSUPPORTED_OPERATION",
             )
         backend = await get_backend()
         if not data.get("code"):
-            return _json({"error": "data.code is required"})
+            return tool_error("data.code is required", code="E_UNSUPPORTED_OPERATION")
         result = await backend.execute_lisp(data["code"])
         return await add_screenshot_if_available(result, include_screenshot)
     else:
-        return _json({"error": f"Unknown system operation: {operation}"})
+        return tool_error(f"Unknown system operation: {operation}", code="E_UNSUPPORTED_OPERATION")
 
 
 # ==========================================================================

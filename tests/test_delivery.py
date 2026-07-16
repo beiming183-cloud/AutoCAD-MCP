@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
-from autocad_mcp.delivery import deliver_drawing
+from autocad_mcp.delivery import _export_checks, deliver_drawing
 
 
 class FakeDeliveryBackend(AutoCADBackend):
@@ -53,10 +53,29 @@ class FakeDeliveryBackend(AutoCADBackend):
             return CommandResult(ok=False, error="save failed")
         return self._write(path, b"DWG")
 
-    async def drawing_plot_pdf(self, path):
+    async def drawing_plot_pdf(
+        self,
+        path,
+        paper="A4",
+        orientation="auto",
+        plot_style="monochrome.ctb",
+        scale_mode="fit",
+        scale="1:1",
+        center=True,
+    ):
         if self.fail_step == "pdf":
             return CommandResult(ok=False, error="plot failed")
-        return self._write(path, b"PDF")
+        result = self._write(path, b"PDF")
+        result.payload.update(
+            paper=paper,
+            orientation=orientation,
+            plot_style=plot_style,
+            scale_mode=scale_mode,
+            scale=scale if scale_mode == "fixed" else "fit",
+            center=center,
+            paper_units="millimeters" if paper.upper().startswith("A") else "inches",
+        )
+        return result
 
     async def drawing_save_as_dxf(self, path):
         if self.fail_step == "dxf":
@@ -133,3 +152,47 @@ async def test_delivery_records_backend_failure(monkeypatch, tmp_path):
     assert manifest["status"] == "failed"
     assert manifest["steps"][-1]["name"] == "plot-pdf"
     assert manifest["steps"][-1]["error"] == "plot failed"
+
+
+@pytest.mark.asyncio
+async def test_delivery_applies_a3_fixed_scale(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUTOCAD_MCP_OUTPUT_ROOT", str(tmp_path / "CAD-Automation"))
+
+    result = await deliver_drawing(
+        FakeDeliveryBackend(),
+        {
+            "name": "a3-release",
+            "plot": {
+                "paper": "A3",
+                "orientation": "landscape",
+                "scale_mode": "fixed",
+                "scale": "1:1",
+                "center": True,
+            },
+        },
+    )
+
+    assert result.ok is True
+    manifest = json.loads(Path(result.payload["manifest"]).read_text(encoding="utf-8"))
+    assert manifest["plot"]["actual"]["paper"] == "A3"
+    assert manifest["plot"]["actual"]["scale"] == "1:1"
+    assert manifest["plot"]["actual"]["paper_units"] == "millimeters"
+    assert all(check["passed"] for check in manifest["validation"]["checks"])
+
+
+def test_export_checks_compare_types_layers_bounds_digest_and_units():
+    source = {
+        "entity_count": 2,
+        "counts_by_type": {"LINE": 2},
+        "counts_by_layer": {"OUTLINE": 2},
+        "bounds": {"min": [0, 0], "max": [10, 5]},
+        "geometry_digest": "abc",
+        "units": {"code": 4, "name": "millimeters"},
+    }
+    exported = dict(source, geometry_digest="different")
+
+    checks = _export_checks(source, exported, 0.000001)
+
+    assert next(item for item in checks if item["name"] == "dxf_geometry_digest_matches_source")[
+        "passed"
+    ] is False

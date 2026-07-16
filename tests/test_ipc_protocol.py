@@ -35,7 +35,9 @@ class TestCommandResult:
         r = CommandResult(ok=False, error="Entity not found")
         d = r.to_dict()
         assert d["ok"] is False
-        assert d["error"] == "Entity not found"
+        assert d["error"]["message"] == "Entity not found"
+        assert d["error"]["code"] == "E_INTERNAL"
+        assert d["error"]["recoverable"] is True
         assert "payload" not in d
 
     def test_default_values(self):
@@ -45,6 +47,20 @@ class TestCommandResult:
         d = r.to_dict()
         assert d["ok"] is True
         assert d["payload"] is None
+
+    def test_mcp_failure_is_marked_is_error(self):
+        from autocad_mcp.client import _format_result
+
+        result = _format_result(
+            CommandResult(
+                ok=False,
+                error="AutoCAD is running but the dispatcher is unavailable",
+                error_code="E_DISPATCHER_NOT_LOADED",
+            )
+        )
+
+        assert result.isError is True
+        assert result.structuredContent["error"]["code"] == "E_DISPATCHER_NOT_LOADED"
 
 
 # ---------------------------------------------------------------------------
@@ -577,3 +593,19 @@ class TestVerifiedPdfPlot:
 
         assert result.ok is False
         assert "no non-empty PDF" in result.error
+
+
+def test_dispatch_trigger_refuses_persistently_busy_command_state(monkeypatch):
+    from autocad_mcp.backends.file_ipc import FileIPCBackend
+
+    backend = FileIPCBackend()
+    monkeypatch.setattr(backend, "_ensure_autocad_visible", lambda activate=False: {})
+    monkeypatch.setattr(backend, "_wait_for_autocad_idle", MagicMock(side_effect=[False, False]))
+    cancel = MagicMock()
+    typed = MagicMock()
+    monkeypatch.setattr(backend, "_cancel_active_command", cancel)
+    monkeypatch.setattr(backend, "_type_command", typed)
+
+    assert backend._type_dispatch_trigger() is False
+    cancel.assert_called_once()
+    typed.assert_not_called()

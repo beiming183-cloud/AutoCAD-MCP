@@ -14,6 +14,7 @@ import asyncio
 import json
 import math
 import os
+import re
 import sys
 import time
 import uuid
@@ -21,10 +22,12 @@ from pathlib import Path
 
 import structlog
 
-from autocad_mcp.audit import audit_dxf_file, build_audit
+from autocad_mcp import __version__
+from autocad_mcp.audit import INSUNITS_NAMES, audit_dxf_file, build_audit
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
-from autocad_mcp.config import IPC_DIR, IPC_TIMEOUT, LISP_DIR
+from autocad_mcp.config import IPC_DIR, IPC_TIMEOUT, LISP_DIR, _autostart_autocad
 from autocad_mcp.drafting import encode_autocad_text
+from autocad_mcp.variables import mechanical_variable_updates, validate_variable_updates
 
 log = structlog.get_logger()
 
@@ -190,7 +193,7 @@ def _com_entity_to_dict(entity) -> dict:
 
 
 class FileIPCBackend(AutoCADBackend):
-    """File-based IPC with AutoCAD LT via mcp_dispatch.lsp."""
+    """File IPC for full AutoCAD and AutoCAD LT via mcp_dispatch.lsp."""
 
     def __init__(self):
         self._hwnd: int | None = None
@@ -201,6 +204,8 @@ class FileIPCBackend(AutoCADBackend):
         self._audit_revision = 0
         self._audit_fingerprints: dict[str, str] | None = None
         self._suspend_auto_fit = 0
+        self._dispatcher_version: str | None = None
+        self._product_info: dict = {}
 
     @property
     def name(self) -> str:
@@ -222,13 +227,35 @@ class FileIPCBackend(AutoCADBackend):
         )
 
     async def initialize(self) -> CommandResult:
-        """Find AutoCAD window and verify dispatcher is loaded."""
+        """Make AutoCAD and its versioned dispatcher ready for commands."""
+        return await self.ensure_ready()
+
+    async def ensure_ready(self) -> CommandResult:
+        """Discover, start, connect, load, handshake, and ping AutoCAD."""
         self._hwnd = find_autocad_window()
         if not self._hwnd:
-            return CommandResult(ok=False, error="AutoCAD LT window not found")
+            try:
+                self._hwnd = _autostart_autocad(find_autocad_window)
+            except Exception as exc:
+                return CommandResult(ok=False, error=str(exc))
+        if not self._hwnd:
+            return CommandResult(
+                ok=False,
+                error="AutoCAD is not running and automatic startup is unavailable",
+                error_code="E_AUTOCAD_NOT_RUNNING",
+            )
 
         visibility = self._ensure_autocad_visible()
         log.info("autocad_visibility", **visibility)
+
+        document = self._ensure_active_document()
+        if not document["ready"]:
+            return CommandResult(
+                ok=False,
+                error=document["error"],
+                error_code="E_NO_ACTIVE_DOCUMENT",
+            )
+        self._product_info = self._discover_product()
 
         # Set up screenshot provider
         try:
@@ -248,27 +275,72 @@ class FileIPCBackend(AutoCADBackend):
         # Clean up stale IPC files
         self._cleanup_stale_files()
 
-        # Optionally load the known dispatcher for this AutoCAD session only.
-        autoload_path = os.environ.get("AUTOCAD_MCP_LISP_PATH", "").strip()
-        if autoload_path:
-            normalized_path = autoload_path.replace("\\", "/")
-            self._type_command(f'(load "{normalized_path}")')
-            await asyncio.sleep(0.5)
+        candidates = []
+        configured = os.environ.get("AUTOCAD_MCP_LISP_PATH", "").strip()
+        if configured:
+            candidates.append(Path(configured).expanduser())
+        bundled = LISP_DIR / "mcp_dispatch.lsp"
+        if bundled not in candidates:
+            candidates.append(bundled)
 
-        # Ping the dispatcher to verify it's loaded
-        result = await self._dispatch("ping", {})
-        if not result.ok:
-            lisp_path = str(LISP_DIR / "mcp_dispatch.lsp").replace("\\", "/")
+        last_result = None
+        loaded_path = None
+        self._dispatcher_version = None
+        for candidate in candidates:
+            if not candidate.is_file():
+                continue
+            normalized_path = str(candidate.resolve()).replace("\\", "/")
+            self._type_command(f'(load "{normalized_path}")')
+            await asyncio.sleep(0.75)
+            self._wait_for_autocad_idle(timeout=10.0)
+            last_result = await self._dispatch("ping", {})
+            version = (
+                last_result.payload.get("dispatcher_version")
+                if last_result.ok and isinstance(last_result.payload, dict)
+                else None
+            )
+            if version == __version__:
+                self._dispatcher_version = version
+                loaded_path = str(candidate.resolve())
+                break
+
+        if not last_result or not last_result.ok:
             return CommandResult(
                 ok=False,
-                error=(
-                    "AutoCAD LT detected but mcp_dispatch.lsp not loaded.\n"
-                    f'In AutoCAD command line, type:\n  (load "{lisp_path}")\n'
-                    "Or add lisp-code/ to trusted paths for auto-loading."
-                ),
+                error="AutoCAD is running but the MCP dispatcher could not be loaded or pinged",
+                error_code="E_DISPATCHER_NOT_LOADED",
+            )
+        if self._dispatcher_version != __version__:
+            actual = (
+                last_result.payload.get("dispatcher_version")
+                if isinstance(last_result.payload, dict)
+                else "unknown"
+            )
+            return CommandResult(
+                ok=False,
+                error=f"Dispatcher version mismatch: expected {__version__}, received {actual}",
+                error_code="E_DISPATCHER_VERSION_MISMATCH",
             )
 
-        return CommandResult(ok=True, payload={"backend": "file_ipc", "hwnd": self._hwnd})
+        return CommandResult(
+            ok=True,
+            payload={
+                "autocad": {
+                    **self._product_info,
+                    "running": True,
+                    "hwnd": self._hwnd,
+                    "active_document": document["name"],
+                },
+                "dispatcher": {
+                    "loaded": True,
+                    "version": self._dispatcher_version,
+                    "path": loaded_path,
+                },
+                "transport": "file_ipc",
+                "ready": True,
+                "visibility": visibility,
+            },
+        )
 
     async def status(self) -> CommandResult:
         info = {
@@ -279,8 +351,61 @@ class FileIPCBackend(AutoCADBackend):
             "visibility": self._window_visibility_status(),
             "auto_fit": os.environ.get("AUTOCAD_MCP_AUTO_FIT", "true").lower()
             in ("1", "true", "yes", "on"),
+            "autocad": self._product_info or self._discover_product(),
+            "dispatcher": {
+                "loaded": self._dispatcher_version is not None,
+                "version": self._dispatcher_version,
+                "expected_version": __version__,
+            },
+            "ready": bool(self._hwnd and self._dispatcher_version == __version__),
         }
         return CommandResult(ok=True, payload=info)
+
+    def _discover_product(self) -> dict:
+        executable = os.environ.get("AUTOCAD_MCP_ACAD_EXE", "").strip()
+        product = None
+        version = None
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            product = str(getattr(application, "Name", "AutoCAD"))
+            version = str(getattr(application, "Version", ""))
+        except Exception:
+            pass
+        if executable:
+            match = re.search(r"AutoCAD\s+(\d{4})", executable, re.IGNORECASE)
+            if match:
+                product = f"AutoCAD {match.group(1)}"
+        installed = bool(executable and Path(executable).is_file()) or bool(self._hwnd)
+        return {
+            "installed": installed,
+            "product": product or "AutoCAD",
+            "version": version,
+            "exe": executable or None,
+        }
+
+    def _ensure_active_document(self) -> dict:
+        deadline = time.monotonic() + 10.0
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                import pythoncom
+                import win32com.client
+
+                pythoncom.CoInitialize()
+                application = win32com.client.GetActiveObject("AutoCAD.Application")
+                if int(application.Documents.Count) == 0:
+                    application.Documents.Add()
+                document = application.ActiveDocument
+                document.Activate()
+                return {"ready": True, "name": str(document.Name)}
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.25)
+        return {"ready": False, "error": f"No active document after retry: {last_error}"}
 
     # --- IPC dispatch ---
 
@@ -309,8 +434,13 @@ class FileIPCBackend(AutoCADBackend):
             tmp_file.write_text(json.dumps(payload), encoding="utf-8")
             tmp_file.rename(cmd_file)
 
-            # Type the fixed dispatch trigger
-            self._type_dispatch_trigger()
+            # Type the fixed dispatch trigger only after AutoCAD reaches idle.
+            if not self._type_dispatch_trigger():
+                return CommandResult(
+                    ok=False,
+                    error="AutoCAD command state remained blocked after cancellation",
+                    error_code="E_COMMAND_STATE_BLOCKED",
+                )
 
             # Poll for result
             deadline = time.time() + TIMEOUT
@@ -346,6 +476,7 @@ class FileIPCBackend(AutoCADBackend):
                     f"Timeout waiting for result (request_id={request_id}); "
                     "AutoCAD command state was cancelled and IPC files were cleaned"
                 ),
+                error_code="E_IPC_TIMEOUT",
             )
 
         finally:
@@ -376,7 +507,7 @@ class FileIPCBackend(AutoCADBackend):
         except Exception:
             return None
 
-    def _type_dispatch_trigger(self):
+    def _type_dispatch_trigger(self) -> bool:
         """Post '(c:mcp-dispatch)' + Enter via WM_CHAR to MDIClient — no focus steal.
 
         Sends ESC keystrokes first to cancel any stale pending command
@@ -386,10 +517,12 @@ class FileIPCBackend(AutoCADBackend):
             activate=os.environ.get("AUTOCAD_MCP_ACTIVATE_ON_DRAW", "false").lower()
             in ("1", "true", "yes", "on")
         )
-        if not self._wait_for_autocad_idle(timeout=1.5):
+        if not self._wait_for_autocad_idle(timeout=5.0):
             self._cancel_active_command()
-            self._wait_for_autocad_idle(timeout=1.0)
+            if not self._wait_for_autocad_idle(timeout=2.0):
+                return False
         self._type_command("(c:mcp-dispatch)")
+        return True
 
     def _wait_for_autocad_idle(self, timeout: float = 2.0) -> bool:
         """Wait for AutoCAD to finish unwinding the previous dispatched command."""
@@ -689,12 +822,46 @@ class FileIPCBackend(AutoCADBackend):
     async def drawing_purge(self) -> CommandResult:
         return await self._dispatch("drawing-purge", {})
 
-    async def drawing_setup_mechanical(self) -> CommandResult:
-        return await self._dispatch("drawing-setup-mechanical", {})
-
-    async def drawing_plot_pdf(self, path: str) -> CommandResult:
+    async def drawing_setup_mechanical(self, config: dict | None = None) -> CommandResult:
+        layers = await self._dispatch("drawing-setup-mechanical", {})
+        if not layers.ok:
+            return layers
         try:
-            payload = self._plot_preview_via_com(path, "A4", "auto", "monochrome.ctb")
+            variables = await self.drawing_set_variables(mechanical_variable_updates(config))
+        except ValueError as exc:
+            return CommandResult(ok=False, error=str(exc), error_code="E_VARIABLE_REJECTED")
+        if not variables.ok:
+            return variables
+        options = dict(config or {})
+        return CommandResult(
+            ok=True,
+            payload={
+                "profile": "mechanical-gbt",
+                "standard": options.get("standard", "GB/T"),
+                "units": options.get("units", "mm"),
+                "sheet": options.get("sheet", "A3"),
+                "orientation": options.get("orientation", "landscape"),
+                "projection": options.get("projection", "first-angle"),
+                "scale": options.get("scale", "1:1"),
+                "layers": layers.payload,
+                "variables": variables.payload,
+            },
+        )
+
+    async def drawing_plot_pdf(
+        self,
+        path: str,
+        paper: str = "A4",
+        orientation: str = "auto",
+        plot_style: str = "monochrome.ctb",
+        scale_mode: str = "fit",
+        scale: str = "1:1",
+        center: bool = True,
+    ) -> CommandResult:
+        try:
+            payload = self._plot_preview_via_com(
+                path, paper, orientation, plot_style, scale_mode, scale, center
+            )
             return CommandResult(ok=True, payload=payload)
         except Exception as com_error:
             result = await self._dispatch("drawing-plot-pdf", {"path": path})
@@ -747,10 +914,29 @@ class FileIPCBackend(AutoCADBackend):
         )
         self._audit_fingerprints = fingerprints
         payload["source"] = source
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            document = win32com.client.GetActiveObject("AutoCAD.Application").ActiveDocument
+            units_code = int(document.GetVariable("INSUNITS"))
+            payload["units"] = {
+                "code": units_code,
+                "name": INSUNITS_NAMES.get(units_code, "unknown"),
+            }
+            payload["drawing_variables"] = {
+                name: document.GetVariable(name)
+                for name in ("INSUNITS", "LUNITS", "LUPREC", "DIMTXT", "DIMASZ")
+            }
+        except Exception as metadata_error:
+            payload.setdefault("warnings", []).append(
+                f"Drawing unit metadata unavailable: {metadata_error}"
+            )
         if source == "autolisp-fallback":
-            payload["warnings"] = [
+            payload.setdefault("warnings", []).append(
                 "AutoLISP fallback has limited geometry fields; full AutoCAD COM provides deeper auditing."
-            ]
+            )
         return CommandResult(ok=True, payload=payload)
 
     async def drawing_audit_dxf(self, path, limit=50, include_entities=True) -> CommandResult:
@@ -766,7 +952,9 @@ class FileIPCBackend(AutoCADBackend):
         self, path, paper="A4", orientation="auto", plot_style="monochrome.ctb"
     ) -> CommandResult:
         try:
-            payload = self._plot_preview_via_com(path, paper, orientation, plot_style)
+            payload = self._plot_preview_via_com(
+                path, paper, orientation, plot_style, "fit", "1:1", True
+            )
             return CommandResult(ok=True, payload=payload)
         except Exception as com_error:
             fallback = await self.drawing_plot_pdf(path)
@@ -787,6 +975,42 @@ class FileIPCBackend(AutoCADBackend):
         else:
             names_str = ""
         return await self._dispatch("drawing-get-variables", {"names_str": names_str})
+
+    async def drawing_set_variables(self, values: dict) -> CommandResult:
+        try:
+            updates = validate_variable_updates(values)
+        except ValueError as exc:
+            return CommandResult(ok=False, error=str(exc), error_code="E_VARIABLE_REJECTED")
+        document = None
+        previous = {}
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            document = win32com.client.GetActiveObject("AutoCAD.Application").ActiveDocument
+            previous = {name: document.GetVariable(name) for name in updates}
+            for name, value in updates.items():
+                document.SetVariable(name, value)
+            current = {name: document.GetVariable(name) for name in updates}
+            return CommandResult(
+                ok=True,
+                payload={"updated": current, "previous": previous, "verified": True},
+            )
+        except Exception as exc:
+            rolled_back = []
+            if document is not None:
+                for name, value in previous.items():
+                    try:
+                        document.SetVariable(name, value)
+                        rolled_back.append(name)
+                    except Exception:
+                        pass
+            return CommandResult(
+                ok=False,
+                error=f"Failed to set system variables: {exc}",
+                payload={"rolled_back": rolled_back},
+            )
 
     async def drawing_open(self, path: str) -> CommandResult:
         result = await self._dispatch("drawing-open", {"path": path})
@@ -809,13 +1033,23 @@ class FileIPCBackend(AutoCADBackend):
         output = Path(path).expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         if file_type is None:
-            document.SaveAs(str(output))
+            inferred_type = 64 if output.suffix.lower() == ".dwg" else None
+            if inferred_type is None:
+                document.SaveAs(str(output))
+            else:
+                document.SaveAs(str(output), inferred_type)
         else:
             document.SaveAs(str(output), file_type)
         if not output.exists():
             raise RuntimeError(f"AutoCAD SaveAs completed but file is missing: {output}")
+        active_path = Path(str(document.FullName)).expanduser().resolve()
+        if os.path.normcase(str(active_path)) != os.path.normcase(str(output)):
+            raise RuntimeError(
+                f"AutoCAD SaveAs did not activate the requested output: {active_path} != {output}"
+            )
         return {
             "path": str(output),
+            "active_document": str(active_path),
             "format": output.suffix.lower().lstrip("."),
             "renderer": "autocad-com-saveas",
         }
@@ -836,7 +1070,9 @@ class FileIPCBackend(AutoCADBackend):
             entities.append(_com_entity_to_dict(entity))
         return entities
 
-    def _plot_preview_via_com(self, path, paper, orientation, plot_style) -> dict:
+    def _plot_preview_via_com(
+        self, path, paper, orientation, plot_style, scale_mode="fit", scale="1:1", center=True
+    ) -> dict:
         import pythoncom
         import win32com.client
 
@@ -853,9 +1089,11 @@ class FileIPCBackend(AutoCADBackend):
         for name in (
             "ConfigName",
             "CanonicalMediaName",
+            "PaperUnits",
             "PlotType",
             "UseStandardScale",
             "StandardScale",
+            "CustomScale",
             "CenterPlot",
             "PlotRotation",
             "StyleSheet",
@@ -882,10 +1120,29 @@ class FileIPCBackend(AutoCADBackend):
             )
             if media:
                 layout.CanonicalMediaName = media
+            plot_paper_units = "millimeters" if str(paper).upper().startswith("A") else "inches"
+            layout.PaperUnits = 1 if plot_paper_units == "millimeters" else 0
             layout.PlotType = 1  # acExtents
-            layout.UseStandardScale = True
-            layout.StandardScale = 0  # acScaleToFit
-            layout.CenterPlot = True
+            selected_scale_mode = str(scale_mode).lower()
+            if selected_scale_mode == "fit":
+                layout.UseStandardScale = True
+                layout.StandardScale = 0  # acScaleToFit
+                actual_scale = "fit"
+            elif selected_scale_mode == "fixed":
+                try:
+                    scale_paper_units, scale_drawing_units = [
+                        float(item) for item in str(scale).split(":", 1)
+                    ]
+                except (TypeError, ValueError, ZeroDivisionError) as exc:
+                    raise ValueError("Fixed plot scale must use paper:drawing form, e.g. 1:1") from exc
+                if scale_paper_units <= 0 or scale_drawing_units <= 0:
+                    raise ValueError("Fixed plot scale values must be positive")
+                layout.UseStandardScale = False
+                layout.SetCustomScale(scale_paper_units, scale_drawing_units)
+                actual_scale = f"{scale_paper_units:g}:{scale_drawing_units:g}"
+            else:
+                raise ValueError("scale_mode must be fit or fixed")
+            layout.CenterPlot = bool(center)
 
             selected_orientation = orientation.lower()
             if selected_orientation == "auto":
@@ -918,8 +1175,15 @@ class FileIPCBackend(AutoCADBackend):
                 "format": "pdf",
                 "renderer": "autocad-plot",
                 "paper": paper,
+                "media": str(media) if media else None,
+                "paper_units": plot_paper_units,
                 "orientation": selected_orientation,
                 "plot_style": plot_style,
+                "scale_mode": selected_scale_mode,
+                "scale": actual_scale,
+                "center": bool(center),
+                "plot_type": "extents",
+                "device": "DWG To PDF.pc3",
             }
         finally:
             for name, value in saved.items():

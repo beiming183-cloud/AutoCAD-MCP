@@ -9,10 +9,11 @@ import json
 from typing import Any
 
 import structlog
-from mcp.types import ImageContent, TextContent
+from mcp.types import CallToolResult, ImageContent, TextContent
 
 from autocad_mcp.backends.base import AutoCADBackend, CommandResult
-from autocad_mcp.config import ONLY_TEXT_FEEDBACK, detect_backend
+from autocad_mcp.config import ONLY_TEXT_FEEDBACK, _current_backend_env, detect_backend
+from autocad_mcp.errors import error_payload
 
 log = structlog.get_logger()
 
@@ -33,7 +34,6 @@ async def get_backend() -> AutoCADBackend:
     global _backend
     if _backend is not None:
         return _backend
-
     async with _init_lock:
         # Double-check after acquiring lock (another task may have initialized)
         if _backend is not None:
@@ -63,6 +63,26 @@ async def get_backend() -> AutoCADBackend:
         return _backend
 
 
+async def ensure_backend_ready() -> CommandResult:
+    """Self-heal the configured backend without conflating status with initialization."""
+    global _backend
+    if _current_backend_env() == "ezdxf":
+        backend = await get_backend()
+        status = await backend.status()
+        if status.ok and isinstance(status.payload, dict):
+            status.payload["ready"] = True
+        return status
+
+    async with _init_lock:
+        from autocad_mcp.backends.file_ipc import FileIPCBackend
+
+        backend = _backend if isinstance(_backend, FileIPCBackend) else FileIPCBackend()
+        result = await backend.ensure_ready()
+        if result.ok:
+            _backend = backend
+        return result
+
+
 # ---------------------------------------------------------------------------
 # JSON serialization helper
 # ---------------------------------------------------------------------------
@@ -78,13 +98,42 @@ def _json(data: Any) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _error(e: Exception, context: str = "") -> str:
+def tool_error(
+    message: str,
+    *,
+    code: str | None = None,
+    context: str = "",
+    recoverable: bool | None = None,
+    recommended_action: str | None = None,
+    details: Any = None,
+) -> CallToolResult:
+    full_message = f"[{context}] {message}" if context else message
+    payload = {
+        "ok": False,
+        "error": error_payload(
+            full_message,
+            code=code,
+            recoverable=recoverable,
+            recommended_action=recommended_action,
+        ),
+    }
+    if details is not None:
+        payload["details"] = details
+    serialized = _json(payload)
+    return CallToolResult(
+        content=[TextContent(type="text", text=serialized)],
+        structuredContent=payload,
+        isError=True,
+    )
+
+
+def _error(e: Exception, context: str = "") -> CallToolResult:
     """Format an exception with an actionable hint."""
     msg = str(e)
     msg_lower = msg.lower()
 
     if "window not found" in msg_lower or "no autocad" in msg_lower:
-        hint = "AutoCAD LT is not running or no drawing is open. Start AutoCAD and open a .dwg file."
+        hint = "AutoCAD is not running or no drawing is open. Use system.ensure_ready."
     elif "timeout" in msg_lower:
         hint = "Command timed out. AutoCAD may be in a modal dialog. Press ESC in AutoCAD and retry."
     elif "not supported" in msg_lower or "backend" in msg_lower:
@@ -94,7 +143,7 @@ def _error(e: Exception, context: str = "") -> str:
     else:
         hint = "Unexpected error. Check AutoCAD is responsive and retry."
 
-    return _json({"error": f"[{context}] {msg}" if context else msg, "hint": hint})
+    return tool_error(msg, context=context, recommended_action=hint)
 
 
 # ---------------------------------------------------------------------------
@@ -129,13 +178,20 @@ def _format_result(
     result: CommandResult,
     include_screenshot: bool = False,
     screenshot_data: str | None = None,
-) -> list[TextContent | ImageContent] | str:
+) -> list[TextContent | ImageContent] | str | CallToolResult:
     """Format a CommandResult for MCP response.
 
     Returns a list with TextContent + optional ImageContent if screenshot requested,
     or a plain JSON string if no screenshot.
     """
     text = _json(result.to_dict())
+
+    if not result.ok:
+        return CallToolResult(
+            content=[TextContent(type="text", text=text)],
+            structuredContent=result.to_dict(),
+            isError=True,
+        )
 
     if not include_screenshot or ONLY_TEXT_FEEDBACK or not screenshot_data:
         return text
@@ -153,8 +209,10 @@ def _format_result(
 async def add_screenshot_if_available(
     result: CommandResult,
     include_screenshot: bool = False,
-) -> list[TextContent | ImageContent] | str:
+) -> list[TextContent | ImageContent] | str | CallToolResult:
     """Conditionally append a screenshot to the result."""
+    if not result.ok:
+        return _format_result(result)
     if not include_screenshot or ONLY_TEXT_FEEDBACK:
         return _json(result.to_dict())
 
