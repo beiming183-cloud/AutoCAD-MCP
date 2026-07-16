@@ -470,6 +470,7 @@ async def view(
     Operations:
       zoom_extents   — Zoom to show all entities.
       zoom_window    — Zoom to window: x1, y1, x2, y2
+      show_window    — Restore and activate the AutoCAD window.
       get_screenshot — Diagnostic-only window capture. Prefer drawing.render_preview.
     """
     backend = await get_backend()
@@ -479,6 +480,9 @@ async def view(
         return _json(result.to_dict())
     elif operation == "zoom_window":
         result = await backend.zoom_window(x1, y1, x2, y2)
+        return _json(result.to_dict())
+    elif operation == "show_window":
+        result = await backend.show_window(activate=True)
         return _json(result.to_dict())
     elif operation == "get_screenshot":
         result = await backend.get_screenshot()

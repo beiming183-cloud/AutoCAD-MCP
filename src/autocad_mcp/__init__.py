@@ -1,3 +1,3 @@
-"""AutoCAD MCP Server v3.4 with resilient structured drafting workflows."""
+"""AutoCAD MCP Server v3.4.1 with visible structured drafting workflows."""
 
-__version__ = "3.4.0"
+__version__ = "3.4.1"

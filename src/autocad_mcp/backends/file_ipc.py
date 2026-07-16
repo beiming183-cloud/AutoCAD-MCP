@@ -226,6 +226,9 @@ class FileIPCBackend(AutoCADBackend):
         if not self._hwnd:
             return CommandResult(ok=False, error="AutoCAD LT window not found")
 
+        visibility = self._ensure_autocad_visible()
+        log.info("autocad_visibility", **visibility)
+
         # Set up screenshot provider
         try:
             from autocad_mcp.screenshot import Win32ScreenshotProvider
@@ -272,6 +275,7 @@ class FileIPCBackend(AutoCADBackend):
             "hwnd": self._hwnd,
             "ipc_dir": str(self._ipc_dir),
             "capabilities": {k: v for k, v in self.capabilities.__dict__.items()},
+            "visibility": self._window_visibility_status(),
         }
         return CommandResult(ok=True, payload=info)
 
@@ -371,8 +375,77 @@ class FileIPCBackend(AutoCADBackend):
         Sends ESC keystrokes first to cancel any stale pending command
         (e.g. from a previous timeout leaving AutoCAD in a command prompt).
         """
+        self._ensure_autocad_visible(
+            activate=os.environ.get("AUTOCAD_MCP_ACTIVATE_ON_DRAW", "false").lower()
+            in ("1", "true", "yes", "on")
+        )
         self._cancel_active_command()
         self._type_command("(c:mcp-dispatch)")
+
+    def _window_visibility_status(self) -> dict:
+        configured = os.environ.get("AUTOCAD_MCP_VISIBLE", "true").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        status = {"configured_visible": configured, "hwnd": self._hwnd}
+        if sys.platform == "win32" and self._hwnd:
+            try:
+                import win32gui
+
+                status.update(
+                    visible=bool(win32gui.IsWindowVisible(self._hwnd)),
+                    minimized=bool(win32gui.IsIconic(self._hwnd)),
+                )
+            except Exception:
+                pass
+        return status
+
+    def _ensure_autocad_visible(self, activate: bool = False) -> dict:
+        """Show and restore AutoCAD so drawing actions can be watched live."""
+        configured = os.environ.get("AUTOCAD_MCP_VISIBLE", "true").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if not configured:
+            return {"configured_visible": False, "shown": False}
+
+        transport = "win32"
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            application.Visible = True
+            self._hwnd = int(application.HWND) or self._hwnd
+            application.Update()
+            transport = "autocad-com"
+        except Exception:
+            pass
+
+        if sys.platform == "win32" and self._hwnd:
+            try:
+                import win32con
+                import win32gui
+
+                win32gui.ShowWindow(self._hwnd, win32con.SW_RESTORE)
+                if activate:
+                    try:
+                        win32gui.SetForegroundWindow(self._hwnd)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        return {
+            "configured_visible": True,
+            "shown": bool(self._hwnd),
+            "activated": bool(activate),
+            "transport": transport,
+        }
 
     def _cancel_active_command(self) -> str:
         """Cancel command-line state without requiring the IPC dispatcher."""
@@ -441,19 +514,25 @@ class FileIPCBackend(AutoCADBackend):
         """Use full AutoCAD's COM API before falling back to window messages."""
         if sys.platform != "win32":
             return False
-        try:
-            import pythoncom
-            import win32com.client
+        deadline = time.time() + 5.0
+        while True:
+            try:
+                import pythoncom
+                import win32com.client
 
-            pythoncom.CoInitialize()
-            application = win32com.client.GetActiveObject("AutoCAD.Application")
-            document = application.ActiveDocument
-            document.SendCommand(command + "\n")
-            log.debug("command_sent_via_com")
-            return True
-        except Exception as exc:
-            log.debug("com_command_unavailable", error=str(exc))
-            return False
+                pythoncom.CoInitialize()
+                application = win32com.client.GetActiveObject("AutoCAD.Application")
+                document = application.ActiveDocument
+                document.SendCommand(command + "\n")
+                log.debug("command_sent_via_com")
+                return True
+            except Exception as exc:
+                hresult = getattr(exc, "hresult", exc.args[0] if exc.args else None)
+                if hresult == -2147418111 and time.time() < deadline:
+                    time.sleep(0.25)
+                    continue
+                log.debug("com_command_unavailable", error=str(exc))
+                return False
 
     def _cleanup_stale_files(self):
         """Remove stale IPC files from previous sessions."""
@@ -974,6 +1053,9 @@ class FileIPCBackend(AutoCADBackend):
 
     async def zoom_window(self, x1, y1, x2, y2) -> CommandResult:
         return await self._dispatch("zoom-window", {"x1": x1, "y1": y1, "x2": x2, "y2": y2})
+
+    async def show_window(self, activate: bool = True) -> CommandResult:
+        return CommandResult(ok=True, payload=self._ensure_autocad_visible(activate=activate))
 
     async def get_screenshot(self) -> CommandResult:
         if self._screenshot_provider:

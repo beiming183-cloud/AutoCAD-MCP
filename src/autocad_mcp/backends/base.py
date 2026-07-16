@@ -431,6 +431,9 @@ class AutoCADBackend(ABC):
     async def zoom_window(self, x1: float, y1: float, x2: float, y2: float) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def show_window(self, activate: bool = True) -> CommandResult:
+        return CommandResult(ok=False, error="Window display is not supported on this backend")
+
     async def get_screenshot(self) -> CommandResult:
         """Return base64 PNG in payload."""
         return CommandResult(ok=False, error="Not supported on this backend")

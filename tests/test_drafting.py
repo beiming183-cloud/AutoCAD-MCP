@@ -71,3 +71,12 @@ async def test_file_ipc_encodes_text_before_dispatch():
     assert result.ok
     assert captured["command"] == "create-text"
     assert captured["params"]["text"] == r"\U+8F93\U+51FA\U+8F74"
+
+
+def test_file_ipc_visibility_can_be_disabled(monkeypatch):
+    backend = FileIPCBackend()
+    monkeypatch.setenv("AUTOCAD_MCP_VISIBLE", "false")
+
+    result = backend._ensure_autocad_visible(activate=True)
+
+    assert result == {"configured_visible": False, "shown": False}

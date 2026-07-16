@@ -39,6 +39,10 @@
     to command-driven saving.
 17. Hidden automation sessions fall back to AutoCAD's COM `HWND`, and DXF
     audits normalize `TEXT` and `MTEXT` heights without cross-type lookups.
+18. AutoCAD is visible by default, can be brought to the foreground before
+    every drawing command, and exposes `view.show_window` for manual restore.
+19. Transient COM call rejection while AutoCAD is still loading is retried for
+    up to five seconds before falling back to window-message delivery.
 
 ## Codex registration
 

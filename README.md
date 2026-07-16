@@ -39,7 +39,7 @@ Open AutoCAD LT and load `mcp_dispatch.lsp` using **APPLOAD**:
 1. Type `APPLOAD` in the AutoCAD command line
 2. Browse to `<repo>/lisp-code/mcp_dispatch.lsp`
 3. Click **Load**
-4. You should see: `=== MCP Dispatch v3.1 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
+4. You should see: `=== MCP Dispatch v3.4.1 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
 
 > **Tip:** Add the file to your AutoCAD Startup Suite (in the APPLOAD dialog) so it loads automatically with every drawing.
 
@@ -210,6 +210,8 @@ The File IPC backend sends `(c:mcp-dispatch)` to the active drawing. Full AutoCA
 | `AUTOCAD_MCP_IPC_TIMEOUT` | `10.0` | IPC command timeout in seconds (1-300) |
 | `AUTOCAD_MCP_ONLY_TEXT` | `true` | Disable automatic screenshot attachments; direct diagnostic capture remains available |
 | `AUTOCAD_MCP_AUTOSTART` | `false` | Start AutoCAD automatically when File IPC is requested and no AutoCAD window exists |
+| `AUTOCAD_MCP_VISIBLE` | `true` | Keep the AutoCAD window shown and restore it before drawing |
+| `AUTOCAD_MCP_ACTIVATE_ON_DRAW` | `false` | Bring AutoCAD to the foreground before each structured drawing command |
 | `AUTOCAD_MCP_ACAD_EXE` | empty | Full path to `acad.exe` used by automatic startup |
 | `AUTOCAD_MCP_ACAD_SCRIPT` | empty | Optional AutoCAD `.scr` file passed with `/b` during startup |
 | `AUTOCAD_MCP_ACAD_STARTUP_TIMEOUT` | `75` | Seconds to wait for the AutoCAD main window, clamped to 5-180 |
@@ -249,6 +251,8 @@ The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
 - **Native save path** - full AutoCAD saves DWG/DXF through COM first and uses the AutoLISP command path only as a fallback.
 - **Automation-session discovery** - hidden AutoCAD instances can be found through their COM window handle when no visible main window is available.
 - **TEXT audit fix** - final DXF audits read `TEXT` and `MTEXT` heights through their correct entity-specific attributes.
+- **Live visible drawing** - AutoCAD is restored before drawing by default; optional foreground activation and `view.show_window` make automation observable in real time.
+- **Startup busy retry** - transient COM call rejection during AutoCAD startup is retried briefly before the Win32 fallback is used.
 
 ### v3.3
 
