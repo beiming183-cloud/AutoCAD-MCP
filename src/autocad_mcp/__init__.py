@@ -1,3 +1,3 @@
-"""AutoCAD MCP Server v3.4.3 with automatic centered viewport fitting."""
+"""AutoCAD MCP Server v3.5.0 with validated industrial delivery jobs."""
 
-__version__ = "3.4.3"
+__version__ = "3.5.0"

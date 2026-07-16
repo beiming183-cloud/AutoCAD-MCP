@@ -49,6 +49,14 @@
     AutoLISP dimensions remain available as the LT fallback.
 22. Geometry-changing operations automatically center and fit drawing extents;
     batch creation suspends intermediate fits and performs one final fit.
+23. All generated outputs are organized under `AUTOCAD_MCP_OUTPUT_ROOT`, which
+    defaults to `D:/CAD-Automation`; external output paths are contained unless
+    explicitly enabled.
+24. `drawing.workspace` reports the managed specs, scripts, models, drawings,
+    exports, reports, outputs, jobs, templates, incoming, archive, and log folders.
+25. `drawing.deliver` creates isolated industrial delivery jobs with source and
+    exported-DXF audits, configurable validation gates, DWG/DXF/PDF artifacts,
+    atomic manifests, and SHA-256 checksums.
 
 ## Codex registration
 

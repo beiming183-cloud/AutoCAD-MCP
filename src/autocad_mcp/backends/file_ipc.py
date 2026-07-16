@@ -693,7 +693,21 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("drawing-setup-mechanical", {})
 
     async def drawing_plot_pdf(self, path: str) -> CommandResult:
-        return await self._dispatch("drawing-plot-pdf", {"path": path})
+        try:
+            payload = self._plot_preview_via_com(path, "A4", "auto", "monochrome.ctb")
+            return CommandResult(ok=True, payload=payload)
+        except Exception as com_error:
+            result = await self._dispatch("drawing-plot-pdf", {"path": path})
+            output = Path(path).expanduser().resolve()
+            if result.ok and output.is_file() and output.stat().st_size > 0:
+                payload = result.payload if isinstance(result.payload, dict) else {"path": str(output)}
+                payload.update(renderer="autolisp-plot", warning=f"COM plot unavailable: {com_error}")
+                return CommandResult(ok=True, payload=payload)
+            fallback_error = result.error or "AutoLISP reported success but no non-empty PDF was created"
+            return CommandResult(
+                ok=False,
+                error=f"COM plot failed: {com_error}; AutoLISP plot failed: {fallback_error}",
+            )
 
     async def drawing_audit(
         self,
@@ -890,8 +904,15 @@ class FileIPCBackend(AutoCADBackend):
                 except Exception:
                     pass
             plotted = bool(document.Plot.PlotToFile(str(output), "DWG To PDF.pc3"))
-            if not plotted and not output.exists():
-                raise RuntimeError("AutoCAD PlotToFile returned false")
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if output.is_file() and output.stat().st_size > 0:
+                    break
+                time.sleep(0.1)
+            if not output.is_file() or output.stat().st_size <= 0:
+                raise RuntimeError(
+                    f"AutoCAD PlotToFile returned {plotted} but no non-empty PDF was created"
+                )
             return {
                 "path": str(output),
                 "format": "pdf",

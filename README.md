@@ -39,7 +39,7 @@ Open AutoCAD LT and load `mcp_dispatch.lsp` using **APPLOAD**:
 1. Type `APPLOAD` in the AutoCAD command line
 2. Browse to `<repo>/lisp-code/mcp_dispatch.lsp`
 3. Click **Load**
-4. You should see: `=== MCP Dispatch v3.4.3 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
+4. You should see: `=== MCP Dispatch v3.5.0 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
 
 > **Tip:** Add the file to your AutoCAD Startup Suite (in the APPLOAD dialog) so it loads automatically with every drawing.
 
@@ -109,6 +109,8 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 | `save_as_dxf` | Export as DXF | Yes | Yes |
 | `plot_pdf` | Plot to PDF | Yes | No |
 | `render_preview` | Native PDF preview or deterministic headless PNG | Yes | Yes |
+| `workspace` | Create and report the managed output workspace | Yes | Yes |
+| `deliver` | Validated DWG/DXF/PDF package with manifest and checksums | Yes | No |
 | `audit` | Compact structured entity audit with change tracking | Yes | Yes |
 | `audit_dxf` | Parse an existing DXF into normalized JSON | Yes | Yes |
 | `setup_mechanical` | Create seven monochrome GB/T drafting layers | Yes | Yes |
@@ -176,6 +178,34 @@ edit entities -> drawing.audit -> native render_preview -> audit_dxf for final d
 
 `drawing.render_preview` uses full AutoCAD's native `PlotToFile` for PDF output, preserving plot styles and avoiding desktop/window capture. The ezdxf backend writes a deterministic PNG instead.
 
+### Industrial delivery jobs
+
+`drawing.deliver` turns the active drawing into a traceable job rather than treating a successful script as a finished drawing. It creates an isolated folder under `jobs`, records the request under `specs`, audits the source, applies validation gates, saves DWG/DXF/PDF, audits the exported DXF, verifies entity-count parity, writes `reports/validation.json`, and records artifact sizes and SHA-256 hashes.
+
+```json
+{
+  "operation": "deliver",
+  "data": {
+    "name": "gearbox-output-shaft",
+    "metadata": {"drawing_number": "GB-OS-001", "revision": "A"},
+    "validation": {
+      "min_entities": 20,
+      "required_layers": ["OUTLINE", "CENTER", "DIM"],
+      "required_types": ["LINE", "CIRCLE", "DIMENSION"]
+    }
+  }
+}
+```
+
+The job contains `specs/request.json`, `manifest.json`, editable DWG and DXF files, a native PDF, `audits/drawing-audit.json`, and `reports/validation.json`. Failed validation or export leaves a failed manifest with step-level diagnostics.
+
+### Industrial automation roadmap
+
+- **v3.5 foundation (complete):** visible AutoCAD execution, automatic centered views, structured batches, managed D-drive jobs, native PDF, DXF re-audit, validation gates, manifests, and checksums.
+- **v3.6 specifications:** versioned JSON drawing specifications, template/title-block registry, units and standards declarations, drawing-number/revision rules, and spec-to-audit comparison.
+- **v3.7 orchestration:** transaction boundaries, rollback, idempotency keys, resumable job states, bounded retries, structured logs, and a local job queue.
+- **v4.0 hybrid CAD:** FreeCAD CLI/MCP as the parameterized 3D and STEP executor, AutoCAD as the visible DWG/2D drafting and release executor, with shared specs and acceptance reports.
+
 ### `system` — Server management
 
 `status`, `health`, `get_backend`, `runtime`, `init`, `recover`, `execute_lisp`
@@ -213,6 +243,8 @@ The File IPC backend sends `(c:mcp-dispatch)` to the active drawing. Full AutoCA
 | `AUTOCAD_MCP_VISIBLE` | `true` | Keep the AutoCAD window shown and restore it before drawing |
 | `AUTOCAD_MCP_ACTIVATE_ON_DRAW` | `false` | Bring AutoCAD to the foreground before each structured drawing command |
 | `AUTOCAD_MCP_AUTO_FIT` | `true` | Automatically center and fit drawing extents after geometry changes |
+| `AUTOCAD_MCP_OUTPUT_ROOT` | `D:/CAD-Automation` | Unified root for specs, scripts, models, drawings, reports, outputs, jobs, templates, logs, and archives |
+| `AUTOCAD_MCP_ALLOW_EXTERNAL_OUTPUTS` | `false` | Permit writes outside the managed output root; disabled by default |
 | `AUTOCAD_MCP_ACAD_EXE` | empty | Full path to `acad.exe` used by automatic startup |
 | `AUTOCAD_MCP_ACAD_SCRIPT` | empty | Optional AutoCAD `.scr` file passed with `/b` during startup |
 | `AUTOCAD_MCP_ACAD_STARTUP_TIMEOUT` | `75` | Seconds to wait for the AutoCAD main window, clamped to 5-180 |
@@ -241,7 +273,14 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 
 The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
 
-## What's New in v3.4
+## What's New in v3.5
+
+- **Unified managed workspace** - output paths default to `D:/CAD-Automation` with standard folders for drawings, DXF, PDF, previews, audits, jobs, templates, incoming files, archives, and logs.
+- **Output containment** - save/export paths outside the managed root are redirected unless external outputs are explicitly enabled.
+- **Validated delivery jobs** - `drawing.deliver` produces DWG, DXF, PDF, request/audit JSON, a step manifest, validation results, file sizes, and SHA-256 checksums.
+- **Quality gates** - delivery can require minimum/maximum entity counts plus required layers and entity types, and rejects DXF exports whose entity count differs from the source.
+
+### v3.4
 
 - **Prompt-free layer management** - common center and hidden linetypes are created or loaded without opening an interactive linetype prompt.
 - **Mechanical drafting profile** - `drawing.setup_mechanical` creates `OUTLINE`, `THIN`, `CENTER`, `HIDDEN`, `HATCH`, `DIM`, and `TEXT` with monochrome GB/T lineweights.

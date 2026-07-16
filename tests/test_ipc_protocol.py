@@ -536,3 +536,44 @@ class TestVariableNameStripping:
         names = None
         names_str = "" if not names else ";".join(names)
         assert names_str == ""
+
+
+class TestVerifiedPdfPlot:
+    @pytest.mark.asyncio
+    async def test_plot_pdf_prefers_native_com(self, monkeypatch, tmp_path):
+        from autocad_mcp.backends.file_ipc import FileIPCBackend
+
+        backend = FileIPCBackend()
+        output = tmp_path / "drawing.pdf"
+        monkeypatch.setattr(
+            backend,
+            "_plot_preview_via_com",
+            lambda *args: {"path": str(output), "renderer": "autocad-plot"},
+        )
+
+        result = await backend.drawing_plot_pdf(str(output))
+
+        assert result.ok is True
+        assert result.payload["renderer"] == "autocad-plot"
+
+    @pytest.mark.asyncio
+    async def test_plot_pdf_rejects_lisp_false_success(self, monkeypatch, tmp_path):
+        from autocad_mcp.backends.base import CommandResult
+        from autocad_mcp.backends.file_ipc import FileIPCBackend
+
+        backend = FileIPCBackend()
+        output = tmp_path / "missing.pdf"
+
+        def fail_com(*args):
+            raise RuntimeError("COM unavailable")
+
+        async def fake_dispatch(command, params):
+            return CommandResult(ok=True, payload={"path": params["path"]})
+
+        monkeypatch.setattr(backend, "_plot_preview_via_com", fail_com)
+        monkeypatch.setattr(backend, "_dispatch", fake_dispatch)
+
+        result = await backend.drawing_plot_pdf(str(output))
+
+        assert result.ok is False
+        assert "no non-empty PDF" in result.error

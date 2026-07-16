@@ -15,6 +15,8 @@ from autocad_mcp.client import (
     add_screenshot_if_available,
     get_backend,
 )
+from autocad_mcp.delivery import deliver_drawing
+from autocad_mcp.workspace import resolve_output_target, workspace_info
 
 # FastMCP validates return types via Pydantic. Tools that may return
 # ImageContent (screenshot) alongside TextContent need a union return type.
@@ -47,6 +49,8 @@ async def drawing(
       save_as_dxf — Export as DXF. data: {path}
       plot_pdf   — Plot to PDF. data: {path}
       render_preview — Native deterministic preview. data: {path, paper?, orientation?, plot_style?}
+      workspace  — Show the managed output workspace and folder layout.
+      deliver    — Build a validated DWG/DXF/PDF job with audits and SHA-256 checksums.
       audit      — Structured drawing audit. data: {limit?, include_entities?, changed_only?, layer?, space?}
       audit_dxf  — Parse an existing DXF into normalized JSON. data: {path, limit?, include_entities?}
       setup_mechanical — Create the seven monochrome GB/T mechanical-drafting layers.
@@ -56,6 +60,9 @@ async def drawing(
       redo       — Redo last undone operation.
     """
     data = data or {}
+    if operation == "workspace":
+        return _json({"ok": True, "payload": workspace_info()})
+
     backend = await get_backend()
 
     if operation == "create":
@@ -63,18 +70,47 @@ async def drawing(
     elif operation == "info":
         result = await backend.drawing_info()
     elif operation == "save":
-        result = await backend.drawing_save(data.get("path"))
+        category = "drawings" if backend.name == "file_ipc" else "dxf"
+        extension = ".dwg" if backend.name == "file_ipc" else ".dxf"
+        target = resolve_output_target(
+            data.get("path"),
+            category=category,
+            extension=extension,
+            default_stem=data.get("name", "drawing"),
+        )
+        result = await backend.drawing_save(str(target.path))
     elif operation == "save_as_dxf":
-        result = await backend.drawing_save_as_dxf(data["path"])
+        target = resolve_output_target(
+            data.get("path"),
+            category="dxf",
+            extension=".dxf",
+            default_stem=data.get("name", "drawing"),
+        )
+        result = await backend.drawing_save_as_dxf(str(target.path))
     elif operation == "plot_pdf":
-        result = await backend.drawing_plot_pdf(data["path"])
+        target = resolve_output_target(
+            data.get("path"),
+            category="pdf",
+            extension=".pdf",
+            default_stem=data.get("name", "drawing"),
+        )
+        result = await backend.drawing_plot_pdf(str(target.path))
     elif operation == "render_preview":
+        extension = ".pdf" if backend.name == "file_ipc" else ".png"
+        target = resolve_output_target(
+            data.get("path"),
+            category="previews",
+            extension=extension,
+            default_stem=data.get("name", "preview"),
+        )
         result = await backend.drawing_render_preview(
-            data["path"],
+            str(target.path),
             data.get("paper", "A4"),
             data.get("orientation", "auto"),
             data.get("plot_style", "monochrome.ctb"),
         )
+    elif operation == "deliver":
+        result = await deliver_drawing(backend, data)
     elif operation == "audit":
         result = await backend.drawing_audit(
             data.get("limit", 50),
