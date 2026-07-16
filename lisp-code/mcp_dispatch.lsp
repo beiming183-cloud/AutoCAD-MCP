@@ -1,4 +1,4 @@
-;;; mcp_dispatch.lsp - File-based IPC dispatcher for AutoCAD MCP v3.4.1
+;;; mcp_dispatch.lsp - File-based IPC dispatcher for AutoCAD MCP v3.4.3
 ;;;
 ;;; Protocol:
 ;;;   1. Python writes command JSON to C:/temp/autocad_mcp_cmd_{id}.json
@@ -582,7 +582,7 @@
   )
 )
 
-(defun mcp-cmd-create-rectangle (params / x1 y1 x2 y2 layer)
+(defun mcp-cmd-create-rectangle (params / x1 y1 x2 y2 layer before-ent created-ent)
   (setq x1 (mcp-json-get-number params "x1"))
   (setq y1 (mcp-json-get-number params "y1"))
   (setq x2 (mcp-json-get-number params "x2"))
@@ -591,8 +591,13 @@
   (if layer
     (progn (ensure_layer_exists layer "white" "CONTINUOUS") (set_current_layer layer))
   )
+  (setq before-ent (entlast))
   (command "_RECTANG" (list x1 y1 0.0) (list x2 y2 0.0))
-  (cons T (strcat "{\"entity_type\":\"LWPOLYLINE\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
+  (setq created-ent (entlast))
+  (if (or (not created-ent) (eq before-ent created-ent))
+    (cons nil "RECTANG completed without creating an entity")
+    (cons T (strcat "{\"entity_type\":\"LWPOLYLINE\",\"handle\":\"" (cdr (assoc 5 (entget created-ent))) "\"}"))
+  )
 )
 
 (defun mcp-cmd-create-text (params / x y text height rotation layer)
@@ -882,7 +887,7 @@
   (cons T (strcat "{\"entity_type\":\"MTEXT\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
 )
 
-(defun mcp-cmd-create-hatch (params / entity-id pattern angle scale layer ent old-hpang old-hpscale old-layer result hatch-ent)
+(defun mcp-cmd-create-hatch (params / entity-id pattern angle scale layer ent old-hpang old-hpscale old-layer result before-ent hatch-ent)
   (setq entity-id (mcp-json-get-string params "entity_id"))
   (setq pattern (mcp-json-get-string params "pattern"))
   (setq angle (mcp-json-get-number params "angle"))
@@ -908,21 +913,25 @@
       )
       (setvar "HPANG" angle)
       (setvar "HPSCALE" scale)
+      (setq before-ent (entlast))
       (setq result (vl-catch-all-apply 'mcp-run-hatch-command (list ent pattern scale angle)))
       (setvar "HPANG" old-hpang)
       (setvar "HPSCALE" old-hpscale)
       (setvar "CLAYER" old-layer)
-      (if (vl-catch-all-error-p result)
-        (cons nil (strcat "Hatch failed: " (vl-catch-all-error-message result)))
-        (progn
-          (setq hatch-ent (entlast))
+      (setq hatch-ent (entlast))
+      (cond
+        ((vl-catch-all-error-p result)
+          (cons nil (strcat "Hatch failed: " (vl-catch-all-error-message result))))
+        ((or (not hatch-ent) (eq before-ent hatch-ent))
+          (cons nil "HATCH completed without creating an entity"))
+        (t
           (cons T (strcat
-            "{\"entity_type\":\"HATCH\",\"handle\":\""
-            (cdr (assoc 5 (entget hatch-ent)))
-            "\",\"pattern\":\"" (mcp-escape-string pattern)
-            "\",\"angle\":" (rtos angle 2 6)
-            ",\"scale\":" (rtos scale 2 6) "}"
-          ))
+              "{\"entity_type\":\"HATCH\",\"handle\":\""
+              (cdr (assoc 5 (entget hatch-ent)))
+              "\",\"pattern\":\"" (mcp-escape-string pattern)
+              "\",\"angle\":" (rtos angle 2 6)
+              ",\"scale\":" (rtos scale 2 6) "}"
+            ))
         )
       )
     )
@@ -1223,41 +1232,56 @@
 
 ;; --- Annotation commands ---
 
-(defun mcp-cmd-create-dimension-linear (params / x1 y1 x2 y2 dim-x dim-y)
+(defun mcp-cmd-create-dimension-linear (params / x1 y1 x2 y2 dim-x dim-y before-ent created-ent)
   (setq x1 (mcp-json-get-number params "x1"))
   (setq y1 (mcp-json-get-number params "y1"))
   (setq x2 (mcp-json-get-number params "x2"))
   (setq y2 (mcp-json-get-number params "y2"))
   (setq dim-x (mcp-json-get-number params "dim_x"))
   (setq dim-y (mcp-json-get-number params "dim_y"))
+  (setq before-ent (entlast))
   (command "_.DIMLINEAR" (list x1 y1 0) (list x2 y2 0) (list dim-x dim-y 0))
-  (cons T "{\"entity_type\":\"DIMENSION\"}")
+  (setq created-ent (entlast))
+  (if (or (not created-ent) (eq before-ent created-ent))
+    (cons nil "DIMLINEAR completed without creating an entity")
+    (cons T (strcat "{\"entity_type\":\"DIMENSION\",\"handle\":\"" (cdr (assoc 5 (entget created-ent))) "\"}"))
+  )
 )
 
-(defun mcp-cmd-create-dimension-aligned (params / x1 y1 x2 y2 offset)
+(defun mcp-cmd-create-dimension-aligned (params / x1 y1 x2 y2 offset before-ent created-ent)
   (setq x1 (mcp-json-get-number params "x1"))
   (setq y1 (mcp-json-get-number params "y1"))
   (setq x2 (mcp-json-get-number params "x2"))
   (setq y2 (mcp-json-get-number params "y2"))
   (setq offset (mcp-json-get-number params "offset"))
   ;; Place dimension line at offset distance
+  (setq before-ent (entlast))
   (command "_.DIMALIGNED" (list x1 y1 0) (list x2 y2 0)
     (list (+ (/ (+ x1 x2) 2.0) offset) (+ (/ (+ y1 y2) 2.0) offset) 0))
-  (cons T "{\"entity_type\":\"DIMENSION\"}")
+  (setq created-ent (entlast))
+  (if (or (not created-ent) (eq before-ent created-ent))
+    (cons nil "DIMALIGNED completed without creating an entity")
+    (cons T (strcat "{\"entity_type\":\"DIMENSION\",\"handle\":\"" (cdr (assoc 5 (entget created-ent))) "\"}"))
+  )
 )
 
-(defun mcp-cmd-create-dimension-angular (params / cx cy x1 y1 x2 y2)
+(defun mcp-cmd-create-dimension-angular (params / cx cy x1 y1 x2 y2 before-ent created-ent)
   (setq cx (mcp-json-get-number params "cx"))
   (setq cy (mcp-json-get-number params "cy"))
   (setq x1 (mcp-json-get-number params "x1"))
   (setq y1 (mcp-json-get-number params "y1"))
   (setq x2 (mcp-json-get-number params "x2"))
   (setq y2 (mcp-json-get-number params "y2"))
+  (setq before-ent (entlast))
   (command "_.DIMANGULAR" (list cx cy 0) (list x1 y1 0) (list x2 y2 0) "")
-  (cons T "{\"entity_type\":\"DIMENSION\"}")
+  (setq created-ent (entlast))
+  (if (or (not created-ent) (eq before-ent created-ent))
+    (cons nil "DIMANGULAR completed without creating an entity")
+    (cons T (strcat "{\"entity_type\":\"DIMENSION\",\"handle\":\"" (cdr (assoc 5 (entget created-ent))) "\"}"))
+  )
 )
 
-(defun mcp-cmd-create-dimension-radius (params / cx cy radius angle px py)
+(defun mcp-cmd-create-dimension-radius (params / cx cy radius angle px py before-ent created-ent)
   (setq cx (mcp-json-get-number params "cx"))
   (setq cy (mcp-json-get-number params "cy"))
   (setq radius (mcp-json-get-number params "radius"))
@@ -1265,8 +1289,13 @@
   ;; Need a circle/arc entity first, use entity at center
   (setq px (+ cx (* radius (cos (* angle (/ pi 180.0))))))
   (setq py (+ cy (* radius (sin (* angle (/ pi 180.0))))))
+  (setq before-ent (entlast))
   (command "_.DIMRADIUS" (list px py 0) "")
-  (cons T "{\"entity_type\":\"DIMENSION\"}")
+  (setq created-ent (entlast))
+  (if (or (not created-ent) (eq before-ent created-ent))
+    (cons nil "DIMRADIUS completed without creating an entity")
+    (cons T (strcat "{\"entity_type\":\"DIMENSION\",\"handle\":\"" (cdr (assoc 5 (entget created-ent))) "\"}"))
+  )
 )
 
 (defun mcp-cmd-create-leader (params / text pts-str pairs pt-str)
@@ -1627,7 +1656,7 @@
 ;; Startup message
 ;; -----------------------------------------------------------------------
 
-(princ "\n=== MCP Dispatch v3.4.1 loaded ===")
+(princ "\n=== MCP Dispatch v3.4.3 loaded ===")
 (princ "\nIPC directory: ")
 (princ *mcp-ipc-dir*)
 (princ "\nReady for commands via (c:mcp-dispatch)")

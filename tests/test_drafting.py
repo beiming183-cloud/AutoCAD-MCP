@@ -80,3 +80,18 @@ def test_file_ipc_visibility_can_be_disabled(monkeypatch):
     result = backend._ensure_autocad_visible(activate=True)
 
     assert result == {"configured_visible": False, "shown": False}
+
+
+def test_file_ipc_auto_fit_can_be_disabled(monkeypatch):
+    backend = FileIPCBackend()
+    monkeypatch.setenv("AUTOCAD_MCP_AUTO_FIT", "false")
+
+    result = backend._auto_fit_view()
+
+    assert result == {"configured": False, "fitted": False, "suspended": False}
+
+
+def test_file_ipc_identifies_geometry_commands_for_auto_fit():
+    assert FileIPCBackend._should_auto_fit("create-circle") is True
+    assert FileIPCBackend._should_auto_fit("entity-move") is True
+    assert FileIPCBackend._should_auto_fit("entity-list") is False

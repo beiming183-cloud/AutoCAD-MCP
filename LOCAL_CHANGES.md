@@ -43,6 +43,12 @@
     every drawing command, and exposes `view.show_window` for manual restore.
 19. Transient COM call rejection while AutoCAD is still loading is retried for
     up to five seconds before falling back to window-message delivery.
+20. IPC waits for `CMDACTIVE=0` before and after requests, and entity-producing
+    commands verify that `entlast` actually changed before reporting success.
+21. Full AutoCAD creates dimensions through native COM methods; prompt-driven
+    AutoLISP dimensions remain available as the LT fallback.
+22. Geometry-changing operations automatically center and fit drawing extents;
+    batch creation suspends intermediate fits and performs one final fit.
 
 ## Codex registration
 

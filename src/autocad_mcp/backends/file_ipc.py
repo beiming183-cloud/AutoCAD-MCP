@@ -200,6 +200,7 @@ class FileIPCBackend(AutoCADBackend):
         self._lock = asyncio.Lock()  # Single in-flight command
         self._audit_revision = 0
         self._audit_fingerprints: dict[str, str] | None = None
+        self._suspend_auto_fit = 0
 
     @property
     def name(self) -> str:
@@ -276,6 +277,8 @@ class FileIPCBackend(AutoCADBackend):
             "ipc_dir": str(self._ipc_dir),
             "capabilities": {k: v for k, v in self.capabilities.__dict__.items()},
             "visibility": self._window_visibility_status(),
+            "auto_fit": os.environ.get("AUTOCAD_MCP_AUTO_FIT", "true").lower()
+            in ("1", "true", "yes", "on"),
         }
         return CommandResult(ok=True, payload=info)
 
@@ -323,11 +326,15 @@ class FileIPCBackend(AutoCADBackend):
                         data = json.loads(text)
                         # Verify request_id matches
                         if data.get("request_id") == request_id:
-                            return CommandResult(
+                            self._wait_for_autocad_idle(timeout=2.0)
+                            result = CommandResult(
                                 ok=data.get("ok", False),
                                 payload=data.get("payload"),
                                 error=data.get("error"),
                             )
+                            if result.ok and self._should_auto_fit(command):
+                                self._auto_fit_view()
+                            return result
                     except (json.JSONDecodeError, OSError):
                         pass  # File may be partially written, retry
                 await asyncio.sleep(POLL_INTERVAL)
@@ -379,8 +386,33 @@ class FileIPCBackend(AutoCADBackend):
             activate=os.environ.get("AUTOCAD_MCP_ACTIVATE_ON_DRAW", "false").lower()
             in ("1", "true", "yes", "on")
         )
-        self._cancel_active_command()
+        if not self._wait_for_autocad_idle(timeout=1.5):
+            self._cancel_active_command()
+            self._wait_for_autocad_idle(timeout=1.0)
         self._type_command("(c:mcp-dispatch)")
+
+    def _wait_for_autocad_idle(self, timeout: float = 2.0) -> bool:
+        """Wait for AutoCAD to finish unwinding the previous dispatched command."""
+        if sys.platform != "win32":
+            return True
+        deadline = time.time() + max(0.0, timeout)
+        while True:
+            try:
+                import pythoncom
+                import win32com.client
+
+                pythoncom.CoInitialize()
+                application = win32com.client.GetActiveObject("AutoCAD.Application")
+                document = application.ActiveDocument
+                if int(document.GetVariable("CMDACTIVE")) == 0:
+                    return True
+            except Exception as exc:
+                hresult = getattr(exc, "hresult", exc.args[0] if exc.args else None)
+                if hresult != -2147418111:
+                    return False
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.05)
 
     def _window_visibility_status(self) -> dict:
         configured = os.environ.get("AUTOCAD_MCP_VISIBLE", "true").lower() in (
@@ -401,6 +433,66 @@ class FileIPCBackend(AutoCADBackend):
             except Exception:
                 pass
         return status
+
+    @staticmethod
+    def _should_auto_fit(command: str) -> bool:
+        if command.startswith("create-"):
+            return True
+        return command in {
+            "entity-copy",
+            "entity-move",
+            "entity-rotate",
+            "entity-scale",
+            "entity-mirror",
+            "entity-offset",
+            "entity-array",
+            "entity-fillet",
+            "entity-chamfer",
+            "entity-erase",
+            "block-insert",
+            "block-insert-with-attribs",
+            "pid-insert-symbol",
+            "pid-draw-process-line",
+            "pid-connect-equipment",
+            "pid-add-flow-arrow",
+            "pid-add-equipment-tag",
+            "pid-add-line-number",
+            "pid-insert-valve",
+            "pid-insert-instrument",
+            "pid-insert-pump",
+            "pid-insert-tank",
+        }
+
+    def _auto_fit_view(self, force: bool = False) -> dict:
+        """Center all drawing extents in the viewport after geometry changes."""
+        configured = os.environ.get("AUTOCAD_MCP_AUTO_FIT", "true").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if not force and (not configured or self._suspend_auto_fit > 0):
+            return {
+                "configured": configured,
+                "fitted": False,
+                "suspended": self._suspend_auto_fit > 0,
+            }
+
+        if not self._wait_for_autocad_idle(timeout=2.0):
+            return {"configured": configured, "fitted": False, "reason": "autocad-busy"}
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            application.ZoomExtents()
+            application.Update()
+            return {"configured": configured, "fitted": True, "renderer": "autocad-com"}
+        except Exception:
+            self._type_command("_.ZOOM _E")
+            self._wait_for_autocad_idle(timeout=2.0)
+            return {"configured": configured, "fitted": True, "renderer": "autocad-command"}
 
     def _ensure_autocad_visible(self, activate: bool = False) -> dict:
         """Show and restore AutoCAD so drawing actions can be watched live."""
@@ -868,6 +960,20 @@ class FileIPCBackend(AutoCADBackend):
     async def create_mtext(self, x, y, width, text, height=2.5, layer=None) -> CommandResult:
         return await self._dispatch("create-mtext", {"x": x, "y": y, "width": width, "text": encode_autocad_text(text), "height": height, "layer": layer})
 
+    async def create_batch(
+        self, entities: list[dict], continue_on_error: bool = False
+    ) -> CommandResult:
+        self._suspend_auto_fit += 1
+        try:
+            result = await super().create_batch(entities, continue_on_error)
+        finally:
+            self._suspend_auto_fit = max(0, self._suspend_auto_fit - 1)
+        if result.ok:
+            fit = self._auto_fit_view()
+            if isinstance(result.payload, dict):
+                result.payload["view"] = fit
+        return result
+
     async def create_hatch(
         self, entity_id, pattern="ANSI31", angle=0.0, scale=1.0, layer=None
     ) -> CommandResult:
@@ -991,16 +1097,118 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("create-text", {"x": x, "y": y, "text": encode_autocad_text(text), "height": height, "rotation": rotation, "layer": layer})
 
     async def create_dimension_linear(self, x1, y1, x2, y2, dim_x, dim_y) -> CommandResult:
-        return await self._dispatch("create-dimension-linear", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "dim_x": dim_x, "dim_y": dim_y})
+        try:
+            return CommandResult(
+                ok=True,
+                payload=self._create_dimension_via_com(
+                    "linear", x1=x1, y1=y1, x2=x2, y2=y2, dim_x=dim_x, dim_y=dim_y
+                ),
+            )
+        except Exception:
+            return await self._dispatch("create-dimension-linear", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "dim_x": dim_x, "dim_y": dim_y})
 
     async def create_dimension_aligned(self, x1, y1, x2, y2, offset) -> CommandResult:
-        return await self._dispatch("create-dimension-aligned", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "offset": offset})
+        try:
+            return CommandResult(
+                ok=True,
+                payload=self._create_dimension_via_com(
+                    "aligned", x1=x1, y1=y1, x2=x2, y2=y2, offset=offset
+                ),
+            )
+        except Exception:
+            return await self._dispatch("create-dimension-aligned", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "offset": offset})
 
     async def create_dimension_angular(self, cx, cy, x1, y1, x2, y2) -> CommandResult:
-        return await self._dispatch("create-dimension-angular", {"cx": cx, "cy": cy, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
+        try:
+            return CommandResult(
+                ok=True,
+                payload=self._create_dimension_via_com(
+                    "angular", cx=cx, cy=cy, x1=x1, y1=y1, x2=x2, y2=y2
+                ),
+            )
+        except Exception:
+            return await self._dispatch("create-dimension-angular", {"cx": cx, "cy": cy, "x1": x1, "y1": y1, "x2": x2, "y2": y2})
 
     async def create_dimension_radius(self, cx, cy, radius, angle) -> CommandResult:
-        return await self._dispatch("create-dimension-radius", {"cx": cx, "cy": cy, "radius": radius, "angle": angle})
+        try:
+            return CommandResult(
+                ok=True,
+                payload=self._create_dimension_via_com(
+                    "radius", cx=cx, cy=cy, radius=radius, angle=angle
+                ),
+            )
+        except Exception:
+            return await self._dispatch("create-dimension-radius", {"cx": cx, "cy": cy, "radius": radius, "angle": angle})
+
+    def _create_dimension_via_com(self, kind: str, **data) -> dict:
+        import pythoncom
+        import win32com.client
+
+        pythoncom.CoInitialize()
+        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        modelspace = application.ActiveDocument.ModelSpace
+
+        def point(x, y):
+            return win32com.client.VARIANT(
+                pythoncom.VT_ARRAY | pythoncom.VT_R8, [float(x), float(y), 0.0]
+            )
+
+        if kind in ("linear", "aligned"):
+            x1, y1, x2, y2 = data["x1"], data["y1"], data["x2"], data["y2"]
+            first, second = point(x1, y1), point(x2, y2)
+            if kind == "linear":
+                text_point = point(data["dim_x"], data["dim_y"])
+                rotation = 0.0 if abs(x2 - x1) >= abs(y2 - y1) else math.pi / 2.0
+                entity = modelspace.AddDimRotated(first, second, text_point, rotation)
+            else:
+                dx, dy = x2 - x1, y2 - y1
+                length = math.hypot(dx, dy)
+                if length == 0:
+                    raise ValueError("Aligned dimension points must differ")
+                offset = float(data["offset"])
+                text_point = point(
+                    (x1 + x2) / 2.0 - dy / length * offset,
+                    (y1 + y2) / 2.0 + dx / length * offset,
+                )
+                entity = modelspace.AddDimAligned(first, second, text_point)
+        elif kind == "radius":
+            angle = math.radians(float(data["angle"]))
+            center = point(data["cx"], data["cy"])
+            chord = point(
+                data["cx"] + data["radius"] * math.cos(angle),
+                data["cy"] + data["radius"] * math.sin(angle),
+            )
+            entity = modelspace.AddDimRadial(center, chord, max(5.0, data["radius"] * 0.5))
+        elif kind == "angular":
+            cx, cy = data["cx"], data["cy"]
+            first_angle = math.atan2(data["y1"] - cy, data["x1"] - cx)
+            second_angle = math.atan2(data["y2"] - cy, data["x2"] - cx)
+            delta = (second_angle - first_angle) % (2.0 * math.pi)
+            mid_angle = first_angle + delta / 2.0
+            radius = max(
+                math.hypot(data["x1"] - cx, data["y1"] - cy),
+                math.hypot(data["x2"] - cx, data["y2"] - cy),
+            )
+            entity = modelspace.AddDimAngular(
+                point(cx, cy),
+                point(data["x1"], data["y1"]),
+                point(data["x2"], data["y2"]),
+                point(cx + radius * 0.7 * math.cos(mid_angle), cy + radius * 0.7 * math.sin(mid_angle)),
+            )
+        else:
+            raise ValueError(f"Unsupported COM dimension kind: {kind}")
+
+        try:
+            entity.Layer = "DIM"
+        except Exception:
+            pass
+        entity.Update()
+        self._auto_fit_view()
+        return {
+            "entity_type": "DIMENSION",
+            "handle": str(entity.Handle),
+            "renderer": "autocad-com",
+        }
 
     async def create_leader(self, points, text) -> CommandResult:
         pts_str = ";".join(f"{p[0]},{p[1]}" for p in points)
@@ -1049,6 +1257,9 @@ class FileIPCBackend(AutoCADBackend):
     # --- View ---
 
     async def zoom_extents(self) -> CommandResult:
+        fit = self._auto_fit_view(force=True)
+        if fit.get("fitted"):
+            return CommandResult(ok=True, payload=fit)
         return await self._dispatch("zoom-extents", {})
 
     async def zoom_window(self, x1, y1, x2, y2) -> CommandResult:
