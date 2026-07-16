@@ -73,7 +73,7 @@ async def test_file_ipc_ensure_ready_loads_and_version_checks_dispatcher(monkeyp
         "_dispatch",
         AsyncMock(
             return_value=CommandResult(
-                ok=True, payload={"pong": True, "dispatcher_version": "3.6.0"}
+            ok=True, payload={"pong": True, "dispatcher_version": "3.7.0"}
             )
         ),
     )
@@ -84,5 +84,5 @@ async def test_file_ipc_ensure_ready_loads_and_version_checks_dispatcher(monkeyp
     assert result.ok is True
     assert result.payload["ready"] is True
     assert result.payload["autocad"]["product"] == "AutoCAD 2025"
-    assert result.payload["dispatcher"]["version"] == "3.6.0"
+    assert result.payload["dispatcher"]["version"] == "3.7.0"
     assert typed and "mcp_dispatch.lsp" in typed[0]

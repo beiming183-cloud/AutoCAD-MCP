@@ -1,3 +1,3 @@
-"""AutoCAD MCP Server v3.6.0 with self-healing startup and geometry DRC."""
+"""AutoCAD MCP Server v3.7.0 with topology DRC and native solid workflows."""
 
-__version__ = "3.6.0"
+__version__ = "3.7.0"

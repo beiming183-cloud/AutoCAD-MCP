@@ -47,7 +47,8 @@ def _validation_checks(audit: dict[str, Any], rules: dict[str, Any]) -> list[dic
         )
     drc = audit.get("geometry_drc") or {}
     if drc and rules.get("require_geometry_clean", True):
-        add("geometry_drc", drc.get("status") == "PASS", drc.get("issue_count", 0), 0)
+        failures = int(drc.get("failure_count", drc.get("issue_count", 0)))
+        add("geometry_drc", failures == 0, failures, 0)
     return checks
 
 
@@ -103,7 +104,8 @@ def _export_checks(
         )
     exported_drc = exported.get("geometry_drc") or {}
     if exported_drc:
-        add("dxf_geometry_drc", exported_drc.get("status") == "PASS", exported_drc.get("issue_count"), 0)
+        failures = int(exported_drc.get("failure_count", exported_drc.get("issue_count", 0)))
+        add("dxf_geometry_drc", failures == 0, failures, 0)
     return checks
 
 

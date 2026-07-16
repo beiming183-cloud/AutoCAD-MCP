@@ -22,6 +22,9 @@ BACKEND_DEFAULT = "auto"  # auto | file_ipc | ezdxf
 
 # IPC timeout (seconds), clamped to [1, 300]
 IPC_TIMEOUT = max(1.0, min(300.0, float(os.environ.get("AUTOCAD_MCP_IPC_TIMEOUT", "10.0"))))
+DOCUMENT_TIMEOUT = max(
+    5.0, min(120.0, float(os.environ.get("AUTOCAD_MCP_DOCUMENT_TIMEOUT", "30.0")))
+)
 
 # Screenshot
 ONLY_TEXT_FEEDBACK = os.environ.get("AUTOCAD_MCP_ONLY_TEXT", "true").lower() in (

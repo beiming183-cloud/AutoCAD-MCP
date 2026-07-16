@@ -88,6 +88,9 @@ class TestBackendCapabilities:
             can_query_entities=True,
             can_file_operations=True,
             can_undo=True,
+            can_create_solids=True,
+            can_boolean_solids=True,
+            can_project_views=True,
         )
         for field_name, value in caps.__dict__.items():
             assert value is True, f"{field_name} should be True"
@@ -327,6 +330,9 @@ class TestDispatchMapCoverage:
         "execute-lisp",
         "undo",
         "redo",
+        "transaction-begin",
+        "transaction-commit",
+        "transaction-rollback",
         "drawing-info",
         "drawing-save",
         "drawing-save-as-dxf",
@@ -356,6 +362,11 @@ class TestDispatchMapCoverage:
         "entity-array",
         "entity-fillet",
         "entity-chamfer",
+        "entity-trim",
+        "entity-extend",
+        "entity-break",
+        "entity-join",
+        "entity-constrain",
         "layer-list",
         "layer-create",
         "layer-set-current",

@@ -1,4 +1,4 @@
-;;; mcp_dispatch.lsp - File-based IPC dispatcher for AutoCAD MCP v3.6.0
+;;; mcp_dispatch.lsp - File-based IPC dispatcher for AutoCAD MCP v3.7.0
 ;;;
 ;;; Protocol:
 ;;;   1. Python writes command JSON to C:/temp/autocad_mcp_cmd_{id}.json
@@ -198,6 +198,40 @@
   result
 )
 
+(defun mcp-selection-from-handles (encoded / selection handle ent)
+  "Build a selection set from a semicolon-delimited handle list."
+  (setq selection (ssadd))
+  (if encoded
+    (foreach handle (mcp-split-string encoded ";")
+      (setq ent (handent handle))
+      (if ent (ssadd ent selection))
+    )
+  )
+  (if (> (sslength selection) 0) selection nil)
+)
+
+(defun mcp-parse-picked-target (encoded / at-pos handle coords comma-pos x y ent)
+  "Parse handle@x,y into an entity-pickpoint pair accepted by command."
+  (setq at-pos (vl-string-search "@" encoded))
+  (if at-pos
+    (progn
+      (setq handle (substr encoded 1 at-pos))
+      (setq coords (substr encoded (+ at-pos 2)))
+      (setq comma-pos (vl-string-search "," coords))
+      (if comma-pos
+        (progn
+          (setq x (atof (substr coords 1 comma-pos)))
+          (setq y (atof (substr coords (+ comma-pos 2))))
+          (setq ent (handent handle))
+          (if ent (list ent (list x y 0)) nil)
+        )
+        nil
+      )
+    )
+    nil
+  )
+)
+
 ;; -----------------------------------------------------------------------
 ;; Command dispatcher — WHITELIST ONLY, no eval
 ;; -----------------------------------------------------------------------
@@ -207,7 +241,7 @@
   (cond
     ;; --- Ping ---
     ((= cmd-name "ping")
-     (cons T "{\"pong\":true,\"dispatcher_version\":\"3.6.0\"}"))
+     (cons T "{\"pong\":true,\"dispatcher_version\":\"3.7.0\"}"))
 
     ;; --- Freehand LISP execution ---
     ((= cmd-name "execute-lisp")
@@ -219,6 +253,17 @@
 
     ((= cmd-name "redo")
      (command "_.REDO") (cons T "\"redone\""))
+
+    ((= cmd-name "transaction-begin")
+     (command "_.UNDO" "_BEGIN") (cons T "{\"transaction\":\"open\"}"))
+
+    ((= cmd-name "transaction-commit")
+     (command "_.UNDO" "_END") (cons T "{\"transaction\":\"committed\"}"))
+
+    ((= cmd-name "transaction-rollback")
+     (command "_.UNDO" "_END")
+     (command "_.UNDO" "1")
+     (cons T "{\"transaction\":\"rolled_back\"}"))
 
     ;; --- Drawing info ---
     ((= cmd-name "drawing-info")
@@ -320,6 +365,21 @@
 
     ((= cmd-name "entity-chamfer")
      (mcp-cmd-entity-chamfer params-json))
+
+    ((= cmd-name "entity-trim")
+     (mcp-cmd-entity-trim params-json))
+
+    ((= cmd-name "entity-extend")
+     (mcp-cmd-entity-extend params-json))
+
+    ((= cmd-name "entity-break")
+     (mcp-cmd-entity-break params-json))
+
+    ((= cmd-name "entity-join")
+     (mcp-cmd-entity-join params-json))
+
+    ((= cmd-name "entity-constrain")
+     (mcp-cmd-entity-constrain params-json))
 
     ;; --- View ---
     ((= cmd-name "zoom-extents")
@@ -1125,6 +1185,104 @@
   )
 )
 
+(defun mcp-cmd-entity-trim (params / cutters-str targets-str cutters token target count)
+  (setq cutters-str (mcp-json-get-string params "cutters_str"))
+  (setq targets-str (mcp-json-get-string params "targets_str"))
+  (setq cutters (mcp-selection-from-handles cutters-str))
+  (setq count 0)
+  (if (and cutters targets-str)
+    (progn
+      (command "_.TRIM" cutters "")
+      (foreach token (mcp-split-string targets-str ";")
+        (setq target (mcp-parse-picked-target token))
+        (if target (progn (command target) (setq count (1+ count))))
+      )
+      (command "")
+      (cons T (strcat "{\"trimmed\":" (itoa count) "}"))
+    )
+    (cons nil "TRIM requires valid cutters and picked targets")
+  )
+)
+
+(defun mcp-cmd-entity-extend (params / boundaries-str targets-str boundaries token target count)
+  (setq boundaries-str (mcp-json-get-string params "boundaries_str"))
+  (setq targets-str (mcp-json-get-string params "targets_str"))
+  (setq boundaries (mcp-selection-from-handles boundaries-str))
+  (setq count 0)
+  (if (and boundaries targets-str)
+    (progn
+      (command "_.EXTEND" boundaries "")
+      (foreach token (mcp-split-string targets-str ";")
+        (setq target (mcp-parse-picked-target token))
+        (if target (progn (command target) (setq count (1+ count))))
+      )
+      (command "")
+      (cons T (strcat "{\"extended\":" (itoa count) "}"))
+    )
+    (cons nil "EXTEND requires valid boundaries and picked targets")
+  )
+)
+
+(defun mcp-cmd-entity-break (params / entity-id ent x1 y1 x2 y2)
+  (setq entity-id (mcp-json-get-string params "entity_id"))
+  (setq ent (handent entity-id))
+  (setq x1 (mcp-json-get-number params "x1"))
+  (setq y1 (mcp-json-get-number params "y1"))
+  (setq x2 (mcp-json-get-number params "x2"))
+  (setq y2 (mcp-json-get-number params "y2"))
+  (if ent
+    (progn
+      (command "_.BREAK" ent "_F" (list x1 y1 0) (list x2 y2 0))
+      (cons T "{\"broken\":true}"))
+    (cons nil "Entity not found")
+  )
+)
+
+(defun mcp-cmd-entity-join (params / ids-str tolerance selection old-peditaccept)
+  (setq ids-str (mcp-json-get-string params "entity_ids_str"))
+  (setq tolerance (mcp-json-get-number params "tolerance"))
+  (setq selection (mcp-selection-from-handles ids-str))
+  (if selection
+    (progn
+      (if (and tolerance (> tolerance 0))
+        (progn
+          (setq old-peditaccept (getvar "PEDITACCEPT"))
+          (setvar "PEDITACCEPT" 1)
+          (command "_.PEDIT" "_M" selection "" "_J" tolerance "")
+          (setvar "PEDITACCEPT" old-peditaccept)
+        )
+        (command "_.JOIN" selection "")
+      )
+      (cons T (strcat "{\"selected\":" (itoa (sslength selection)) "}")))
+    (cons nil "JOIN requires at least one valid entity")
+  )
+)
+
+(defun mcp-cmd-entity-constrain (params / constraint ids-str selection option)
+  (setq constraint (strcase (mcp-json-get-string params "constraint")))
+  (setq ids-str (mcp-json-get-string params "entity_ids_str"))
+  (setq selection (mcp-selection-from-handles ids-str))
+  (setq option
+    (cond
+      ((= constraint "HORIZONTAL") "_Horizontal")
+      ((= constraint "VERTICAL") "_Vertical")
+      ((= constraint "PARALLEL") "_Parallel")
+      ((= constraint "PERPENDICULAR") "_Perpendicular")
+      ((= constraint "TANGENT") "_Tangent")
+      ((= constraint "CONCENTRIC") "_Concentric")
+      ((= constraint "EQUAL") "_Equal")
+      ((= constraint "COLLINEAR") "_Collinear")
+      (T nil)
+    )
+  )
+  (if (and selection option)
+    (progn
+      (command "_.GEOMCONSTRAINT" option selection "")
+      (cons T (strcat "{\"constraint\":\"" (mcp-escape-string constraint) "\"}")))
+    (cons nil "Unsupported constraint or invalid entity selection")
+  )
+)
+
 ;; --- Layer operations ---
 
 (defun mcp-cmd-layer-set-properties (params / name color linetype lineweight)
@@ -1656,7 +1814,7 @@
 ;; Startup message
 ;; -----------------------------------------------------------------------
 
-(princ "\n=== MCP Dispatch v3.6.0 loaded ===")
+(princ "\n=== MCP Dispatch v3.7.0 loaded ===")
 (princ "\nIPC directory: ")
 (princ *mcp-ipc-dir*)
 (princ "\nReady for commands via (c:mcp-dispatch)")

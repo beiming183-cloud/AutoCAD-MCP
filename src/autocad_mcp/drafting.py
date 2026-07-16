@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
@@ -44,3 +45,40 @@ def lineweight_hundredths(value: str | int | float | None, default: int = -3) ->
     if number < 0:
         return int(number)
     return int(round(number * 100))
+
+
+def tangent_arc_from_start(
+    start: list[float], end: list[float], tangent: list[float], tolerance: float = 0.000001
+) -> dict[str, Any]:
+    """Solve the circle through two points with a prescribed tangent at the start."""
+    if len(start) < 2 or len(end) < 2 or len(tangent) < 2:
+        raise ValueError("start, end, and tangent require two coordinates")
+    sx, sy = float(start[0]), float(start[1])
+    ex, ey = float(end[0]), float(end[1])
+    tx, ty = float(tangent[0]), float(tangent[1])
+    tangent_length = math.hypot(tx, ty)
+    chord_x, chord_y = ex - sx, ey - sy
+    chord_squared = chord_x * chord_x + chord_y * chord_y
+    if tangent_length <= tolerance or chord_squared <= tolerance * tolerance:
+        raise ValueError("tangent and chord must have non-zero length")
+    tx, ty = tx / tangent_length, ty / tangent_length
+    normal_x, normal_y = -ty, tx
+    denominator = 2 * (chord_x * normal_x + chord_y * normal_y)
+    if abs(denominator) <= tolerance:
+        raise ValueError("the requested tangent produces a straight line, not a finite arc")
+    signed_radius = chord_squared / denominator
+    center = [sx + normal_x * signed_radius, sy + normal_y * signed_radius]
+    radius = abs(signed_radius)
+    start_angle = math.degrees(math.atan2(sy - center[1], sx - center[0])) % 360
+    end_angle = math.degrees(math.atan2(ey - center[1], ex - center[0])) % 360
+    ccw_tangent = [-(sy - center[1]), sx - center[0]]
+    counterclockwise = ccw_tangent[0] * tx + ccw_tangent[1] * ty >= 0
+    return {
+        "center": center,
+        "radius": radius,
+        "start_angle": start_angle if counterclockwise else end_angle,
+        "end_angle": end_angle if counterclockwise else start_angle,
+        "requested_start": [sx, sy],
+        "requested_end": [ex, ey],
+        "direction": "counterclockwise" if counterclockwise else "clockwise",
+    }

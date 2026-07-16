@@ -2,11 +2,13 @@
 
 import base64
 import io
+from pathlib import Path
 
 import ezdxf
 import pytest
 
 from autocad_mcp.screenshot import MatplotlibScreenshotProvider, NullScreenshotProvider
+from autocad_mcp.backends.ezdxf_backend import EzdxfBackend
 
 
 # ---------------------------------------------------------------------------
@@ -130,3 +132,75 @@ class TestMatplotlibProvider:
         s1 = len(base64.b64decode(r1))
         s2 = len(base64.b64decode(r2))
         assert abs(s1 - s2) < s1 * 0.1  # Within 10%
+
+
+@pytest.mark.asyncio
+async def test_ezdxf_preview_is_real_png_with_hash_and_force_control(tmp_path):
+    backend = EzdxfBackend()
+    await backend.initialize()
+    await backend.create_circle(0, 0, 10)
+    output = tmp_path / "preview.png"
+
+    first = await backend.drawing_render_preview(str(output), dpi=96, force=True)
+    blocked = await backend.drawing_render_preview(str(output), dpi=96, force=False)
+
+    assert first.ok is True
+    assert first.payload["format"] == "png"
+    assert first.payload["dpi"] == 96
+    assert len(first.payload["sha256"]) == 64
+    assert Path(first.payload["path"]).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+    assert blocked.ok is False
+    assert blocked.error_code == "E_OUTPUT_EXISTS"
+
+
+@pytest.mark.asyncio
+async def test_file_ipc_preview_reports_png_not_pdf(monkeypatch, tmp_path):
+    from autocad_mcp.backends.file_ipc import FileIPCBackend
+
+    backend = FileIPCBackend()
+    output = tmp_path / "autocad-preview.png"
+
+    def fake_plot(path, *args):
+        Path(path).write_bytes(b"PDF")
+        return {"paper": "A3", "orientation": "landscape", "plot_style": "monochrome.ctb"}
+
+    def fake_raster(pdf_path, png_path, *, dpi, background):
+        png_path.write_bytes(b"\x89PNG\r\n\x1a\npreview")
+        return {
+            "path": str(png_path), "format": "png", "dpi": dpi, "background": background,
+            "width": 100, "height": 50, "bytes": png_path.stat().st_size, "sha256": "a" * 64,
+        }
+
+    monkeypatch.setattr(backend, "_plot_preview_via_com", fake_plot)
+    monkeypatch.setattr(backend, "_rasterize_pdf_to_png", fake_raster)
+    monkeypatch.setattr(backend, "_collect_entities_via_com", lambda: [])
+
+    result = await backend.drawing_render_preview(str(output), paper="A3", dpi=120)
+
+    assert result.ok is True
+    assert result.payload["format"] == "png"
+    assert result.payload["renderer"] == "autocad-plot+pymupdf"
+    assert result.payload["width"] == 100
+
+
+def test_pymupdf_rasterizer_creates_verified_png(tmp_path):
+    import fitz
+    from autocad_mcp.backends.file_ipc import FileIPCBackend
+
+    pdf_path = tmp_path / "source.pdf"
+    png_path = tmp_path / "raster.png"
+    document = fitz.open()
+    page = document.new_page(width=200, height=100)
+    page.draw_line((10, 10), (190, 90))
+    document.save(pdf_path)
+    document.close()
+
+    result = FileIPCBackend()._rasterize_pdf_to_png(
+        pdf_path, png_path, dpi=144, background="white"
+    )
+
+    assert result["format"] == "png"
+    assert result["width"] == 400
+    assert result["height"] == 200
+    assert len(result["sha256"]) == 64
+    assert png_path.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"

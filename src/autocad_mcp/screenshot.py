@@ -46,6 +46,9 @@ class MatplotlibScreenshotProvider(ScreenshotProvider):
         self._doc = value
 
     def capture(self) -> str | None:
+        return self.render()
+
+    def render(self, dpi: int = 150, background: str = "white") -> str | None:
         if self._doc is None:
             return None
         try:
@@ -56,7 +59,9 @@ class MatplotlibScreenshotProvider(ScreenshotProvider):
             from ezdxf.addons.drawing import Frontend, RenderContext
             from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
 
-            fig, ax = plt.subplots(figsize=(16, 10), dpi=150)
+            fig, ax = plt.subplots(figsize=(16, 10), dpi=dpi)
+            fig.patch.set_facecolor(background)
+            ax.set_facecolor(background)
             ax.set_aspect("equal")
 
             ctx = RenderContext(self._doc)
@@ -64,7 +69,14 @@ class MatplotlibScreenshotProvider(ScreenshotProvider):
             Frontend(ctx, out).draw_layout(self._doc.modelspace())
 
             buf = io.BytesIO()
-            fig.savefig(buf, format="png", bbox_inches="tight", pad_inches=0.1)
+            fig.savefig(
+                buf,
+                format="png",
+                bbox_inches="tight",
+                pad_inches=0.1,
+                dpi=dpi,
+                facecolor=background,
+            )
             plt.close(fig)
             buf.seek(0)
             return base64.b64encode(buf.read()).decode("ascii")

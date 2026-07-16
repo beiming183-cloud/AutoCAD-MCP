@@ -50,6 +50,9 @@ class BackendCapabilities:
     can_query_entities: bool = False
     can_file_operations: bool = False
     can_undo: bool = False
+    can_create_solids: bool = False
+    can_boolean_solids: bool = False
+    can_project_views: bool = False
 
 
 class AutoCADBackend(ABC):
@@ -108,6 +111,9 @@ class AutoCADBackend(ABC):
         paper: str = "A4",
         orientation: str = "auto",
         plot_style: str = "monochrome.ctb",
+        dpi: int = 150,
+        force: bool = True,
+        background: str = "white",
     ) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
@@ -118,6 +124,7 @@ class AutoCADBackend(ABC):
         changed_only: bool = False,
         layer: str | None = None,
         space: str = "model",
+        rules: dict[str, Any] | None = None,
     ) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
@@ -219,7 +226,10 @@ class AutoCADBackend(ABC):
         return CommandResult(ok=False, error="Not supported on this backend")
 
     async def create_batch(
-        self, entities: list[dict[str, Any]], continue_on_error: bool = False
+        self,
+        entities: list[dict[str, Any]],
+        continue_on_error: bool = False,
+        atomic: bool = False,
     ) -> CommandResult:
         """Create a bounded structured entity batch without arbitrary code execution."""
         if len(entities) > 500:
@@ -227,6 +237,7 @@ class AutoCADBackend(ABC):
 
         results: list[dict[str, Any]] = []
         last_handle: str | None = None
+        created_handles: list[str] = []
         failures = 0
         for index, item in enumerate(entities):
             kind = str(item.get("type", "")).lower()
@@ -304,20 +315,42 @@ class AutoCADBackend(ABC):
             results.append(entry)
             if result.ok and isinstance(result.payload, dict):
                 last_handle = result.payload.get("handle", last_handle)
+                if result.payload.get("handle"):
+                    created_handles.append(str(result.payload["handle"]))
+                created_handles.extend(str(handle) for handle in result.payload.get("handles", []))
             if not result.ok:
                 failures += 1
                 if not continue_on_error:
                     break
 
-        return CommandResult(
-            ok=True,
-            payload={
+        rolled_back: list[str] = []
+        rollback_errors: list[dict[str, str]] = []
+        if failures and atomic:
+            for handle in reversed(created_handles):
+                rollback = await self.entity_erase(handle)
+                if rollback.ok:
+                    rolled_back.append(handle)
+                else:
+                    rollback_errors.append({"handle": handle, "error": rollback.error or "unknown"})
+
+        payload = {
                 "batch_ok": failures == 0,
                 "requested": len(entities),
                 "processed": len(results),
                 "failures": failures,
                 "results": results,
-            },
+                "atomic": bool(atomic),
+                "created_handles": created_handles,
+                "rolled_back": rolled_back,
+                "rollback_errors": rollback_errors,
+            }
+        return CommandResult(
+            ok=failures == 0,
+            payload=payload,
+            error=(f"Batch failed after {len(results)} operations" if failures else None),
+            error_code=("E_BATCH_ROLLED_BACK" if failures and atomic else "E_BATCH_FAILED")
+            if failures
+            else None,
         )
 
     async def entity_list(self, layer: str | None = None) -> CommandResult:
@@ -358,6 +391,72 @@ class AutoCADBackend(ABC):
 
     async def entity_chamfer(self, entity_id1: str, entity_id2: str, dist1: float, dist2: float) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def entity_trim(self, cutters: list[str], targets: list[dict[str, Any]]) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def entity_extend(self, boundaries: list[str], targets: list[dict[str, Any]]) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def entity_break(
+        self, entity_id: str, point1: list[float], point2: list[float]
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def entity_join(self, entity_ids: list[str], tolerance: float = 0.0) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def entity_constrain(
+        self, constraint: str, entity_ids: list[str]
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    # --- Native 3D solid operations ---
+
+    async def solid_create_box(
+        self, center: list[float], length: float, width: float, height: float, layer: str | None = None
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="3D solids are not supported on this backend")
+
+    async def solid_create_cylinder(
+        self, base_center: list[float], radius: float, height: float, layer: str | None = None
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="3D solids are not supported on this backend")
+
+    async def solid_extrude(
+        self,
+        profile_id: str,
+        height: float,
+        taper_angle: float = 0.0,
+        erase_profile: bool = False,
+        layer: str | None = None,
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="3D solids are not supported on this backend")
+
+    async def solid_revolve(
+        self,
+        profile_id: str,
+        axis_point: list[float],
+        axis_direction: list[float],
+        angle: float = 360.0,
+        erase_profile: bool = False,
+        layer: str | None = None,
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="3D solids are not supported on this backend")
+
+    async def solid_sweep(
+        self,
+        profile_id: str,
+        path_id: str,
+        erase_profile: bool = False,
+        layer: str | None = None,
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="3D solids are not supported on this backend")
+
+    async def solid_boolean(
+        self, primary_id: str, tool_id: str, operation: str
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="3D solid booleans are not supported on this backend")
 
     # --- Layer operations ---
 

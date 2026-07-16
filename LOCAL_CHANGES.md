@@ -22,8 +22,8 @@
    command delivery; the original window-message path remains the LT fallback.
 8. Structured drawing audits report bounded entity geometry, layer/type counts,
    drawing bounds, and added/modified/removed handles.
-9. Full AutoCAD produces milestone previews through native PDF plotting instead
-   of desktop/window screenshots.
+9. Full AutoCAD produces milestone previews as verified PNG files rasterized
+   from native plots instead of desktop/window screenshots.
 10. Existing DXF files can be parsed into normalized, bounded audit JSON.
 11. Automatic screenshot attachments are disabled by default; direct window
     capture remains available for UI diagnostics.
@@ -35,8 +35,8 @@
     exposes explicit hatch angle/scale parameters.
 15. `system.recover` cancels stuck commands outside the dispatcher and cleans
     abandoned IPC files; timeouts trigger the same cancellation path.
-16. Full AutoCAD uses COM `Save`/`SaveAs` for DWG and DXF before falling back
-    to command-driven saving.
+16. Full AutoCAD uses COM `Save`/`SaveAs` for DWG and the non-switching COM
+    export API for DXF.
 17. Hidden automation sessions fall back to AutoCAD's COM `HWND`, and DXF
     audits normalize `TEXT` and `MTEXT` heights without cross-type lookups.
 18. AutoCAD is visible by default, can be brought to the foreground before
@@ -68,6 +68,22 @@
     DRC for zero/short segments, duplicate vertices/entities, and self-crossing.
 30. Delivery passes paper/orientation/style/scale/centering into native plotting
     and verifies type/layer counts, bounds, units, digest, and exported DRC.
+31. Geometry DRC includes an endpoint topology graph plus configurable gap,
+    dangling-endpoint, interior-crossing, tangency, equal-radius, and projection checks.
+32. Structured batches are atomic by default and use AutoCAD undo transactions
+    or tracked-entity rollback when a batch operation fails.
+33. File IPC exposes explicit trim, extend, break, join, geometric constraints,
+    and mathematically solved tangent arcs without arbitrary AutoLISP.
+34. Full AutoCAD exposes native boxes, cylinders, extrusions, revolutions,
+    sweeps, and boolean solids through a dedicated standard MCP tool.
+35. Entity queries include arc endpoints, polyline bulges, MText width and
+    attachment, block attributes, ownership, bounds, length, and area when available.
+36. `drawing.render_preview` writes a real white-background PNG with explicit
+    DPI, pixel dimensions, force-overwrite behavior, SHA-256, and geometry digest.
+37. Active-document readiness has a separate bounded timeout so a newly started
+    AutoCAD window can finish COM registration before dispatcher loading begins.
+38. The manual visible-AutoCAD smoke test closes and deletes generated test CAD
+    artifacts by default while retaining a timestamped JSON evidence record.
 
 ## MCP client registration
 

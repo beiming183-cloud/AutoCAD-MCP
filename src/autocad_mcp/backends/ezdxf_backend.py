@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import math
 import os
 from pathlib import Path
@@ -117,6 +118,7 @@ class EzdxfBackend(AutoCADBackend):
         changed_only=False,
         layer=None,
         space="model",
+        rules=None,
     ) -> CommandResult:
         if not self._doc:
             return CommandResult(ok=False, error="No document open")
@@ -137,6 +139,7 @@ class EzdxfBackend(AutoCADBackend):
                 previous_fingerprints=self._audit_fingerprints,
                 revision=self._audit_revision,
                 space="model",
+                geometry_rules=rules,
             )
             self._audit_fingerprints = fingerprints
             units_code = int(self._doc.header.get("$INSUNITS", 0) or 0)
@@ -158,19 +161,47 @@ class EzdxfBackend(AutoCADBackend):
             return CommandResult(ok=False, error=str(exc))
 
     async def drawing_render_preview(
-        self, path, paper="A4", orientation="auto", plot_style="monochrome.ctb"
+        self,
+        path,
+        paper="A4",
+        orientation="auto",
+        plot_style="monochrome.ctb",
+        dpi=150,
+        force=True,
+        background="white",
     ) -> CommandResult:
         output = Path(path).expanduser().resolve()
         if output.suffix.lower() != ".png":
             return CommandResult(ok=False, error="ezdxf preview output must use a .png extension")
-        data = self._screenshot.capture()
+        if int(dpi) < 72 or int(dpi) > 600:
+            return CommandResult(ok=False, error="Preview DPI must be between 72 and 600")
+        if output.exists() and not force:
+            return CommandResult(ok=False, error=f"Preview already exists: {output}", error_code="E_OUTPUT_EXISTS")
+        data = self._screenshot.render(dpi=int(dpi), background=str(background))
         if not data:
             return CommandResult(ok=False, error="Headless preview render failed")
         output.parent.mkdir(parents=True, exist_ok=True)
+        if force:
+            output.unlink(missing_ok=True)
         output.write_bytes(base64.b64decode(data))
+        from PIL import Image
+
+        with Image.open(output) as image:
+            width, height = image.size
         return CommandResult(
             ok=True,
-            payload={"path": str(output), "format": "png", "renderer": "ezdxf-matplotlib"},
+            payload={
+                "path": str(output),
+                "format": "png",
+                "renderer": "ezdxf-matplotlib",
+                "dpi": int(dpi),
+                "background": str(background),
+                "width": width,
+                "height": height,
+                "bytes": output.stat().st_size,
+                "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+                "force_overwrite": bool(force),
+            },
         )
 
     async def drawing_create(self, name: str | None = None) -> CommandResult:

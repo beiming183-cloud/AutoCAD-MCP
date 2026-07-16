@@ -11,11 +11,13 @@ Protocol:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import os
 import re
 import sys
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -23,9 +25,9 @@ from pathlib import Path
 import structlog
 
 from autocad_mcp import __version__
-from autocad_mcp.audit import INSUNITS_NAMES, audit_dxf_file, build_audit
+from autocad_mcp.audit import INSUNITS_NAMES, audit_dxf_file, build_audit, geometry_digest
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
-from autocad_mcp.config import IPC_DIR, IPC_TIMEOUT, LISP_DIR, _autostart_autocad
+from autocad_mcp.config import DOCUMENT_TIMEOUT, IPC_DIR, IPC_TIMEOUT, LISP_DIR, _autostart_autocad
 from autocad_mcp.drafting import encode_autocad_text
 from autocad_mcp.variables import mechanical_variable_updates, validate_variable_updates
 
@@ -110,6 +112,10 @@ def _com_point(value) -> list[float] | None:
         return None
 
 
+def _distance_2d(first, second) -> float:
+    return math.hypot(float(second[0]) - float(first[0]), float(second[1]) - float(first[1]))
+
+
 def _com_entity_to_dict(entity) -> dict:
     """Normalize a full AutoCAD COM entity for structured auditing."""
     object_name = str(_com_value(entity, "ObjectName", "UNKNOWN"))
@@ -130,6 +136,9 @@ def _com_entity_to_dict(entity) -> dict:
         "type": entity_type,
         "handle": str(_com_value(entity, "Handle", "")),
         "layer": str(_com_value(entity, "Layer", "0")),
+        "object_name": object_name,
+        "object_id": _com_value(entity, "ObjectID"),
+        "owner_id": _com_value(entity, "OwnerID"),
     }
 
     if entity_type == "LINE":
@@ -146,6 +155,8 @@ def _com_entity_to_dict(entity) -> dict:
             result.update(
                 start_angle=math.degrees(float(_com_value(entity, "StartAngle", 0))),
                 end_angle=math.degrees(float(_com_value(entity, "EndAngle", 0))),
+                start=_com_point(_com_value(entity, "StartPoint")),
+                end=_com_point(_com_value(entity, "EndPoint")),
             )
     elif entity_type in ("LWPOLYLINE", "POLYLINE", "POLYLINE3D"):
         coordinates = list(_com_value(entity, "Coordinates", []) or [])
@@ -155,6 +166,14 @@ def _com_entity_to_dict(entity) -> dict:
             for index in range(0, len(coordinates), stride)
         ]
         result["closed"] = bool(_com_value(entity, "Closed", False))
+        if entity_type == "LWPOLYLINE":
+            try:
+                result["bulges"] = [
+                    round(float(entity.GetBulge(index)), 9)
+                    for index in range(len(result["points"]))
+                ]
+            except Exception:
+                pass
     elif entity_type in ("TEXT", "MTEXT"):
         result.update(
             insert=_com_point(
@@ -164,6 +183,11 @@ def _com_entity_to_dict(entity) -> dict:
             height=_com_value(entity, "Height", _com_value(entity, "TextHeight")),
             rotation=math.degrees(float(_com_value(entity, "Rotation", 0))),
         )
+        if entity_type == "MTEXT":
+            result.update(
+                width=_com_value(entity, "Width"),
+                attachment_point=_com_value(entity, "AttachmentPoint"),
+            )
     elif entity_type == "INSERT":
         result.update(
             name=str(_com_value(entity, "EffectiveName", _com_value(entity, "Name", ""))),
@@ -172,6 +196,17 @@ def _com_entity_to_dict(entity) -> dict:
             xscale=_com_value(entity, "XScaleFactor", 1),
             yscale=_com_value(entity, "YScaleFactor", 1),
         )
+        try:
+            result["attributes"] = [
+                {
+                    "tag": str(_com_value(attribute, "TagString", "")),
+                    "text": str(_com_value(attribute, "TextString", "")),
+                    "handle": str(_com_value(attribute, "Handle", "")),
+                }
+                for attribute in list(entity.GetAttributes())
+            ]
+        except Exception:
+            result["attributes"] = []
     elif entity_type == "DIMENSION":
         result.update(
             measurement=_com_value(entity, "Measurement"),
@@ -183,6 +218,11 @@ def _com_entity_to_dict(entity) -> dict:
             pattern=str(_com_value(entity, "PatternName", "")),
             area=_com_value(entity, "Area"),
         )
+
+    for property_name, key in (("Length", "length"), ("Area", "area")):
+        value = _com_value(entity, property_name)
+        if value is not None:
+            result[key] = value
 
     try:
         minimum, maximum = entity.GetBoundingBox()
@@ -224,6 +264,9 @@ class FileIPCBackend(AutoCADBackend):
             can_query_entities=True,
             can_file_operations=True,
             can_undo=True,
+            can_create_solids=True,
+            can_boolean_solids=True,
+            can_project_views=False,
         )
 
     async def initialize(self) -> CommandResult:
@@ -388,7 +431,7 @@ class FileIPCBackend(AutoCADBackend):
         }
 
     def _ensure_active_document(self) -> dict:
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + DOCUMENT_TIMEOUT
         last_error = None
         while time.monotonic() < deadline:
             try:
@@ -405,7 +448,10 @@ class FileIPCBackend(AutoCADBackend):
             except Exception as exc:
                 last_error = exc
                 time.sleep(0.25)
-        return {"ready": False, "error": f"No active document after retry: {last_error}"}
+        return {
+            "ready": False,
+            "error": f"No active document after {DOCUMENT_TIMEOUT:g}s: {last_error}",
+        }
 
     # --- IPC dispatch ---
 
@@ -805,12 +851,9 @@ class FileIPCBackend(AutoCADBackend):
 
     async def drawing_save_as_dxf(self, path: str) -> CommandResult:
         try:
-            return CommandResult(ok=True, payload=self._save_via_com(path, file_type=61))
-        except Exception as com_error:
-            result = await self._dispatch("drawing-save-as-dxf", {"path": path})
-            if result.ok and isinstance(result.payload, dict):
-                result.payload["warning"] = f"COM DXF save unavailable: {com_error}"
-            return result
+            return CommandResult(ok=True, payload=self._export_dxf_via_com(path))
+        except Exception as exc:
+            return CommandResult(ok=False, error=str(exc), error_code="E_DXF_EXPORT")
 
     async def drawing_create(self, name: str | None = None) -> CommandResult:
         result = await self._dispatch("drawing-create", {"name": name})
@@ -883,6 +926,7 @@ class FileIPCBackend(AutoCADBackend):
         changed_only=False,
         layer=None,
         space="model",
+        rules=None,
     ) -> CommandResult:
         try:
             entities = self._collect_entities_via_com(layer=layer, space=space)
@@ -911,6 +955,7 @@ class FileIPCBackend(AutoCADBackend):
             previous_fingerprints=self._audit_fingerprints,
             revision=self._audit_revision,
             space=space.lower(),
+            geometry_rules=rules,
         )
         self._audit_fingerprints = fingerprints
         payload["source"] = source
@@ -949,23 +994,66 @@ class FileIPCBackend(AutoCADBackend):
             return CommandResult(ok=False, error=str(exc))
 
     async def drawing_render_preview(
-        self, path, paper="A4", orientation="auto", plot_style="monochrome.ctb"
+        self,
+        path,
+        paper="A4",
+        orientation="auto",
+        plot_style="monochrome.ctb",
+        dpi=150,
+        force=True,
+        background="white",
     ) -> CommandResult:
-        try:
-            payload = self._plot_preview_via_com(
-                path, paper, orientation, plot_style, "fit", "1:1", True
-            )
-            return CommandResult(ok=True, payload=payload)
-        except Exception as com_error:
-            fallback = await self.drawing_plot_pdf(path)
-            if fallback.ok:
-                payload = fallback.payload if isinstance(fallback.payload, dict) else {"path": path}
-                payload.update(renderer="autolisp-plot", warning=f"COM plot unavailable: {com_error}")
-                return CommandResult(ok=True, payload=payload)
+        output = Path(path).expanduser().resolve()
+        if output.suffix.lower() != ".png":
+            return CommandResult(ok=False, error="AutoCAD preview output must use a .png extension")
+        if str(background).lower() != "white":
+            return CommandResult(ok=False, error="AutoCAD preview currently supports a white background")
+        if int(dpi) < 72 or int(dpi) > 600:
+            return CommandResult(ok=False, error="Preview DPI must be between 72 and 600")
+        if output.exists() and not force:
             return CommandResult(
                 ok=False,
-                error=f"COM preview failed: {com_error}; AutoLISP plot failed: {fallback.error}",
+                error=f"Preview already exists: {output}",
+                error_code="E_OUTPUT_EXISTS",
             )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if force:
+            output.unlink(missing_ok=True)
+        temporary_pdf = Path(tempfile.gettempdir()) / f"autocad-mcp-preview-{uuid.uuid4().hex}.pdf"
+        try:
+            plot = self._plot_preview_via_com(
+                str(temporary_pdf), paper, orientation, plot_style, "fit", "1:1", True
+            )
+            raster = self._rasterize_pdf_to_png(
+                temporary_pdf, output, dpi=int(dpi), background=str(background).lower()
+            )
+            try:
+                digest = geometry_digest(self._collect_entities_via_com())
+            except Exception:
+                digest = None
+            return CommandResult(
+                ok=True,
+                payload={
+                    **raster,
+                    "renderer": "autocad-plot+pymupdf",
+                    "paper": plot.get("paper"),
+                    "orientation": plot.get("orientation"),
+                    "plot_style": plot.get("plot_style"),
+                    "geometry_digest": digest,
+                    "force_overwrite": bool(force),
+                },
+            )
+        except Exception as exc:
+            return CommandResult(ok=False, error=f"PNG preview failed: {exc}")
+        finally:
+            for _ in range(20):
+                try:
+                    temporary_pdf.unlink(missing_ok=True)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                log.warning("preview_temp_pdf_cleanup_deferred", path=str(temporary_pdf))
 
     async def drawing_get_variables(self, names: list[str] | None = None) -> CommandResult:
         if names:
@@ -1054,6 +1142,51 @@ class FileIPCBackend(AutoCADBackend):
             "renderer": "autocad-com-saveas",
         }
 
+    def _export_dxf_via_com(self, path: str) -> dict:
+        import pythoncom
+        import win32com.client
+
+        output = Path(path).expanduser().resolve()
+        if output.suffix.lower() != ".dxf":
+            raise ValueError("DXF export path must use a .dxf extension")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.unlink(missing_ok=True)
+
+        pythoncom.CoInitialize()
+        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        document = application.ActiveDocument
+        active_before = str(document.FullName or document.Name)
+        selection_name = f"MCP_EXPORT_{uuid.uuid4().hex[:8]}"
+        selection = document.SelectionSets.Add(selection_name)
+        selection_count = 0
+        try:
+            selection.Select(5)  # acSelectionSetAll
+            selection_count = int(selection.Count)
+            document.Export(str(output.with_suffix("")), "DXF", selection)
+        finally:
+            try:
+                selection.Delete()
+            except Exception:
+                pass
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and not output.is_file():
+            time.sleep(0.1)
+        if not output.is_file() or output.stat().st_size <= 0:
+            raise RuntimeError(f"AutoCAD Export did not create a non-empty DXF: {output}")
+        active_after = str(document.FullName or document.Name)
+        if os.path.normcase(active_after) != os.path.normcase(active_before):
+            raise RuntimeError(
+                f"DXF export changed the active document: {active_before} -> {active_after}"
+            )
+        return {
+            "path": str(output),
+            "format": "dxf",
+            "renderer": "autocad-com-export",
+            "active_document": active_after,
+            "active_document_preserved": True,
+            "selection_count": selection_count,
+        }
+
     def _collect_entities_via_com(self, layer=None, space="model") -> list[dict]:
         import pythoncom
         import win32com.client
@@ -1070,6 +1203,15 @@ class FileIPCBackend(AutoCADBackend):
             entities.append(_com_entity_to_dict(entity))
         return entities
 
+    def _get_entity_via_com(self, entity_id: str) -> dict:
+        import pythoncom
+        import win32com.client
+
+        pythoncom.CoInitialize()
+        document = win32com.client.GetActiveObject("AutoCAD.Application").ActiveDocument
+        entity = document.HandleToObject(str(entity_id))
+        return _com_entity_to_dict(entity)
+
     def _plot_preview_via_com(
         self, path, paper, orientation, plot_style, scale_mode="fit", scale="1:1", center=True
     ) -> dict:
@@ -1080,6 +1222,7 @@ class FileIPCBackend(AutoCADBackend):
         if output.suffix.lower() != ".pdf":
             raise ValueError("Full AutoCAD preview output must use a .pdf extension")
         output.parent.mkdir(parents=True, exist_ok=True)
+        output.unlink(missing_ok=True)
 
         pythoncom.CoInitialize()
         application = win32com.client.GetActiveObject("AutoCAD.Application")
@@ -1197,6 +1340,37 @@ class FileIPCBackend(AutoCADBackend):
                 except Exception:
                     pass
 
+    def _rasterize_pdf_to_png(
+        self, pdf_path: Path, png_path: Path, *, dpi: int, background: str
+    ) -> dict:
+        import fitz
+
+        if background != "white":
+            raise ValueError("Only a white preview background is currently supported")
+        document = fitz.open(str(pdf_path))
+        try:
+            if document.page_count < 1:
+                raise RuntimeError("Preview PDF has no pages")
+            page = document.load_page(0)
+            scale = float(dpi) / 72.0
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+            pixmap.save(str(png_path))
+            width, height = int(pixmap.width), int(pixmap.height)
+        finally:
+            document.close()
+        if not png_path.is_file() or png_path.stat().st_size <= 0:
+            raise RuntimeError("PNG rasterizer did not create a non-empty image")
+        return {
+            "path": str(png_path),
+            "format": "png",
+            "dpi": int(dpi),
+            "background": background,
+            "width": width,
+            "height": height,
+            "bytes": png_path.stat().st_size,
+            "sha256": hashlib.sha256(png_path.read_bytes()).hexdigest(),
+        }
+
     # --- Undo / Redo ---
 
     async def undo(self) -> CommandResult:
@@ -1246,11 +1420,41 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("create-mtext", {"x": x, "y": y, "width": width, "text": encode_autocad_text(text), "height": height, "layer": layer})
 
     async def create_batch(
-        self, entities: list[dict], continue_on_error: bool = False
+        self,
+        entities: list[dict],
+        continue_on_error: bool = False,
+        atomic: bool = False,
     ) -> CommandResult:
         self._suspend_auto_fit += 1
         try:
-            result = await super().create_batch(entities, continue_on_error)
+            if atomic:
+                begin = await self._dispatch("transaction-begin", {})
+                if not begin.ok:
+                    return CommandResult(
+                        ok=False,
+                        error=f"Unable to begin AutoCAD transaction: {begin.error}",
+                        error_code="E_TRANSACTION_BEGIN",
+                    )
+            result = await super().create_batch(entities, continue_on_error, atomic=False)
+            if atomic:
+                transaction = await self._dispatch(
+                    "transaction-commit" if result.ok else "transaction-rollback", {}
+                )
+                if isinstance(result.payload, dict):
+                    result.payload["atomic"] = True
+                    result.payload["transaction"] = transaction.to_dict()
+                    if not result.ok and transaction.ok:
+                        result.error_code = "E_BATCH_ROLLED_BACK"
+                        result.payload["rolled_back"] = list(
+                            reversed(result.payload.get("created_handles", []))
+                        )
+                if not transaction.ok:
+                    return CommandResult(
+                        ok=False,
+                        payload=result.payload,
+                        error=f"AutoCAD transaction finalization failed: {transaction.error}",
+                        error_code="E_TRANSACTION_FINALIZE",
+                    )
         finally:
             self._suspend_auto_fit = max(0, self._suspend_auto_fit - 1)
         if result.ok:
@@ -1280,7 +1484,13 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("entity-count", {"layer": layer})
 
     async def entity_get(self, entity_id) -> CommandResult:
-        return await self._dispatch("entity-get", {"entity_id": entity_id})
+        try:
+            return CommandResult(ok=True, payload=self._get_entity_via_com(entity_id))
+        except Exception as com_error:
+            result = await self._dispatch("entity-get", {"entity_id": entity_id})
+            if result.ok and isinstance(result.payload, dict):
+                result.payload["warning"] = f"COM query unavailable: {com_error}"
+            return result
 
     async def entity_erase(self, entity_id) -> CommandResult:
         return await self._dispatch("entity-erase", {"entity_id": entity_id})
@@ -1311,6 +1521,405 @@ class FileIPCBackend(AutoCADBackend):
 
     async def entity_chamfer(self, entity_id1, entity_id2, dist1, dist2) -> CommandResult:
         return await self._dispatch("entity-chamfer", {"id1": entity_id1, "id2": entity_id2, "dist1": dist1, "dist2": dist2})
+
+    async def entity_trim(self, cutters, targets) -> CommandResult:
+        before = {}
+        for target in targets:
+            try:
+                before[str(target["id"])] = self._get_entity_via_com(str(target["id"]))
+            except Exception:
+                pass
+        cutters_str = ";".join(str(handle) for handle in cutters)
+        targets_str = ";".join(
+            f"{target['id']}@{target['pick'][0]},{target['pick'][1]}" for target in targets
+        )
+        result = await self._dispatch(
+            "entity-trim", {"cutters_str": cutters_str, "targets_str": targets_str}
+        )
+        return self._verify_entity_changes(result, before, "TRIM")
+
+    async def entity_extend(self, boundaries, targets) -> CommandResult:
+        before = {}
+        for target in targets:
+            try:
+                before[str(target["id"])] = self._get_entity_via_com(str(target["id"]))
+            except Exception:
+                pass
+        boundaries_str = ";".join(str(handle) for handle in boundaries)
+        targets_str = ";".join(
+            f"{target['id']}@{target['pick'][0]},{target['pick'][1]}" for target in targets
+        )
+        result = await self._dispatch(
+            "entity-extend", {"boundaries_str": boundaries_str, "targets_str": targets_str}
+        )
+        return self._verify_entity_changes(result, before, "EXTEND")
+
+    async def entity_break(self, entity_id, point1, point2) -> CommandResult:
+        return await self._dispatch(
+            "entity-break",
+            {
+                "entity_id": entity_id,
+                "x1": point1[0],
+                "y1": point1[1],
+                "x2": point2[0],
+                "y2": point2[1],
+            },
+        )
+
+    async def entity_join(self, entity_ids, tolerance=0.0) -> CommandResult:
+        try:
+            return CommandResult(
+                ok=True,
+                payload=self._join_lines_via_com(entity_ids, float(tolerance)),
+            )
+        except Exception as com_error:
+            before_count = (await self.entity_count()).payload.get("count")
+            result = await self._dispatch(
+                "entity-join",
+                {
+                    "entity_ids_str": ";".join(str(handle) for handle in entity_ids),
+                    "tolerance": tolerance,
+                },
+            )
+            after_count = (await self.entity_count()).payload.get("count")
+            if result.ok and before_count is not None and after_count is not None and after_count >= before_count:
+                return CommandResult(
+                    ok=False,
+                    error=f"JOIN command completed without reducing entity count; COM join failed: {com_error}",
+                    error_code="E_VALIDATION_FAILED",
+                )
+            if result.ok and isinstance(result.payload, dict):
+                result.payload.update(
+                    verified=True,
+                    entity_count_before=before_count,
+                    entity_count_after=after_count,
+                    warning=f"COM line join unavailable: {com_error}",
+                )
+            return result
+
+    async def entity_constrain(self, constraint, entity_ids) -> CommandResult:
+        result = await self._dispatch(
+            "entity-constrain",
+            {
+                "constraint": constraint,
+                "entity_ids_str": ";".join(str(handle) for handle in entity_ids),
+            },
+        )
+        if result.ok and isinstance(result.payload, dict):
+            result.payload.update(
+                verified=False,
+                verification="AutoCAD accepted the native GEOMCONSTRAINT command; the ActiveX API does not expose a portable constraint collection.",
+            )
+        return result
+
+    def _verify_entity_changes(
+        self, result: CommandResult, before: dict[str, dict], operation: str
+    ) -> CommandResult:
+        if not result.ok:
+            return result
+        if not before:
+            if isinstance(result.payload, dict):
+                result.payload.update(
+                    verified=False,
+                    verification=f"{operation} command accepted; target geometry verification requires full AutoCAD COM.",
+                )
+            return result
+        changed = []
+        for handle, previous in before.items():
+            try:
+                current = self._get_entity_via_com(handle)
+            except Exception:
+                changed.append(handle)
+                continue
+            if current != previous:
+                changed.append(handle)
+        if not changed:
+            return CommandResult(
+                ok=False,
+                error=f"{operation} command completed but no target geometry changed",
+                error_code="E_VALIDATION_FAILED",
+                payload={"targets": list(before)},
+            )
+        payload = result.payload if isinstance(result.payload, dict) else {}
+        payload.update(verified=True, changed_handles=changed)
+        result.payload = payload
+        return result
+
+    def _join_lines_via_com(self, entity_ids, tolerance: float) -> dict:
+        pythoncom, win32com, document, modelspace = self._solid_context()
+        entities = [document.HandleToObject(str(handle)) for handle in entity_ids]
+        if len(entities) < 2 or any(str(entity.ObjectName) != "AcDbLine" for entity in entities):
+            raise ValueError("Deterministic COM join currently requires at least two LINE entities")
+        threshold = max(float(tolerance), 0.000001)
+        segments = [
+            [_com_point(entity.StartPoint)[:2], _com_point(entity.EndPoint)[:2]]
+            for entity in entities
+        ]
+
+        endpoint_candidates = [point for segment in segments for point in segment]
+        start = next(
+            (
+                point
+                for point in endpoint_candidates
+                if sum(_distance_2d(point, other) <= threshold for other in endpoint_candidates) == 1
+            ),
+            segments[0][0],
+        )
+        vertices = [start]
+        unused = set(range(len(segments)))
+        current = start
+        while unused:
+            match = None
+            for index in unused:
+                first, second = segments[index]
+                if _distance_2d(current, first) <= threshold:
+                    match = index, second
+                    break
+                if _distance_2d(current, second) <= threshold:
+                    match = index, first
+                    break
+            if match is None:
+                raise ValueError("LINE entities do not form one connected chain within tolerance")
+            index, current = match
+            unused.remove(index)
+            vertices.append(current)
+
+        closed = len(vertices) > 2 and _distance_2d(vertices[0], vertices[-1]) <= threshold
+        if closed:
+            vertices.pop()
+        base_x = vertices[-1][0] - vertices[0][0]
+        base_y = vertices[-1][1] - vertices[0][1]
+        base_length = math.hypot(base_x, base_y)
+        collinear = not closed and base_length > threshold and all(
+            abs(
+                base_x * (point[1] - vertices[0][1])
+                - base_y * (point[0] - vertices[0][0])
+            )
+            <= threshold * base_length
+            for point in vertices[1:-1]
+        )
+
+        if collinear:
+            joined = entities[0]
+            joined.StartPoint = self._solid_point(pythoncom, win32com, vertices[0])
+            joined.EndPoint = self._solid_point(pythoncom, win32com, vertices[-1])
+            for entity in entities[1:]:
+                entity.Delete()
+            entity_type = "LINE"
+        else:
+            coordinates = [coordinate for point in vertices for coordinate in point[:2]]
+            variant = win32com.client.VARIANT(
+                pythoncom.VT_ARRAY | pythoncom.VT_R8, coordinates
+            )
+            joined = modelspace.AddLightWeightPolyline(variant)
+            joined.Layer = str(entities[0].Layer)
+            joined.Closed = bool(closed)
+            for entity in entities:
+                entity.Delete()
+            entity_type = "LWPOLYLINE"
+        joined.Update()
+        self._auto_fit_view()
+        return {
+            "handle": str(joined.Handle),
+            "entity_type": entity_type,
+            "joined_handles": [str(handle) for handle in entity_ids],
+            "vertex_count": len(vertices),
+            "closed": closed,
+            "verified": True,
+            "renderer": "autocad-com",
+        }
+
+    # --- Native 3D solid operations ---
+
+    @staticmethod
+    def _solid_point(pythoncom, win32com, value):
+        coordinates = [float(item) for item in list(value)[:3]]
+        while len(coordinates) < 3:
+            coordinates.append(0.0)
+        return win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_R8, coordinates
+        )
+
+    def _solid_context(self):
+        import pythoncom
+        import win32com.client
+
+        pythoncom.CoInitialize()
+        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        document = application.ActiveDocument
+        return pythoncom, win32com, document, document.ModelSpace
+
+    def _solid_payload(self, entity, operation: str) -> dict:
+        payload = _com_entity_to_dict(entity)
+        payload.update(
+            entity_type="3DSOLID",
+            operation=operation,
+            renderer="autocad-com",
+            volume=_com_value(entity, "Volume"),
+            centroid=_com_point(_com_value(entity, "Centroid")),
+        )
+        return {key: value for key, value in payload.items() if value is not None}
+
+    def _region_from_profile(self, profile_id: str):
+        pythoncom, win32com, document, modelspace = self._solid_context()
+        profile = document.HandleToObject(str(profile_id))
+        curves = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, [profile]
+        )
+        regions = list(modelspace.AddRegion(curves))
+        if len(regions) != 1:
+            for region in regions:
+                try:
+                    region.Delete()
+                except Exception:
+                    pass
+            raise ValueError("Profile must create exactly one planar closed region")
+        return pythoncom, win32com, document, modelspace, profile, regions[0]
+
+    async def solid_create_box(self, center, length, width, height, layer=None) -> CommandResult:
+        try:
+            if min(float(length), float(width), float(height)) <= 0:
+                raise ValueError("Box length, width, and height must be positive")
+            pythoncom, win32com, _, modelspace = self._solid_context()
+            solid = modelspace.AddBox(
+                self._solid_point(pythoncom, win32com, center),
+                float(length),
+                float(width),
+                float(height),
+            )
+            if layer:
+                solid.Layer = layer
+            solid.Update()
+            self._auto_fit_view()
+            return CommandResult(ok=True, payload=self._solid_payload(solid, "box"))
+        except Exception as exc:
+            return CommandResult(ok=False, error=str(exc), error_code="E_SOLID_OPERATION")
+
+    async def solid_create_cylinder(self, base_center, radius, height, layer=None) -> CommandResult:
+        try:
+            if float(radius) <= 0 or float(height) == 0:
+                raise ValueError("Cylinder radius must be positive and height must be non-zero")
+            pythoncom, win32com, _, modelspace = self._solid_context()
+            solid = modelspace.AddCylinder(
+                self._solid_point(pythoncom, win32com, base_center), float(radius), float(height)
+            )
+            if layer:
+                solid.Layer = layer
+            solid.Update()
+            self._auto_fit_view()
+            return CommandResult(ok=True, payload=self._solid_payload(solid, "cylinder"))
+        except Exception as exc:
+            return CommandResult(ok=False, error=str(exc), error_code="E_SOLID_OPERATION")
+
+    async def solid_extrude(
+        self, profile_id, height, taper_angle=0.0, erase_profile=False, layer=None
+    ) -> CommandResult:
+        region = None
+        try:
+            if float(height) == 0:
+                raise ValueError("Extrusion height must be non-zero")
+            _, _, _, modelspace, profile, region = self._region_from_profile(profile_id)
+            solid = modelspace.AddExtrudedSolid(
+                region, float(height), math.radians(float(taper_angle))
+            )
+            if layer:
+                solid.Layer = layer
+            if erase_profile:
+                profile.Delete()
+            solid.Update()
+            return CommandResult(ok=True, payload=self._solid_payload(solid, "extrude"))
+        except Exception as exc:
+            return CommandResult(ok=False, error=str(exc), error_code="E_SOLID_OPERATION")
+        finally:
+            if region is not None:
+                try:
+                    region.Delete()
+                except Exception:
+                    pass
+            self._auto_fit_view()
+
+    async def solid_revolve(
+        self,
+        profile_id,
+        axis_point,
+        axis_direction,
+        angle=360.0,
+        erase_profile=False,
+        layer=None,
+    ) -> CommandResult:
+        region = None
+        try:
+            direction = [float(item) for item in list(axis_direction)[:3]]
+            while len(direction) < 3:
+                direction.append(0.0)
+            if math.sqrt(sum(value * value for value in direction)) <= 0.000001:
+                raise ValueError("Revolve axis direction must be non-zero")
+            pythoncom, win32com, _, modelspace, profile, region = self._region_from_profile(profile_id)
+            solid = modelspace.AddRevolvedSolid(
+                region,
+                self._solid_point(pythoncom, win32com, axis_point),
+                self._solid_point(pythoncom, win32com, direction),
+                math.radians(float(angle)),
+            )
+            if layer:
+                solid.Layer = layer
+            if erase_profile:
+                profile.Delete()
+            solid.Update()
+            return CommandResult(ok=True, payload=self._solid_payload(solid, "revolve"))
+        except Exception as exc:
+            return CommandResult(ok=False, error=str(exc), error_code="E_SOLID_OPERATION")
+        finally:
+            if region is not None:
+                try:
+                    region.Delete()
+                except Exception:
+                    pass
+            self._auto_fit_view()
+
+    async def solid_sweep(self, profile_id, path_id, erase_profile=False, layer=None) -> CommandResult:
+        region = None
+        try:
+            _, _, document, modelspace, profile, region = self._region_from_profile(profile_id)
+            path = document.HandleToObject(str(path_id))
+            solid = modelspace.AddExtrudedSolidAlongPath(region, path)
+            if layer:
+                solid.Layer = layer
+            if erase_profile:
+                profile.Delete()
+            solid.Update()
+            return CommandResult(ok=True, payload=self._solid_payload(solid, "sweep"))
+        except Exception as exc:
+            return CommandResult(ok=False, error=str(exc), error_code="E_SOLID_OPERATION")
+        finally:
+            if region is not None:
+                try:
+                    region.Delete()
+                except Exception:
+                    pass
+            self._auto_fit_view()
+
+    async def solid_boolean(self, primary_id, tool_id, operation) -> CommandResult:
+        operation_name = str(operation).lower()
+        operation_codes = {"union": 0, "intersection": 1, "subtract": 2}
+        if operation_name not in operation_codes:
+            return CommandResult(
+                ok=False,
+                error="Boolean operation must be union, intersection, or subtract",
+                error_code="E_SOLID_OPERATION",
+            )
+        try:
+            _, _, document, _ = self._solid_context()
+            primary = document.HandleToObject(str(primary_id))
+            tool = document.HandleToObject(str(tool_id))
+            primary.Boolean(operation_codes[operation_name], tool)
+            primary.Update()
+            self._auto_fit_view()
+            return CommandResult(
+                ok=True, payload=self._solid_payload(primary, f"boolean-{operation_name}")
+            )
+        except Exception as exc:
+            return CommandResult(ok=False, error=str(exc), error_code="E_SOLID_OPERATION")
 
     # --- Layer operations ---
 

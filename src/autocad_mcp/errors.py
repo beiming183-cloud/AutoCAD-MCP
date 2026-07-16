@@ -14,6 +14,13 @@ ERROR_ACTIONS = {
     "E_OUTPUT_PATH_REJECTED": (False, "use_managed_output_workspace"),
     "E_VARIABLE_REJECTED": (False, "use_whitelisted_variable_and_value"),
     "E_VALIDATION_FAILED": (False, "inspect_validation_report"),
+    "E_BATCH_FAILED": (True, "inspect_batch_results"),
+    "E_BATCH_ROLLED_BACK": (True, "correct_batch_and_retry"),
+    "E_TRANSACTION_BEGIN": (True, "recover_and_retry"),
+    "E_TRANSACTION_FINALIZE": (False, "inspect_drawing_undo_state"),
+    "E_SOLID_OPERATION": (False, "inspect_profile_and_solid_inputs"),
+    "E_DXF_EXPORT": (True, "inspect_export_settings_and_retry"),
+    "E_OUTPUT_EXISTS": (False, "set_force_true_or_choose_new_path"),
     "E_UNSUPPORTED_OPERATION": (False, "check_backend_capabilities"),
     "E_INTERNAL": (True, "inspect_logs_and_retry"),
 }

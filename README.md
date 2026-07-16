@@ -8,10 +8,10 @@ Two backends, one API:
 
 | Backend | Runtime | Requires AutoCAD? | Validation feedback |
 |---------|---------|-------------------|------------|
-| **File IPC** | Windows Python | Yes - full AutoCAD or AutoCAD LT 2024+ | Structured audit + native PDF plot |
+| **File IPC** | Windows Python | Yes - full AutoCAD or AutoCAD LT 2024+ | Topology audit + native PDF/PNG |
 | **ezdxf** | Any platform | No (headless) | Structured audit + deterministic PNG |
 
-The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `block`, `annotation`, `pid`, `view`, `system`) over the standard MCP stdio transport. It is client-independent and works with Codex, Claude Code, Claude Desktop, Cursor, and other MCP-compatible clients.
+The server exposes **9 consolidated tools** (`drawing`, `entity`, `solid`, `layer`, `block`, `annotation`, `pid`, `view`, `system`) over the standard MCP stdio transport. It is client-independent and works with Codex, Claude Code, Claude Desktop, Cursor, and other MCP-compatible clients.
 
 ## Prerequisites (File IPC backend)
 
@@ -39,7 +39,7 @@ Open AutoCAD or AutoCAD LT and load `mcp_dispatch.lsp` using **APPLOAD**:
 1. Type `APPLOAD` in the AutoCAD command line
 2. Browse to `<repo>/lisp-code/mcp_dispatch.lsp`
 3. Click **Load**
-4. You should see: `=== MCP Dispatch v3.6.0 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
+4. You should see: `=== MCP Dispatch v3.7.0 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
 
 > **Tip:** Add the file to your AutoCAD Startup Suite (in the APPLOAD dialog) so it loads automatically with every drawing.
 
@@ -126,13 +126,13 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 | `open` | Open an existing drawing | Yes | Yes (DXF) |
 | `info` | Get entity count and layers | Yes | Yes |
 | `save` | Save current drawing (to path if given) | Yes | Yes |
-| `save_as_dxf` | Export as DXF | Yes | Yes |
+| `save_as_dxf` | Export as DXF without switching the active DWG | Yes | Yes |
 | `plot_pdf` | Plot to PDF | Yes | No |
-| `render_preview` | Native PDF preview or deterministic headless PNG | Yes | Yes |
+| `render_preview` | True PNG with DPI, force-overwrite, dimensions, and SHA-256 | Yes | Yes |
 | `workspace` | Create and report the managed output workspace | Yes | Yes |
 | `deliver` | Validated DWG/DXF/PDF package with manifest and checksums | Yes | No |
 | `audit` | Compact structured entity audit with change tracking | Yes | Yes |
-| `audit_geometry` | Geometry DRC for zero/short segments, duplicate vertices/entities, and self-intersections | Yes | Yes |
+| `audit_geometry` | Geometry/topology DRC including gaps, dangling endpoints, crossings, tangency, equal radii, and projection checks | Yes | Yes |
 | `audit_dxf` | Parse an existing DXF into normalized JSON | Yes | Yes |
 | `setup_mechanical` | Configure mm units, dimensions, sheet metadata, and seven GB/T layers | Yes | Yes |
 | `purge` | Purge unused objects | Yes | Yes |
@@ -143,17 +143,25 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 
 ### `entity` — Entity CRUD + modification
 
-**Create:** `create_line`, `create_circle`, `create_polyline`, `create_rectangle`, `create_arc`, `create_ellipse`, `create_mtext`, `create_hatch`, `create_batch`
+**Create:** `create_line`, `create_circle`, `create_polyline`, `create_rectangle`, `create_arc`, `create_tangent_arc`, `create_ellipse`, `create_mtext`, `create_hatch`, `create_batch`
 
-`create_batch` accepts up to 500 structured entities in one MCP call. It supports line, circle, polyline, rectangle, arc, ellipse, text, mtext, and hatch records. A hatch can use `entity_id: "$last"` to reference the preceding entity. This is the preferred high-throughput path; it does not enable arbitrary AutoLISP.
+`create_batch` accepts up to 500 structured entities in one MCP call. It supports line, circle, polyline, rectangle, arc, ellipse, text, mtext, and hatch records. A hatch can use `entity_id: "$last"` to reference the preceding entity. Batches are atomic by default: a failed operation rolls back the AutoCAD undo group or the tracked headless entities. This is the preferred high-throughput path; it does not enable arbitrary AutoLISP.
 
 For `ANSI31`, pass `angle: 0` to retain the pattern's native 45-degree section angle. `scale` and hatch `layer` are also explicit parameters.
 
 **Read:** `list`, `count`, `get`
 
-**Modify:** `copy`, `move`, `rotate`, `scale`, `mirror`, `offset`\*, `array`, `fillet`\*, `chamfer`\*, `erase`
+**Modify:** `copy`, `move`, `rotate`, `scale`, `mirror`, `offset`\*, `array`, `fillet`\*, `chamfer`\*, `trim`\*, `extend`\*, `break`\*, `join`\*, `constrain`\*, `erase`
 
-> \* `offset`, `fillet`, `chamfer` are File IPC only (not supported in ezdxf headless backend).
+> \* These native editing operations are File IPC only. `trim` and `extend` require explicit entity IDs and pick points so AutoCAD never guesses which side to keep.
+
+`constrain` reports whether the native command was accepted, but currently returns `verified: false` because the portable ActiveX API does not expose AutoCAD's associative constraint collection. Treat the constraint as review-required rather than release evidence.
+
+### `solid` - Native AutoCAD 3D solids
+
+`create_box`, `create_cylinder`, `extrude`, `revolve`, `sweep`, `boolean`
+
+The `solid` tool is available on full AutoCAD through the native ActiveX object model. Box placement uses its center; cylinder placement uses the center of its base. Extrude, revolve, and sweep consume a closed profile handle; boolean accepts `union`, `intersection`, or `subtract`. AutoCAD LT and the ezdxf backend report these operations as unsupported. Edge fillets/chamfers and projected drawing views are not advertised yet because their prompt-driven workflows have not reached the same deterministic standard.
 
 ### `layer` — Layer management
 
@@ -196,9 +204,9 @@ Normal validation is data-first: use `drawing.audit` after edits and `drawing.re
 edit entities -> drawing.audit -> native render_preview -> audit_dxf for final delivery
 ```
 
-`drawing.audit` returns entity counts by type and layer, drawing bounds, units, a handle-independent geometry digest, geometry DRC, limited normalized entity geometry, and added/modified/removed handles since the previous audit. DRC detects zero/short segments, consecutive duplicate vertices, duplicate closed endpoints, polyline self-intersections, and duplicate entities. `limit` is clamped to 500 so large drawings do not flood model context.
+`drawing.audit` returns entity counts by type and layer, drawing bounds, units, a handle-independent geometry digest, geometry DRC, an endpoint topology graph, limited normalized entity geometry, and added/modified/removed handles since the previous audit. In addition to degenerate geometry, rules can check connection gaps, dangling endpoints, interior crossings, explicit tangent pairs, equal-radius groups, and cross-view projection alignment. `limit` is clamped to 500 so large drawings do not flood model context.
 
-`drawing.render_preview` uses full AutoCAD's native `PlotToFile` for PDF output, preserving plot styles and avoiding desktop/window capture. The ezdxf backend writes a deterministic PNG instead.
+`drawing.render_preview` always returns a real PNG. Full AutoCAD plots a temporary PDF with its native renderer and rasterizes it with PyMuPDF, preserving plot styles without capturing the desktop. The result includes DPI, pixel size, SHA-256, and the source geometry digest. `drawing.plot_pdf` remains the release-quality vector output.
 
 ### Industrial delivery jobs
 
@@ -234,8 +242,9 @@ The job contains `specs/request.json`, `manifest.json`, editable DWG and DXF fil
 ### Industrial automation roadmap
 
 - **v3.6 reliability (complete):** self-healing startup, dispatcher version handshake, machine-readable MCP failures, controlled variables, geometry DRC, DXF units/digests, and enforced plot configuration.
-- **v3.7 specifications:** versioned JSON drawing specifications, template/title-block registry, units and standards declarations, drawing-number/revision rules, and spec-to-audit comparison.
-- **v3.8 orchestration:** transaction boundaries, rollback, idempotency keys, resumable job states, bounded retries, structured logs, and a local job queue.
+- **v3.7 geometry control (complete):** topology DRC, atomic batches, safe trim/extend/break/join/constraints, native 3D solids, non-switching DXF export, and verified PNG previews.
+- **v3.8 specifications:** versioned JSON drawing specifications, template/title-block registry, assembly/component trees, drawing-number/revision rules, and spec-to-audit comparison.
+- **v3.9 orchestration:** idempotency keys, resumable job states, bounded retries, structured logs, and a local job queue.
 - **v4.0 hybrid CAD:** FreeCAD CLI/MCP as the parameterized 3D and STEP executor, AutoCAD as the visible DWG/2D drafting and release executor, with shared specs and acceptance reports.
 
 ### `system` — Server management
@@ -253,7 +262,7 @@ Tool failures use MCP `isError=true` and a stable structure containing `code`, `
 ## Architecture
 
 ```
-MCP Client (Claude)
+MCP Client (Codex / Claude Code / Claude Desktop / Cursor)
     │  stdio (JSON-RPC)
     ▼
 Python MCP Server (autocad_mcp)
@@ -274,6 +283,7 @@ The File IPC backend sends `(c:mcp-dispatch)` to the active drawing. Full AutoCA
 | `AUTOCAD_MCP_BACKEND` | `auto` | Backend selection: `auto`, `file_ipc`, `ezdxf` |
 | `AUTOCAD_MCP_IPC_DIR` | `C:/temp` | Directory for IPC command/result JSON files (must match on both Python and LISP sides) |
 | `AUTOCAD_MCP_IPC_TIMEOUT` | `10.0` | IPC command timeout in seconds (1-300) |
+| `AUTOCAD_MCP_DOCUMENT_TIMEOUT` | `30.0` | Seconds to wait for COM registration and an active document after the window appears (5-120) |
 | `AUTOCAD_MCP_ONLY_TEXT` | `true` | Disable automatic screenshot attachments; direct diagnostic capture remains available |
 | `AUTOCAD_MCP_AUTOSTART` | `false` | Start AutoCAD automatically when File IPC is requested and no AutoCAD window exists |
 | `AUTOCAD_MCP_VISIBLE` | `true` | Keep the AutoCAD window shown and restore it before drawing |
@@ -309,7 +319,17 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 
 The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
 
-## What's New in v3.6
+## What's New in v3.7
+
+- **Topology-aware DRC** - audits expose endpoint connectivity and configurable checks for near misses, dangling endpoints, non-endpoint crossings, tangency, equal-radius groups, and projection alignment.
+- **Atomic batches** - `create_batch` opens an AutoCAD undo transaction by default and rolls back the whole batch on failure.
+- **Controlled 2D repair** - explicit `trim`, `extend`, `break`, `join`, geometric constraints, and mathematically solved tangent arcs replace blind coordinate patching.
+- **Native 3D solids** - full AutoCAD supports boxes, cylinders, extrusions, revolutions, sweeps, and boolean operations through a dedicated safe tool.
+- **True PNG previews** - native AutoCAD plotting is rasterized to a force-overwritable white-background PNG with DPI, dimensions, hashes, and no desktop capture.
+- **Non-switching DXF export** - `save_as_dxf` uses AutoCAD's export API and verifies that the active DWG remains unchanged.
+- **Richer entity data** - arc endpoints, polyline bulges, MText width/attachment, block attributes, bounds, length, area, and object ownership are returned when available.
+
+### v3.6
 
 - **Self-healing readiness** - `system.ensure_ready` discovers or starts AutoCAD, ensures an active document, loads the configured or bundled dispatcher, verifies its version, and pings IPC.
 - **Structured MCP errors** - failures are marked `isError=true` and use stable error codes such as `E_DISPATCHER_NOT_LOADED`, `E_IPC_TIMEOUT`, and `E_OUTPUT_PATH_REJECTED`.

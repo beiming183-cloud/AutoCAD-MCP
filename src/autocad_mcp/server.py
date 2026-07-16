@@ -1,6 +1,6 @@
 """AutoCAD MCP Server v3.1 — 8 consolidated tools with operation dispatch.
 
-Tools: drawing, entity, layer, block, annotation, pid, view, system
+Tools: drawing, entity, solid, layer, block, annotation, pid, view, system
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from autocad_mcp.client import (
     tool_error,
 )
 from autocad_mcp.delivery import deliver_drawing
+from autocad_mcp.drafting import tangent_arc_from_start
 from autocad_mcp.workspace import resolve_output_target, workspace_info
 
 # FastMCP validates return types via Pydantic. Tools that may return
@@ -110,11 +111,10 @@ async def drawing(
             data.get("center", True),
         )
     elif operation == "render_preview":
-        extension = ".pdf" if backend.name == "file_ipc" else ".png"
         target = resolve_output_target(
             data.get("path"),
             category="previews",
-            extension=extension,
+            extension=".png",
             default_stem=data.get("name", "preview"),
         )
         result = await backend.drawing_render_preview(
@@ -122,6 +122,9 @@ async def drawing(
             data.get("paper", "A4"),
             data.get("orientation", "auto"),
             data.get("plot_style", "monochrome.ctb"),
+            data.get("dpi", 150),
+            data.get("force", True),
+            data.get("background", "white"),
         )
     elif operation == "deliver":
         result = await deliver_drawing(backend, data)
@@ -132,6 +135,7 @@ async def drawing(
             data.get("changed_only", False),
             data.get("layer"),
             data.get("space", "model"),
+            data.get("rules"),
         )
     elif operation == "audit_dxf":
         result = await backend.drawing_audit_dxf(
@@ -222,6 +226,18 @@ async def entity(
         result = await backend.create_rectangle(x1, y1, x2, y2, layer)
     elif operation == "create_arc":
         result = await backend.create_arc(data["cx"], data["cy"], data["radius"], data["start_angle"], data["end_angle"], layer)
+    elif operation == "create_tangent_arc":
+        geometry = tangent_arc_from_start(data["start"], data["end"], data["tangent"])
+        result = await backend.create_arc(
+            geometry["center"][0],
+            geometry["center"][1],
+            geometry["radius"],
+            geometry["start_angle"],
+            geometry["end_angle"],
+            layer,
+        )
+        if result.ok and isinstance(result.payload, dict):
+            result.payload["tangent_geometry"] = geometry
     elif operation == "create_ellipse":
         result = await backend.create_ellipse(data["cx"], data["cy"], data["major_x"], data["major_y"], data["ratio"], layer)
     elif operation == "create_mtext":
@@ -236,7 +252,9 @@ async def entity(
         )
     elif operation == "create_batch":
         result = await backend.create_batch(
-            data.get("entities", []), data.get("continue_on_error", False)
+            data.get("entities", []),
+            data.get("continue_on_error", False),
+            data.get("atomic", True),
         )
     # --- Read ---
     elif operation == "list":
@@ -264,6 +282,16 @@ async def entity(
         result = await backend.entity_fillet(data["id1"], data["id2"], data["radius"])
     elif operation == "chamfer":
         result = await backend.entity_chamfer(data["id1"], data["id2"], data["dist1"], data["dist2"])
+    elif operation == "trim":
+        result = await backend.entity_trim(data.get("cutters", []), data.get("targets", []))
+    elif operation == "extend":
+        result = await backend.entity_extend(data.get("boundaries", []), data.get("targets", []))
+    elif operation == "break":
+        result = await backend.entity_break(entity_id, data["point1"], data["point2"])
+    elif operation == "join":
+        result = await backend.entity_join(data.get("entity_ids", []), data.get("tolerance", 0.0))
+    elif operation == "constrain":
+        result = await backend.entity_constrain(data["constraint"], data.get("entity_ids", []))
     elif operation == "erase":
         result = await backend.entity_erase(entity_id)
     else:
@@ -434,6 +462,61 @@ async def annotation(
 # ==========================================================================
 # 6. pid — P&ID operations (CTO library)
 # ==========================================================================
+
+
+@mcp.tool(annotations={"title": "AutoCAD Native 3D Solids", "readOnlyHint": False})
+@_safe("solid")
+async def solid(
+    operation: str,
+    data: dict | None = None,
+    include_screenshot: bool = False,
+) -> ToolResult:
+    """Create and combine native AutoCAD 3D solids through the safe COM API.
+
+    Operations:
+      create_box      - {center: [x,y,z], length, width, height, layer?}
+      create_cylinder - {base_center: [x,y,z], radius, height, layer?}
+      extrude         - {profile_id, height, taper_angle?, erase_profile?, layer?}
+      revolve         - {profile_id, axis_point, axis_direction, angle?, erase_profile?, layer?}
+      sweep           - {profile_id, path_id, erase_profile?, layer?}
+      boolean         - {primary_id, tool_id, operation: union|intersection|subtract}
+
+    Edge fillets/chamfers and projected drawing views are intentionally not advertised
+    until their native AutoCAD workflows can be made deterministic.
+    """
+    data = data or {}
+    backend = await get_backend()
+
+    if operation == "create_box":
+        result = await backend.solid_create_box(
+            data.get("center", data.get("origin", [0, 0, 0])),
+            data["length"], data["width"], data["height"], data.get("layer")
+        )
+    elif operation == "create_cylinder":
+        result = await backend.solid_create_cylinder(
+            data.get("base_center", data.get("center", [0, 0, 0])),
+            data["radius"], data["height"], data.get("layer")
+        )
+    elif operation == "extrude":
+        result = await backend.solid_extrude(
+            data["profile_id"], data["height"], data.get("taper_angle", 0.0),
+            data.get("erase_profile", False), data.get("layer"),
+        )
+    elif operation == "revolve":
+        result = await backend.solid_revolve(
+            data["profile_id"], data["axis_point"], data["axis_direction"], data.get("angle", 360.0),
+            data.get("erase_profile", False), data.get("layer"),
+        )
+    elif operation == "sweep":
+        result = await backend.solid_sweep(
+            data["profile_id"], data["path_id"], data.get("erase_profile", False), data.get("layer")
+        )
+    elif operation == "boolean":
+        result = await backend.solid_boolean(data["primary_id"], data["tool_id"], data["operation"])
+    else:
+        return tool_error(f"Unknown solid operation: {operation}", code="E_UNSUPPORTED_OPERATION")
+
+    return await add_screenshot_if_available(result, include_screenshot)
 
 
 @mcp.tool(annotations={"title": "P&ID Operations (CTO Library)", "readOnlyHint": False})

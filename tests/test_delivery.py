@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
-from autocad_mcp.delivery import _export_checks, deliver_drawing
+from autocad_mcp.delivery import _export_checks, _validation_checks, deliver_drawing
 
 
 class FakeDeliveryBackend(AutoCADBackend):
@@ -196,3 +196,22 @@ def test_export_checks_compare_types_layers_bounds_digest_and_units():
     assert next(item for item in checks if item["name"] == "dxf_geometry_digest_matches_source")[
         "passed"
     ] is False
+
+
+def test_geometry_warnings_do_not_fail_release_gate():
+    audit = {
+        "entity_count": 1,
+        "counts_by_type": {"LINE": 1},
+        "counts_by_layer": {"OUTLINE": 1},
+        "geometry_drc": {
+            "status": "WARNING",
+            "issue_count": 2,
+            "failure_count": 0,
+            "warning_count": 2,
+        },
+    }
+
+    check = next(item for item in _validation_checks(audit, {}) if item["name"] == "geometry_drc")
+
+    assert check["passed"] is True
+    assert check["actual"] == 0
