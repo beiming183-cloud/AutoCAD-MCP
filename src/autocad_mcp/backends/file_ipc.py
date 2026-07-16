@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import sys
 import time
@@ -20,6 +21,7 @@ from pathlib import Path
 
 import structlog
 
+from autocad_mcp.audit import audit_dxf_file, build_audit
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
 from autocad_mcp.config import IPC_DIR, IPC_TIMEOUT, LISP_DIR
 
@@ -77,6 +79,103 @@ def find_autocad_window() -> int | None:
         return None
 
 
+def _com_value(obj, name: str, default=None):
+    try:
+        value = getattr(obj, name)
+        return value if value is not None else default
+    except Exception:
+        return default
+
+
+def _com_point(value) -> list[float] | None:
+    try:
+        return [round(float(item), 6) for item in list(value)[:3]]
+    except (TypeError, ValueError):
+        return None
+
+
+def _com_entity_to_dict(entity) -> dict:
+    """Normalize a full AutoCAD COM entity for structured auditing."""
+    object_name = str(_com_value(entity, "ObjectName", "UNKNOWN"))
+    short_name = object_name.removeprefix("AcDb")
+    if "Dimension" in short_name:
+        entity_type = "DIMENSION"
+    else:
+        entity_type = {
+            "Polyline": "LWPOLYLINE",
+            "2dPolyline": "POLYLINE",
+            "3dPolyline": "POLYLINE3D",
+            "BlockReference": "INSERT",
+            "MText": "MTEXT",
+            "Text": "TEXT",
+        }.get(short_name, short_name.upper())
+
+    result = {
+        "type": entity_type,
+        "handle": str(_com_value(entity, "Handle", "")),
+        "layer": str(_com_value(entity, "Layer", "0")),
+    }
+
+    if entity_type == "LINE":
+        result.update(
+            start=_com_point(_com_value(entity, "StartPoint")),
+            end=_com_point(_com_value(entity, "EndPoint")),
+        )
+    elif entity_type in ("CIRCLE", "ARC"):
+        result.update(
+            center=_com_point(_com_value(entity, "Center")),
+            radius=_com_value(entity, "Radius"),
+        )
+        if entity_type == "ARC":
+            result.update(
+                start_angle=math.degrees(float(_com_value(entity, "StartAngle", 0))),
+                end_angle=math.degrees(float(_com_value(entity, "EndAngle", 0))),
+            )
+    elif entity_type in ("LWPOLYLINE", "POLYLINE", "POLYLINE3D"):
+        coordinates = list(_com_value(entity, "Coordinates", []) or [])
+        stride = 2 if entity_type == "LWPOLYLINE" else 3
+        result["points"] = [
+            [round(float(value), 6) for value in coordinates[index : index + stride]]
+            for index in range(0, len(coordinates), stride)
+        ]
+        result["closed"] = bool(_com_value(entity, "Closed", False))
+    elif entity_type in ("TEXT", "MTEXT"):
+        result.update(
+            insert=_com_point(
+                _com_value(entity, "InsertionPoint", _com_value(entity, "TextAlignmentPoint"))
+            ),
+            text=str(_com_value(entity, "TextString", "")),
+            height=_com_value(entity, "Height", _com_value(entity, "TextHeight")),
+            rotation=math.degrees(float(_com_value(entity, "Rotation", 0))),
+        )
+    elif entity_type == "INSERT":
+        result.update(
+            name=str(_com_value(entity, "EffectiveName", _com_value(entity, "Name", ""))),
+            insert=_com_point(_com_value(entity, "InsertionPoint")),
+            rotation=math.degrees(float(_com_value(entity, "Rotation", 0))),
+            xscale=_com_value(entity, "XScaleFactor", 1),
+            yscale=_com_value(entity, "YScaleFactor", 1),
+        )
+    elif entity_type == "DIMENSION":
+        result.update(
+            measurement=_com_value(entity, "Measurement"),
+            text=str(_com_value(entity, "TextOverride", "")),
+            text_position=_com_point(_com_value(entity, "TextPosition")),
+        )
+    elif entity_type == "HATCH":
+        result.update(
+            pattern=str(_com_value(entity, "PatternName", "")),
+            area=_com_value(entity, "Area"),
+        )
+
+    try:
+        minimum, maximum = entity.GetBoundingBox()
+        result["bounds"] = {"min": _com_point(minimum), "max": _com_point(maximum)}
+    except Exception:
+        pass
+    return {key: value for key, value in result.items() if value is not None}
+
+
 class FileIPCBackend(AutoCADBackend):
     """File-based IPC with AutoCAD LT via mcp_dispatch.lsp."""
 
@@ -86,6 +185,8 @@ class FileIPCBackend(AutoCADBackend):
         self._ipc_dir = Path(IPC_DIR)
         self._screenshot_provider = None
         self._lock = asyncio.Lock()  # Single in-flight command
+        self._audit_revision = 0
+        self._audit_fingerprints: dict[str, str] | None = None
 
     @property
     def name(self) -> str:
@@ -322,13 +423,87 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("drawing-save-as-dxf", {"path": path})
 
     async def drawing_create(self, name: str | None = None) -> CommandResult:
-        return await self._dispatch("drawing-create", {"name": name})
+        result = await self._dispatch("drawing-create", {"name": name})
+        if result.ok:
+            self._audit_revision = 0
+            self._audit_fingerprints = None
+        return result
 
     async def drawing_purge(self) -> CommandResult:
         return await self._dispatch("drawing-purge", {})
 
     async def drawing_plot_pdf(self, path: str) -> CommandResult:
         return await self._dispatch("drawing-plot-pdf", {"path": path})
+
+    async def drawing_audit(
+        self,
+        limit=50,
+        include_entities=True,
+        changed_only=False,
+        layer=None,
+        space="model",
+    ) -> CommandResult:
+        try:
+            entities = self._collect_entities_via_com(layer=layer, space=space)
+            source = "autocad-com"
+        except Exception as com_error:
+            listing = await self.entity_list(layer)
+            if not listing.ok:
+                return CommandResult(ok=False, error=f"COM audit failed: {com_error}; {listing.error}")
+            entities = list(listing.payload.get("entities", []))
+            if include_entities:
+                detail_limit = max(0, min(int(limit), 500))
+                details = {}
+                for entity in entities[:detail_limit]:
+                    detail = await self.entity_get(entity.get("handle"))
+                    if detail.ok:
+                        details[entity.get("handle")] = detail.payload
+                entities = [details.get(entity.get("handle"), entity) for entity in entities]
+            source = "autolisp-fallback"
+
+        self._audit_revision += 1
+        payload, fingerprints = build_audit(
+            entities,
+            limit=limit,
+            include_entities=include_entities,
+            changed_only=changed_only,
+            previous_fingerprints=self._audit_fingerprints,
+            revision=self._audit_revision,
+            space=space.lower(),
+        )
+        self._audit_fingerprints = fingerprints
+        payload["source"] = source
+        if source == "autolisp-fallback":
+            payload["warnings"] = [
+                "AutoLISP fallback has limited geometry fields; full AutoCAD COM provides deeper auditing."
+            ]
+        return CommandResult(ok=True, payload=payload)
+
+    async def drawing_audit_dxf(self, path, limit=50, include_entities=True) -> CommandResult:
+        try:
+            return CommandResult(
+                ok=True,
+                payload=audit_dxf_file(path, limit=limit, include_entities=include_entities),
+            )
+        except Exception as exc:
+            return CommandResult(ok=False, error=str(exc))
+
+    async def drawing_render_preview(
+        self, path, paper="A4", orientation="auto", plot_style="monochrome.ctb"
+    ) -> CommandResult:
+        try:
+            payload = self._plot_preview_via_com(path, paper, orientation, plot_style)
+            return CommandResult(ok=True, payload=payload)
+        except Exception as com_error:
+            fallback = await self.drawing_plot_pdf(path)
+            if fallback.ok:
+                payload = fallback.payload if isinstance(fallback.payload, dict) else {"path": path}
+                payload.update(renderer="autolisp-plot", warning=f"COM plot unavailable: {com_error}")
+                return CommandResult(ok=True, payload=payload)
+            return CommandResult(
+                ok=False,
+                error=f"COM preview failed: {com_error}; AutoLISP plot failed: {fallback.error}",
+            )
 
     async def drawing_get_variables(self, names: list[str] | None = None) -> CommandResult:
         if names:
@@ -340,7 +515,117 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("drawing-get-variables", {"names_str": names_str})
 
     async def drawing_open(self, path: str) -> CommandResult:
-        return await self._dispatch("drawing-open", {"path": path})
+        result = await self._dispatch("drawing-open", {"path": path})
+        if result.ok:
+            self._audit_revision = 0
+            self._audit_fingerprints = None
+        return result
+
+    def _collect_entities_via_com(self, layer=None, space="model") -> list[dict]:
+        import pythoncom
+        import win32com.client
+
+        pythoncom.CoInitialize()
+        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        document = application.ActiveDocument
+        collection = document.PaperSpace if space.lower() == "paper" else document.ModelSpace
+        entities = []
+        for index in range(int(collection.Count)):
+            entity = collection.Item(index)
+            if layer and str(_com_value(entity, "Layer", "0")) != layer:
+                continue
+            entities.append(_com_entity_to_dict(entity))
+        return entities
+
+    def _plot_preview_via_com(self, path, paper, orientation, plot_style) -> dict:
+        import pythoncom
+        import win32com.client
+
+        output = Path(path).expanduser().resolve()
+        if output.suffix.lower() != ".pdf":
+            raise ValueError("Full AutoCAD preview output must use a .pdf extension")
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        pythoncom.CoInitialize()
+        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        document = application.ActiveDocument
+        layout = document.ActiveLayout
+        saved = {}
+        for name in (
+            "ConfigName",
+            "CanonicalMediaName",
+            "PlotType",
+            "UseStandardScale",
+            "StandardScale",
+            "CenterPlot",
+            "PlotRotation",
+            "StyleSheet",
+            "PlotWithPlotStyles",
+        ):
+            try:
+                saved[name] = getattr(layout, name)
+            except Exception:
+                pass
+        try:
+            old_background_plot = document.GetVariable("BACKGROUNDPLOT")
+        except Exception:
+            old_background_plot = None
+
+        try:
+            document.SetVariable("BACKGROUNDPLOT", 0)
+            layout.ConfigName = "DWG To PDF.pc3"
+            layout.RefreshPlotDeviceInfo()
+            media_names = list(layout.GetCanonicalMediaNames())
+            paper_token = paper.upper().replace(" ", "_")
+            media = next(
+                (name for name in media_names if paper_token in str(name).upper()),
+                media_names[0] if media_names else None,
+            )
+            if media:
+                layout.CanonicalMediaName = media
+            layout.PlotType = 1  # acExtents
+            layout.UseStandardScale = True
+            layout.StandardScale = 0  # acScaleToFit
+            layout.CenterPlot = True
+
+            selected_orientation = orientation.lower()
+            if selected_orientation == "auto":
+                ext_min = list(document.GetVariable("EXTMIN"))
+                ext_max = list(document.GetVariable("EXTMAX"))
+                selected_orientation = (
+                    "landscape"
+                    if abs(ext_max[0] - ext_min[0]) >= abs(ext_max[1] - ext_min[1])
+                    else "portrait"
+                )
+            layout.PlotRotation = 1 if selected_orientation == "landscape" else 0
+            if plot_style:
+                try:
+                    layout.StyleSheet = plot_style
+                    layout.PlotWithPlotStyles = True
+                except Exception:
+                    pass
+            plotted = bool(document.Plot.PlotToFile(str(output), "DWG To PDF.pc3"))
+            if not plotted and not output.exists():
+                raise RuntimeError("AutoCAD PlotToFile returned false")
+            return {
+                "path": str(output),
+                "format": "pdf",
+                "renderer": "autocad-plot",
+                "paper": paper,
+                "orientation": selected_orientation,
+                "plot_style": plot_style,
+            }
+        finally:
+            for name, value in saved.items():
+                try:
+                    setattr(layout, name, value)
+                except Exception:
+                    pass
+            if old_background_plot is not None:
+                try:
+                    document.SetVariable("BACKGROUNDPLOT", old_background_plot)
+                except Exception:
+                    pass
 
     # --- Undo / Redo ---
 

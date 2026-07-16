@@ -24,7 +24,11 @@ BACKEND_DEFAULT = "auto"  # auto | file_ipc | ezdxf
 IPC_TIMEOUT = max(1.0, min(300.0, float(os.environ.get("AUTOCAD_MCP_IPC_TIMEOUT", "10.0"))))
 
 # Screenshot
-ONLY_TEXT_FEEDBACK = os.environ.get("AUTOCAD_MCP_ONLY_TEXT", "").lower() in ("1", "true", "yes")
+ONLY_TEXT_FEEDBACK = os.environ.get("AUTOCAD_MCP_ONLY_TEXT", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 # Win32 availability
 WIN32_AVAILABLE = sys.platform == "win32"

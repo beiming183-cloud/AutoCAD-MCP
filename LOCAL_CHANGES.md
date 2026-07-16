@@ -11,7 +11,7 @@
    `AUTOCAD_MCP_ALLOW_ARBITRARY_LISP=true` is explicitly set.
 2. `ezdxf` is preloaded before the MCP event loop starts to avoid a Windows
    native-module import stall.
-3. File IPC uses the local `ipc` directory instead of `C:/temp`.
+3. File IPC reads `AUTOCAD_MCP_IPC_DIR` and defaults to portable `C:/temp`.
 4. File IPC can auto-start a configured AutoCAD executable and wait for its
    main window when `AUTOCAD_MCP_AUTOSTART=true`.
 5. AutoCAD window detection verifies the owning process is `acad.exe`, so the
@@ -20,8 +20,15 @@
    `AUTOCAD_MCP_LISP_PATH`, without changing AutoCAD's persistent trust paths.
 7. Full AutoCAD uses COM `ActiveDocument.SendCommand` for reliable background
    command delivery; the original window-message path remains the LT fallback.
+8. Structured drawing audits report bounded entity geometry, layer/type counts,
+   drawing bounds, and added/modified/removed handles.
+9. Full AutoCAD produces milestone previews through native PDF plotting instead
+   of desktop/window screenshots.
+10. Existing DXF files can be parsed into normalized, bounded audit JSON.
+11. Automatic screenshot attachments are disabled by default; direct window
+    capture remains available for UI diagnostics.
 
 ## Codex registration
 
 The server is registered as `[mcp_servers.autocad]` in the global Codex
-`config.toml`, with backend selection set to `auto`.
+`config.toml`, with backend selection set to `file_ipc` on the local workstation.

@@ -6,10 +6,10 @@ This edition is based on [puran-water/autocad-mcp](https://github.com/puran-wate
 
 Two backends, one API:
 
-| Backend | Runtime | Requires AutoCAD? | Screenshot |
+| Backend | Runtime | Requires AutoCAD? | Validation feedback |
 |---------|---------|-------------------|------------|
-| **File IPC** | Windows Python | Yes - full AutoCAD or AutoCAD LT 2024+ | Win32 PrintWindow |
-| **ezdxf** | Any platform | No (headless) | matplotlib render |
+| **File IPC** | Windows Python | Yes - full AutoCAD or AutoCAD LT 2024+ | Structured audit + native PDF plot |
+| **ezdxf** | Any platform | No (headless) | Structured audit + deterministic PNG |
 
 The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `block`, `annotation`, `pid`, `view`, `system`) over the MCP stdio transport. An MCP client (Claude Desktop, Claude Code, etc.) connects and drives AutoCAD through natural-language requests.
 
@@ -108,6 +108,9 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 | `save` | Save current drawing (to path if given) | Yes | Yes |
 | `save_as_dxf` | Export as DXF | Yes | Yes |
 | `plot_pdf` | Plot to PDF | Yes | No |
+| `render_preview` | Native PDF preview or deterministic headless PNG | Yes | Yes |
+| `audit` | Compact structured entity audit with change tracking | Yes | Yes |
+| `audit_dxf` | Parse an existing DXF into normalized JSON | Yes | Yes |
 | `purge` | Purge unused objects | Yes | Yes |
 | `get_variables` | Get system variables by name | Yes | Yes |
 | `undo` | Undo last operation | Yes | No |
@@ -148,15 +151,25 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 
 > P&ID symbol insertion requires the [CAD Tools Online](https://www.cadtoolsonline.com/) (CTO) P&ID Symbol Library installed at `C:\PIDv4-CTO\`. The ezdxf backend has built-in CTO library support. For the File IPC backend, some P&ID operations require additional LISP helpers — see the P&ID section in the wiki for setup details.
 
-### `view` — Viewport and screenshot
+### `view` — Viewport and diagnostic capture
 
 | Operation | Description |
 |-----------|-------------|
 | `zoom_extents` | Zoom to show all entities |
 | `zoom_window` | Zoom to a specified window |
-| `get_screenshot` | Capture current AutoCAD view as PNG |
+| `get_screenshot` | Diagnostic-only AutoCAD window capture |
 
-Screenshots use `PrintWindow` (Win32) for the File IPC backend — works even when AutoCAD is minimized or in the background. The ezdxf backend renders via matplotlib.
+Normal validation is data-first: use `drawing.audit` after edits and `drawing.render_preview` at milestones. `get_screenshot` remains available only for diagnosing AutoCAD UI state.
+
+### Data-first validation
+
+```text
+edit entities -> drawing.audit -> native render_preview -> audit_dxf for final delivery
+```
+
+`drawing.audit` returns entity counts by type and layer, drawing bounds, limited normalized entity geometry, and added/modified/removed handles since the previous audit. `limit` is clamped to 500 so large drawings do not flood model context. Set `changed_only=true` to return only changed entity details.
+
+`drawing.render_preview` uses full AutoCAD's native `PlotToFile` for PDF output, preserving plot styles and avoiding desktop/window capture. The ezdxf backend writes a deterministic PNG instead.
 
 ### `system` — Server management
 
@@ -188,7 +201,7 @@ The File IPC backend sends `(c:mcp-dispatch)` to the active drawing. Full AutoCA
 | `AUTOCAD_MCP_BACKEND` | `auto` | Backend selection: `auto`, `file_ipc`, `ezdxf` |
 | `AUTOCAD_MCP_IPC_DIR` | `C:/temp` | Directory for IPC command/result JSON files (must match on both Python and LISP sides) |
 | `AUTOCAD_MCP_IPC_TIMEOUT` | `10.0` | IPC command timeout in seconds (1-300) |
-| `AUTOCAD_MCP_ONLY_TEXT` | `false` | Disable screenshot capture (text feedback only) |
+| `AUTOCAD_MCP_ONLY_TEXT` | `true` | Disable automatic screenshot attachments; direct diagnostic capture remains available |
 | `AUTOCAD_MCP_AUTOSTART` | `false` | Start AutoCAD automatically when File IPC is requested and no AutoCAD window exists |
 | `AUTOCAD_MCP_ACAD_EXE` | empty | Full path to `acad.exe` used by automatic startup |
 | `AUTOCAD_MCP_ACAD_SCRIPT` | empty | Optional AutoCAD `.scr` file passed with `/b` during startup |
@@ -218,7 +231,15 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 
 The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
 
-## What's New in v3.2
+## What's New in v3.3
+
+- **Structured drawing audits** - compact counts, layers, bounds, normalized geometry, and change fingerprints.
+- **Native preview rendering** - full AutoCAD plots PDF through `PlotToFile`; ezdxf writes deterministic PNG.
+- **DXF mathematical audit** - parses existing DXF files into bounded normalized JSON instead of returning raw DXF text.
+- **Data-first defaults** - automatic screenshot feedback is disabled by default; window capture is diagnostic only.
+- **Richer AutoLISP entity details** - arcs, polylines, text, blocks, and dimensions report useful geometry.
+
+### v3.2
 
 - **Full AutoCAD COM transport** - sends command expressions through `ActiveDocument.SendCommand`.
 - **Process-based window detection** - recognizes localized titles and the AutoCAD Start page by verifying `acad.exe`.

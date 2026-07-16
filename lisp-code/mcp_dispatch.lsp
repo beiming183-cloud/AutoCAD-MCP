@@ -848,7 +848,7 @@
 
 ;; --- Entity query: get ---
 
-(defun mcp-cmd-entity-get (params / entity-id ent ent-data etype handle elayer result)
+(defun mcp-cmd-entity-get (params / entity-id ent ent-data etype handle elayer result item point points)
   (setq entity-id (mcp-json-get-string params "entity_id"))
   (if (= entity-id "last")
     (setq ent (entlast))
@@ -872,6 +872,44 @@
          (setq result (strcat result
            ",\"center\":[" (rtos (car (cdr (assoc 10 ent-data))) 2 6) "," (rtos (cadr (cdr (assoc 10 ent-data))) 2 6) "]"
            ",\"radius\":" (rtos (cdr (assoc 40 ent-data)) 2 6))))
+        ((= etype "ARC")
+         (setq result (strcat result
+           ",\"center\":[" (rtos (car (cdr (assoc 10 ent-data))) 2 6) "," (rtos (cadr (cdr (assoc 10 ent-data))) 2 6) "]"
+           ",\"radius\":" (rtos (cdr (assoc 40 ent-data)) 2 6)
+           ",\"start_angle\":" (rtos (* 180.0 (/ (cdr (assoc 50 ent-data)) pi)) 2 6)
+           ",\"end_angle\":" (rtos (* 180.0 (/ (cdr (assoc 51 ent-data)) pi)) 2 6))))
+        ((= etype "LWPOLYLINE")
+         (setq points "")
+         (foreach item ent-data
+           (if (= (car item) 10)
+             (progn
+               (setq point (cdr item))
+               (if (> (strlen points) 0) (setq points (strcat points ",")))
+               (setq points (strcat points "[" (rtos (car point) 2 6) "," (rtos (cadr point) 2 6) "]"))
+             )
+           )
+         )
+         (setq result (strcat result
+           ",\"points\":[" points "]"
+           ",\"closed\":" (if (and (assoc 70 ent-data) (= 1 (logand 1 (cdr (assoc 70 ent-data))))) "true" "false"))))
+        ((or (= etype "TEXT") (= etype "MTEXT"))
+         (setq result (strcat result
+           ",\"insert\":[" (rtos (car (cdr (assoc 10 ent-data))) 2 6) "," (rtos (cadr (cdr (assoc 10 ent-data))) 2 6) "]"
+           ",\"text\":\"" (mcp-escape-string (cdr (assoc 1 ent-data))) "\""
+           ",\"height\":" (rtos (cdr (assoc 40 ent-data)) 2 6)
+           ",\"rotation\":" (rtos (* 180.0 (/ (if (assoc 50 ent-data) (cdr (assoc 50 ent-data)) 0.0) pi)) 2 6))))
+        ((= etype "INSERT")
+         (setq result (strcat result
+           ",\"name\":\"" (mcp-escape-string (cdr (assoc 2 ent-data))) "\""
+           ",\"insert\":[" (rtos (car (cdr (assoc 10 ent-data))) 2 6) "," (rtos (cadr (cdr (assoc 10 ent-data))) 2 6) "]"
+           ",\"xscale\":" (rtos (if (assoc 41 ent-data) (cdr (assoc 41 ent-data)) 1.0) 2 6)
+           ",\"yscale\":" (rtos (if (assoc 42 ent-data) (cdr (assoc 42 ent-data)) 1.0) 2 6)
+           ",\"rotation\":" (rtos (* 180.0 (/ (if (assoc 50 ent-data) (cdr (assoc 50 ent-data)) 0.0) pi)) 2 6))))
+        ((= etype "DIMENSION")
+         (setq result (strcat result
+           ",\"dimtype\":" (itoa (cdr (assoc 70 ent-data)))
+           ",\"text\":\"" (mcp-escape-string (if (assoc 1 ent-data) (cdr (assoc 1 ent-data)) "")) "\""
+           (if (assoc 42 ent-data) (strcat ",\"measurement\":" (rtos (cdr (assoc 42 ent-data)) 2 6)) ""))))
       )
       (setq result (strcat result "}"))
       (cons T result)

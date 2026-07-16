@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import math
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import ezdxf
 import structlog
 
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
+from autocad_mcp.audit import audit_dxf_file, build_audit, normalize_ezdxf_entity
 from autocad_mcp.screenshot import MatplotlibScreenshotProvider
 
 log = structlog.get_logger()
@@ -25,6 +27,8 @@ class EzdxfBackend(AutoCADBackend):
         self._save_path: str | None = None
         self._screenshot = MatplotlibScreenshotProvider()
         self._entity_counter = 0
+        self._audit_revision = 0
+        self._audit_fingerprints: dict[str, str] | None = None
 
     @property
     def name(self) -> str:
@@ -49,6 +53,8 @@ class EzdxfBackend(AutoCADBackend):
         self._doc = ezdxf.new("R2013")
         self._msp = self._doc.modelspace()
         self._screenshot.doc = self._doc
+        self._audit_revision = 0
+        self._audit_fingerprints = None
         return CommandResult(ok=True, payload={"backend": "ezdxf", "version": ezdxf.__version__})
 
     async def status(self) -> CommandResult:
@@ -99,12 +105,72 @@ class EzdxfBackend(AutoCADBackend):
     async def drawing_save_as_dxf(self, path: str) -> CommandResult:
         return await self.drawing_save(path)
 
+    async def drawing_audit(
+        self,
+        limit=50,
+        include_entities=True,
+        changed_only=False,
+        layer=None,
+        space="model",
+    ) -> CommandResult:
+        if not self._doc:
+            return CommandResult(ok=False, error="No document open")
+        if space.lower() != "model":
+            return CommandResult(ok=False, error="ezdxf audit currently supports ModelSpace only")
+        try:
+            entities = [
+                normalize_ezdxf_entity(entity)
+                for entity in self._msp
+                if not layer or entity.dxf.get("layer", "0") == layer
+            ]
+            self._audit_revision += 1
+            payload, fingerprints = build_audit(
+                entities,
+                limit=limit,
+                include_entities=include_entities,
+                changed_only=changed_only,
+                previous_fingerprints=self._audit_fingerprints,
+                revision=self._audit_revision,
+                space="model",
+            )
+            self._audit_fingerprints = fingerprints
+            return CommandResult(ok=True, payload=payload)
+        except Exception as exc:
+            return CommandResult(ok=False, error=str(exc))
+
+    async def drawing_audit_dxf(self, path, limit=50, include_entities=True) -> CommandResult:
+        try:
+            return CommandResult(
+                ok=True,
+                payload=audit_dxf_file(path, limit=limit, include_entities=include_entities),
+            )
+        except Exception as exc:
+            return CommandResult(ok=False, error=str(exc))
+
+    async def drawing_render_preview(
+        self, path, paper="A4", orientation="auto", plot_style="monochrome.ctb"
+    ) -> CommandResult:
+        output = Path(path).expanduser().resolve()
+        if output.suffix.lower() != ".png":
+            return CommandResult(ok=False, error="ezdxf preview output must use a .png extension")
+        data = self._screenshot.capture()
+        if not data:
+            return CommandResult(ok=False, error="Headless preview render failed")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_bytes(base64.b64decode(data))
+        return CommandResult(
+            ok=True,
+            payload={"path": str(output), "format": "png", "renderer": "ezdxf-matplotlib"},
+        )
+
     async def drawing_create(self, name: str | None = None) -> CommandResult:
         self._doc = ezdxf.new("R2013")
         self._msp = self._doc.modelspace()
         self._screenshot.doc = self._doc
         self._entity_counter = 0
         self._save_path = f"{name}.dxf" if name else None
+        self._audit_revision = 0
+        self._audit_fingerprints = None
         return CommandResult(ok=True, payload={"name": name or "untitled"})
 
     async def drawing_purge(self) -> CommandResult:
@@ -119,6 +185,8 @@ class EzdxfBackend(AutoCADBackend):
             self._msp = self._doc.modelspace()
             self._screenshot.doc = self._doc
             self._save_path = path
+            self._audit_revision = 0
+            self._audit_fingerprints = None
             return CommandResult(ok=True, payload={"path": path})
         except Exception as ex:
             return CommandResult(ok=False, error=str(ex))

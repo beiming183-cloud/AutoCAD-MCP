@@ -46,6 +46,9 @@ async def drawing(
       save       — Save current drawing. data: {path?} (saves to path if given, else QSAVE)
       save_as_dxf — Export as DXF. data: {path}
       plot_pdf   — Plot to PDF. data: {path}
+      render_preview — Native deterministic preview. data: {path, paper?, orientation?, plot_style?}
+      audit      — Structured drawing audit. data: {limit?, include_entities?, changed_only?, layer?, space?}
+      audit_dxf  — Parse an existing DXF into normalized JSON. data: {path, limit?, include_entities?}
       purge      — Purge unused objects.
       get_variables — Get system variables. data: {names: [...]}
       undo       — Undo last operation.
@@ -64,6 +67,25 @@ async def drawing(
         result = await backend.drawing_save_as_dxf(data["path"])
     elif operation == "plot_pdf":
         result = await backend.drawing_plot_pdf(data["path"])
+    elif operation == "render_preview":
+        result = await backend.drawing_render_preview(
+            data["path"],
+            data.get("paper", "A4"),
+            data.get("orientation", "auto"),
+            data.get("plot_style", "monochrome.ctb"),
+        )
+    elif operation == "audit":
+        result = await backend.drawing_audit(
+            data.get("limit", 50),
+            data.get("include_entities", True),
+            data.get("changed_only", False),
+            data.get("layer"),
+            data.get("space", "model"),
+        )
+    elif operation == "audit_dxf":
+        result = await backend.drawing_audit_dxf(
+            data["path"], data.get("limit", 50), data.get("include_entities", True)
+        )
     elif operation == "purge":
         result = await backend.drawing_purge()
     elif operation == "get_variables":
@@ -424,12 +446,12 @@ async def view(
     x2: float | None = None,
     y2: float | None = None,
 ) -> ToolResult:
-    """Viewport control and screenshot capture.
+    """Viewport control and diagnostic window capture.
 
     Operations:
       zoom_extents   — Zoom to show all entities.
       zoom_window    — Zoom to window: x1, y1, x2, y2
-      get_screenshot — Capture current view as PNG image.
+      get_screenshot — Diagnostic-only window capture. Prefer drawing.render_preview.
     """
     backend = await get_backend()
 

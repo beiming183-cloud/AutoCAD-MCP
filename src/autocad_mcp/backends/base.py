@@ -81,6 +81,30 @@ class AutoCADBackend(ABC):
     async def drawing_plot_pdf(self, path: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def drawing_render_preview(
+        self,
+        path: str,
+        paper: str = "A4",
+        orientation: str = "auto",
+        plot_style: str = "monochrome.ctb",
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def drawing_audit(
+        self,
+        limit: int = 50,
+        include_entities: bool = True,
+        changed_only: bool = False,
+        layer: str | None = None,
+        space: str = "model",
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def drawing_audit_dxf(
+        self, path: str, limit: int = 50, include_entities: bool = True
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
     async def drawing_get_variables(self, names: list[str] | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
