@@ -27,8 +27,8 @@ The server exposes **8 consolidated tools** (`drawing`, `entity`, `layer`, `bloc
 ### 1. Clone and install
 
 ```powershell
-git clone https://github.com/beiming183-cloud/autocad-mcp-codex.git
-cd autocad-mcp-codex
+git clone https://github.com/beiming183-cloud/AutoCAD-MCP.git
+cd AutoCAD-MCP
 uv sync
 ```
 
