@@ -24,6 +24,7 @@ import structlog
 from autocad_mcp.audit import audit_dxf_file, build_audit
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
 from autocad_mcp.config import IPC_DIR, IPC_TIMEOUT, LISP_DIR
+from autocad_mcp.drafting import encode_autocad_text
 
 log = structlog.get_logger()
 
@@ -34,7 +35,7 @@ STALE_THRESHOLD = 60.0  # clean up files older than this
 
 
 def find_autocad_window() -> int | None:
-    """Find a visible main window owned by acad.exe."""
+    """Find the AutoCAD main window, including hidden automation sessions."""
     if sys.platform != "win32":
         return None
     try:
@@ -74,7 +75,19 @@ def find_autocad_window() -> int | None:
             return True
 
         win32gui.EnumWindows(callback, windows)
-        return windows[0] if windows else None
+        if windows:
+            return windows[0]
+
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            hwnd = int(application.HWND)
+            return hwnd if hwnd else None
+        except Exception:
+            return None
     except ImportError:
         return None
 
@@ -315,7 +328,14 @@ class FileIPCBackend(AutoCADBackend):
                         pass  # File may be partially written, retry
                 await asyncio.sleep(POLL_INTERVAL)
 
-            return CommandResult(ok=False, error=f"Timeout waiting for result (request_id={request_id})")
+            self._cancel_active_command()
+            return CommandResult(
+                ok=False,
+                error=(
+                    f"Timeout waiting for result (request_id={request_id}); "
+                    "AutoCAD command state was cancelled and IPC files were cleaned"
+                ),
+            )
 
         finally:
             # Cleanup
@@ -351,7 +371,42 @@ class FileIPCBackend(AutoCADBackend):
         Sends ESC keystrokes first to cancel any stale pending command
         (e.g. from a previous timeout leaving AutoCAD in a command prompt).
         """
+        self._cancel_active_command()
         self._type_command("(c:mcp-dispatch)")
+
+    def _cancel_active_command(self) -> str:
+        """Cancel command-line state without requiring the IPC dispatcher."""
+        if sys.platform != "win32":
+            return "not-windows"
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            document = application.ActiveDocument
+            active = int(document.GetVariable("CMDACTIVE"))
+            if active:
+                document.SendCommand("\x1b\x1b")
+                time.sleep(0.1)
+            return "autocad-com"
+        except Exception:
+            pass
+
+        try:
+            import ctypes
+
+            target = self._command_hwnd or self._hwnd
+            if not target:
+                return "no-window"
+            post = ctypes.windll.user32.PostMessageW
+            for _ in range(2):
+                post(target, 0x0100, 0x1B, 0)
+                post(target, 0x0101, 0x1B, 0)
+            time.sleep(0.1)
+            return "win32-message"
+        except Exception:
+            return "failed"
 
     def _type_command(self, command: str):
         """Post a command-line expression to the active AutoCAD session."""
@@ -411,16 +466,47 @@ class FileIPCBackend(AutoCADBackend):
         except OSError:
             pass
 
+    async def recover(self) -> CommandResult:
+        cancel_transport = self._cancel_active_command()
+        removed = 0
+        for pattern in ("autocad_mcp_cmd_*", "autocad_mcp_result_*", "*.tmp"):
+            for path in self._ipc_dir.glob(pattern):
+                try:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+                except OSError:
+                    pass
+        return CommandResult(
+            ok=True,
+            payload={
+                "recovered": True,
+                "cancel_transport": cancel_transport,
+                "removed_ipc_files": removed,
+            },
+        )
+
     # --- Drawing management ---
 
     async def drawing_info(self) -> CommandResult:
         return await self._dispatch("drawing-info", {})
 
     async def drawing_save(self, path: str | None = None) -> CommandResult:
-        return await self._dispatch("drawing-save", {"path": path})
+        try:
+            return CommandResult(ok=True, payload=self._save_via_com(path))
+        except Exception as com_error:
+            result = await self._dispatch("drawing-save", {"path": path})
+            if result.ok and isinstance(result.payload, dict):
+                result.payload["warning"] = f"COM save unavailable: {com_error}"
+            return result
 
     async def drawing_save_as_dxf(self, path: str) -> CommandResult:
-        return await self._dispatch("drawing-save-as-dxf", {"path": path})
+        try:
+            return CommandResult(ok=True, payload=self._save_via_com(path, file_type=61))
+        except Exception as com_error:
+            result = await self._dispatch("drawing-save-as-dxf", {"path": path})
+            if result.ok and isinstance(result.payload, dict):
+                result.payload["warning"] = f"COM DXF save unavailable: {com_error}"
+            return result
 
     async def drawing_create(self, name: str | None = None) -> CommandResult:
         result = await self._dispatch("drawing-create", {"name": name})
@@ -431,6 +517,9 @@ class FileIPCBackend(AutoCADBackend):
 
     async def drawing_purge(self) -> CommandResult:
         return await self._dispatch("drawing-purge", {})
+
+    async def drawing_setup_mechanical(self) -> CommandResult:
+        return await self._dispatch("drawing-setup-mechanical", {})
 
     async def drawing_plot_pdf(self, path: str) -> CommandResult:
         return await self._dispatch("drawing-plot-pdf", {"path": path})
@@ -520,6 +609,31 @@ class FileIPCBackend(AutoCADBackend):
             self._audit_revision = 0
             self._audit_fingerprints = None
         return result
+
+    def _save_via_com(self, path: str | None, file_type: int | None = None) -> dict:
+        import pythoncom
+        import win32com.client
+
+        pythoncom.CoInitialize()
+        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        document = application.ActiveDocument
+        if not path:
+            document.Save()
+            return {"path": str(document.FullName), "renderer": "autocad-com-save"}
+
+        output = Path(path).expanduser().resolve()
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if file_type is None:
+            document.SaveAs(str(output))
+        else:
+            document.SaveAs(str(output), file_type)
+        if not output.exists():
+            raise RuntimeError(f"AutoCAD SaveAs completed but file is missing: {output}")
+        return {
+            "path": str(output),
+            "format": output.suffix.lower().lstrip("."),
+            "renderer": "autocad-com-saveas",
+        }
 
     def _collect_entities_via_com(self, layer=None, space="model") -> list[dict]:
         import pythoncom
@@ -673,10 +787,21 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("create-ellipse", {"cx": cx, "cy": cy, "major_x": major_x, "major_y": major_y, "ratio": ratio, "layer": layer})
 
     async def create_mtext(self, x, y, width, text, height=2.5, layer=None) -> CommandResult:
-        return await self._dispatch("create-mtext", {"x": x, "y": y, "width": width, "text": text, "height": height, "layer": layer})
+        return await self._dispatch("create-mtext", {"x": x, "y": y, "width": width, "text": encode_autocad_text(text), "height": height, "layer": layer})
 
-    async def create_hatch(self, entity_id, pattern="ANSI31") -> CommandResult:
-        return await self._dispatch("create-hatch", {"entity_id": entity_id, "pattern": pattern})
+    async def create_hatch(
+        self, entity_id, pattern="ANSI31", angle=0.0, scale=1.0, layer=None
+    ) -> CommandResult:
+        return await self._dispatch(
+            "create-hatch",
+            {
+                "entity_id": entity_id,
+                "pattern": pattern,
+                "angle": angle,
+                "scale": scale,
+                "layer": layer,
+            },
+        )
 
     async def entity_list(self, layer=None) -> CommandResult:
         return await self._dispatch("entity-list", {"layer": layer})
@@ -722,14 +847,32 @@ class FileIPCBackend(AutoCADBackend):
     async def layer_list(self) -> CommandResult:
         return await self._dispatch("layer-list", {})
 
-    async def layer_create(self, name, color="white", linetype="CONTINUOUS") -> CommandResult:
-        return await self._dispatch("layer-create", {"name": name, "color": color, "linetype": linetype})
+    async def layer_create(
+        self, name, color="white", linetype="CONTINUOUS", lineweight=None
+    ) -> CommandResult:
+        return await self._dispatch(
+            "layer-create",
+            {
+                "name": name,
+                "color": str(color),
+                "linetype": linetype,
+                "lineweight": str(lineweight) if lineweight is not None else None,
+            },
+        )
 
     async def layer_set_current(self, name) -> CommandResult:
         return await self._dispatch("layer-set-current", {"name": name})
 
     async def layer_set_properties(self, name, color=None, linetype=None, lineweight=None) -> CommandResult:
-        return await self._dispatch("layer-set-properties", {"name": name, "color": color, "linetype": linetype, "lineweight": lineweight})
+        return await self._dispatch(
+            "layer-set-properties",
+            {
+                "name": name,
+                "color": str(color) if color is not None else None,
+                "linetype": linetype,
+                "lineweight": str(lineweight) if lineweight is not None else None,
+            },
+        )
 
     async def layer_freeze(self, name) -> CommandResult:
         return await self._dispatch("layer-freeze", {"name": name})
@@ -766,7 +909,7 @@ class FileIPCBackend(AutoCADBackend):
     # --- Annotation ---
 
     async def create_text(self, x, y, text, height=2.5, rotation=0.0, layer=None) -> CommandResult:
-        return await self._dispatch("create-text", {"x": x, "y": y, "text": text, "height": height, "rotation": rotation, "layer": layer})
+        return await self._dispatch("create-text", {"x": x, "y": y, "text": encode_autocad_text(text), "height": height, "rotation": rotation, "layer": layer})
 
     async def create_dimension_linear(self, x1, y1, x2, y2, dim_x, dim_y) -> CommandResult:
         return await self._dispatch("create-dimension-linear", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "dim_x": dim_x, "dim_y": dim_y})
@@ -782,7 +925,9 @@ class FileIPCBackend(AutoCADBackend):
 
     async def create_leader(self, points, text) -> CommandResult:
         pts_str = ";".join(f"{p[0]},{p[1]}" for p in points)
-        return await self._dispatch("create-leader", {"points_str": pts_str, "text": text})
+        return await self._dispatch(
+            "create-leader", {"points_str": pts_str, "text": encode_autocad_text(text)}
+        )
 
     # --- P&ID ---
 

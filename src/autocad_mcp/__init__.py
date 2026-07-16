@@ -1,3 +1,3 @@
-"""AutoCAD MCP Server v3.3 with data-first drawing validation."""
+"""AutoCAD MCP Server v3.4 with resilient structured drafting workflows."""
 
-__version__ = "3.3.0"
+__version__ = "3.4.0"

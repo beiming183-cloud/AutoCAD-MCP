@@ -111,6 +111,21 @@ class AutoCADBackend(ABC):
     async def drawing_open(self, path: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
+    async def drawing_setup_mechanical(self) -> CommandResult:
+        """Create the standard monochrome mechanical-drafting layers."""
+        from autocad_mcp.drafting import MECHANICAL_LAYERS
+
+        results = []
+        for layer in MECHANICAL_LAYERS:
+            result = await self.layer_create(**layer)
+            results.append(result.to_dict())
+            if not result.ok:
+                return CommandResult(ok=False, payload={"layers": results}, error=result.error)
+        return CommandResult(ok=True, payload={"profile": "mechanical-gbt", "layers": results})
+
+    async def recover(self) -> CommandResult:
+        return CommandResult(ok=False, error="Recovery is not supported on this backend")
+
     # --- Undo / Redo ---
 
     async def undo(self) -> CommandResult:
@@ -147,8 +162,117 @@ class AutoCADBackend(ABC):
     async def create_mtext(self, x: float, y: float, width: float, text: str, height: float = 2.5, layer: str | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
-    async def create_hatch(self, entity_id: str, pattern: str = "ANSI31") -> CommandResult:
+    async def create_hatch(
+        self,
+        entity_id: str,
+        pattern: str = "ANSI31",
+        angle: float = 0.0,
+        scale: float = 1.0,
+        layer: str | None = None,
+    ) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def create_batch(
+        self, entities: list[dict[str, Any]], continue_on_error: bool = False
+    ) -> CommandResult:
+        """Create a bounded structured entity batch without arbitrary code execution."""
+        if len(entities) > 500:
+            return CommandResult(ok=False, error="A batch is limited to 500 entities")
+
+        results: list[dict[str, Any]] = []
+        last_handle: str | None = None
+        failures = 0
+        for index, item in enumerate(entities):
+            kind = str(item.get("type", "")).lower()
+            layer = item.get("layer")
+            try:
+                if kind == "line":
+                    result = await self.create_line(
+                        item["x1"], item["y1"], item["x2"], item["y2"], layer
+                    )
+                elif kind == "circle":
+                    result = await self.create_circle(
+                        item["cx"], item["cy"], item["radius"], layer
+                    )
+                elif kind == "polyline":
+                    result = await self.create_polyline(
+                        item["points"], item.get("closed", False), layer
+                    )
+                elif kind == "rectangle":
+                    result = await self.create_rectangle(
+                        item["x1"], item["y1"], item["x2"], item["y2"], layer
+                    )
+                elif kind == "arc":
+                    result = await self.create_arc(
+                        item["cx"],
+                        item["cy"],
+                        item["radius"],
+                        item["start_angle"],
+                        item["end_angle"],
+                        layer,
+                    )
+                elif kind == "ellipse":
+                    result = await self.create_ellipse(
+                        item["cx"],
+                        item["cy"],
+                        item["major_x"],
+                        item["major_y"],
+                        item["ratio"],
+                        layer,
+                    )
+                elif kind == "text":
+                    result = await self.create_text(
+                        item["x"],
+                        item["y"],
+                        item["text"],
+                        item.get("height", 2.5),
+                        item.get("rotation", 0.0),
+                        layer,
+                    )
+                elif kind == "mtext":
+                    result = await self.create_mtext(
+                        item["x"],
+                        item["y"],
+                        item["width"],
+                        item["text"],
+                        item.get("height", 2.5),
+                        layer,
+                    )
+                elif kind == "hatch":
+                    entity_id = item.get("entity_id")
+                    if entity_id in (None, "last", "$last"):
+                        entity_id = last_handle or "last"
+                    result = await self.create_hatch(
+                        entity_id,
+                        item.get("pattern", "ANSI31"),
+                        item.get("angle", 0.0),
+                        item.get("scale", 1.0),
+                        layer,
+                    )
+                else:
+                    result = CommandResult(ok=False, error=f"Unsupported batch type: {kind}")
+            except (KeyError, TypeError, ValueError) as exc:
+                result = CommandResult(ok=False, error=f"Invalid {kind or 'entity'}: {exc}")
+
+            entry = {"index": index, "type": kind, **result.to_dict()}
+            results.append(entry)
+            if result.ok and isinstance(result.payload, dict):
+                last_handle = result.payload.get("handle", last_handle)
+            if not result.ok:
+                failures += 1
+                if not continue_on_error:
+                    break
+
+        return CommandResult(
+            ok=True,
+            payload={
+                "batch_ok": failures == 0,
+                "requested": len(entities),
+                "processed": len(results),
+                "failures": failures,
+                "results": results,
+            },
+        )
 
     async def entity_list(self, layer: str | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
@@ -194,7 +318,13 @@ class AutoCADBackend(ABC):
     async def layer_list(self) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
-    async def layer_create(self, name: str, color: str | int = "white", linetype: str = "CONTINUOUS") -> CommandResult:
+    async def layer_create(
+        self,
+        name: str,
+        color: str | int = "white",
+        linetype: str = "CONTINUOUS",
+        lineweight: str | float | int | None = None,
+    ) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
     async def layer_set_current(self, name: str) -> CommandResult:

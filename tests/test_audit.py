@@ -48,6 +48,14 @@ def test_normalize_ezdxf_line():
     assert normalized["end"][:2] == [3, 4]
 
 
+def test_normalize_ezdxf_text_height():
+    document = ezdxf.new("R2013")
+    text = document.modelspace().add_text("shaft", height=3.5)
+    normalized = normalize_ezdxf_entity(text)
+    assert normalized["type"] == "TEXT"
+    assert normalized["height"] == 3.5
+
+
 def test_audit_dxf_file():
     document = ezdxf.new("R2013")
     document.modelspace().add_circle((5, 5), 2, dxfattribs={"layer": "HOLES"})

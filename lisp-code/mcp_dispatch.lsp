@@ -1,4 +1,4 @@
-;;; mcp_dispatch.lsp — File-based IPC dispatcher for AutoCAD MCP v3.1
+;;; mcp_dispatch.lsp - File-based IPC dispatcher for AutoCAD MCP v3.4
 ;;;
 ;;; Protocol:
 ;;;   1. Python writes command JSON to C:/temp/autocad_mcp_cmd_{id}.json
@@ -90,6 +90,34 @@
 ;; Simple JSON parser (extracts string values by key)
 ;; -----------------------------------------------------------------------
 
+(defun mcp-json-unescape-string (s / result i ch next)
+  "Decode the JSON escapes used by the Python IPC writer."
+  (setq result "" i 1)
+  (while (<= i (strlen s))
+    (setq ch (substr s i 1))
+    (if (and (= ch "\\") (< i (strlen s)))
+      (progn
+        (setq next (substr s (1+ i) 1))
+        (cond
+          ((= next "\\") (setq result (strcat result "\\")))
+          ((= next "\"") (setq result (strcat result "\"")))
+          ((= next "/") (setq result (strcat result "/")))
+          ((= next "n") (setq result (strcat result (chr 10))))
+          ((= next "r") (setq result (strcat result (chr 13))))
+          ((= next "t") (setq result (strcat result (chr 9))))
+          (t (setq result (strcat result "\\" next)))
+        )
+        (setq i (+ i 2))
+      )
+      (progn
+        (setq result (strcat result ch))
+        (setq i (1+ i))
+      )
+    )
+  )
+  result
+)
+
 (defun mcp-json-get-string (json key / search-str pos end-pos value)
   "Extract a string value for a given key from JSON text."
   (setq search-str (strcat "\"" key "\""))
@@ -116,7 +144,7 @@
                   (setq end-pos (1+ end-pos))
                 )
               )
-              (substr json pos (- end-pos pos))
+              (mcp-json-unescape-string (substr json pos (- end-pos pos)))
             )
           )
         )
@@ -195,6 +223,9 @@
     ;; --- Drawing info ---
     ((= cmd-name "drawing-info")
      (mcp-cmd-drawing-info))
+
+    ((= cmd-name "drawing-setup-mechanical")
+     (mcp-cmd-drawing-setup-mechanical))
 
     ;; --- Layer operations ---
     ((= cmd-name "layer-list")
@@ -467,14 +498,35 @@
   (cons T (strcat "{\"layers\":[" layer-list "]}"))
 )
 
-(defun mcp-cmd-layer-create (params / name color linetype)
+(defun mcp-cmd-drawing-setup-mechanical ( / names)
+  "Create the standard GB/T monochrome drafting layers without prompts."
+  (mcp-upsert-layer "OUTLINE" "7" "CONTINUOUS" "0.50")
+  (mcp-upsert-layer "THIN" "7" "CONTINUOUS" "0.20")
+  (mcp-upsert-layer "CENTER" "7" "CENTER" "0.20")
+  (mcp-upsert-layer "HIDDEN" "7" "HIDDEN" "0.20")
+  (mcp-upsert-layer "HATCH" "7" "CONTINUOUS" "0.20")
+  (mcp-upsert-layer "DIM" "7" "CONTINUOUS" "0.20")
+  (mcp-upsert-layer "TEXT" "7" "CONTINUOUS" "0.20")
+  (cons T "{\"profile\":\"mechanical-gbt\",\"layers\":[\"OUTLINE\",\"THIN\",\"CENTER\",\"HIDDEN\",\"HATCH\",\"DIM\",\"TEXT\"]}")
+)
+
+(defun mcp-cmd-layer-create (params / name color linetype lineweight actual-linetype)
   (setq name (mcp-json-get-string params "name"))
   (setq color (mcp-json-get-string params "color"))
   (setq linetype (mcp-json-get-string params "linetype"))
+  (setq lineweight (mcp-json-get-string params "lineweight"))
   (if (not color) (setq color "white"))
   (if (not linetype) (setq linetype "CONTINUOUS"))
-  (ensure_layer_exists name color linetype)
-  (cons T (strcat "{\"name\":\"" name "\"}"))
+  (if (not name)
+    (cons nil "Layer name required")
+    (progn
+      (setq actual-linetype (mcp-upsert-layer name color linetype lineweight))
+      (cons T (strcat
+        "{\"name\":\"" (mcp-escape-string name)
+        "\",\"linetype\":\"" actual-linetype "\"}"
+      ))
+    )
+  )
 )
 
 (defun mcp-cmd-layer-set-current (params / name)
@@ -830,18 +882,50 @@
   (cons T (strcat "{\"entity_type\":\"MTEXT\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}"))
 )
 
-(defun mcp-cmd-create-hatch (params / entity-id pattern ent)
+(defun mcp-cmd-create-hatch (params / entity-id pattern angle scale layer ent old-hpang old-hpscale old-layer result hatch-ent)
   (setq entity-id (mcp-json-get-string params "entity_id"))
   (setq pattern (mcp-json-get-string params "pattern"))
+  (setq angle (mcp-json-get-number params "angle"))
+  (setq scale (mcp-json-get-number params "scale"))
+  (setq layer (mcp-json-get-string params "layer"))
   (if (not pattern) (setq pattern "ANSI31"))
+  (if (not angle) (setq angle 0.0))
+  (if (not scale) (setq scale 1.0))
   (if (= entity-id "last")
     (setq ent (entlast))
     (setq ent (handent entity-id))
   )
   (if ent
     (progn
-      (command "_HATCH" "_P" pattern "" "_S" ent "" "")
-      (cons T (strcat "{\"entity_type\":\"HATCH\",\"handle\":\"" (cdr (assoc 5 (entget (entlast)))) "\"}")))
+      (setq old-hpang (getvar "HPANG"))
+      (setq old-hpscale (getvar "HPSCALE"))
+      (setq old-layer (getvar "CLAYER"))
+      (if layer
+        (progn
+          (ensure_layer_exists layer "white" "CONTINUOUS")
+          (setvar "CLAYER" layer)
+        )
+      )
+      (setvar "HPANG" angle)
+      (setvar "HPSCALE" scale)
+      (setq result (vl-catch-all-apply 'mcp-run-hatch-command (list ent pattern scale angle)))
+      (setvar "HPANG" old-hpang)
+      (setvar "HPSCALE" old-hpscale)
+      (setvar "CLAYER" old-layer)
+      (if (vl-catch-all-error-p result)
+        (cons nil (strcat "Hatch failed: " (vl-catch-all-error-message result)))
+        (progn
+          (setq hatch-ent (entlast))
+          (cons T (strcat
+            "{\"entity_type\":\"HATCH\",\"handle\":\""
+            (cdr (assoc 5 (entget hatch-ent)))
+            "\",\"pattern\":\"" (mcp-escape-string pattern)
+            "\",\"angle\":" (rtos angle 2 6)
+            ",\"scale\":" (rtos scale 2 6) "}"
+          ))
+        )
+      )
+    )
     (cons nil "Entity not found for hatching")
   )
 )
@@ -1039,33 +1123,36 @@
   (setq color (mcp-json-get-string params "color"))
   (setq linetype (mcp-json-get-string params "linetype"))
   (setq lineweight (mcp-json-get-string params "lineweight"))
-  (if color (command "_.-LAYER" "_COLOR" color name ""))
-  (if linetype (command "_.-LAYER" "_LTYPE" linetype name ""))
-  (if lineweight (command "_.-LAYER" "_LWEIGHT" lineweight name ""))
-  (cons T (strcat "{\"name\":\"" name "\"}"))
+  (if (not (tblsearch "LAYER" name))
+    (cons nil (strcat "Layer not found: " name))
+    (progn
+      (mcp-update-layer-properties name color linetype lineweight)
+      (cons T (strcat "{\"name\":\"" (mcp-escape-string name) "\"}"))
+    )
+  )
 )
 
 (defun mcp-cmd-layer-freeze (params / name)
   (setq name (mcp-json-get-string params "name"))
-  (command "_.-LAYER" "_FREEZE" name "")
+  (mcp-set-layer-flag name 1 T)
   (cons T (strcat "{\"name\":\"" name "\",\"frozen\":true}"))
 )
 
 (defun mcp-cmd-layer-thaw (params / name)
   (setq name (mcp-json-get-string params "name"))
-  (command "_.-LAYER" "_THAW" name "")
+  (mcp-set-layer-flag name 1 nil)
   (cons T (strcat "{\"name\":\"" name "\",\"frozen\":false}"))
 )
 
 (defun mcp-cmd-layer-lock (params / name)
   (setq name (mcp-json-get-string params "name"))
-  (command "_.-LAYER" "_LOCK" name "")
+  (mcp-set-layer-flag name 4 T)
   (cons T (strcat "{\"name\":\"" name "\",\"locked\":true}"))
 )
 
 (defun mcp-cmd-layer-unlock (params / name)
   (setq name (mcp-json-get-string params "name"))
-  (command "_.-LAYER" "_UNLOCK" name "")
+  (mcp-set-layer-flag name 4 nil)
   (cons T (strcat "{\"name\":\"" name "\",\"locked\":false}"))
 )
 
@@ -1374,13 +1461,137 @@
 ;; Utility helpers (defined if not already loaded from external files)
 ;; -----------------------------------------------------------------------
 
-(if (not ensure_layer_exists)
-  (defun ensure_layer_exists (name color linetype)
-    "Create layer if it doesn't exist."
-    (if (not (tblsearch "LAYER" name))
-      (command "_.-LAYER" "_NEW" name "_COLOR" color name "_LTYPE" linetype name "")
+(defun mcp-color-index (value / name)
+  (cond
+    ((= (type value) 'INT) value)
+    ((= (type value) 'REAL) (fix value))
+    ((and value (> (atoi value) 0)) (atoi value))
+    (t
+      (setq name (strcase (if value value "WHITE")))
+      (cond
+        ((= name "RED") 1)
+        ((= name "YELLOW") 2)
+        ((= name "GREEN") 3)
+        ((= name "CYAN") 4)
+        ((= name "BLUE") 5)
+        ((= name "MAGENTA") 6)
+        (t 7)
+      )
     )
   )
+)
+
+(defun mcp-lineweight-value (value)
+  (if (not value)
+    -3
+    (if (< (atof value) 0.0)
+      (fix (atof value))
+      (fix (+ 0.5 (* 100.0 (atof value))))
+    )
+  )
+)
+
+(defun mcp-ensure-linetype (name / upper created)
+  "Ensure common drafting linetypes without opening a file prompt."
+  (setq upper (strcase (if name name "CONTINUOUS")))
+  (if (tblsearch "LTYPE" upper)
+    upper
+    (progn
+      (setq created
+        (cond
+          ((= upper "CENTER")
+            (entmakex (list
+              '(0 . "LTYPE") '(100 . "AcDbSymbolTableRecord")
+              '(100 . "AcDbLinetypeTableRecord") (cons 2 "CENTER") '(70 . 0)
+              '(3 . "Center ____ _ ____ _ ____") '(72 . 65) '(73 . 4) '(40 . 2.0)
+              '(49 . 1.25) '(74 . 0) '(49 . -0.25) '(74 . 0)
+              '(49 . 0.25) '(74 . 0) '(49 . -0.25) '(74 . 0)
+            )))
+          ((= upper "HIDDEN")
+            (entmakex (list
+              '(0 . "LTYPE") '(100 . "AcDbSymbolTableRecord")
+              '(100 . "AcDbLinetypeTableRecord") (cons 2 "HIDDEN") '(70 . 0)
+              '(3 . "Hidden __ __ __ __ __") '(72 . 65) '(73 . 2) '(40 . 0.75)
+              '(49 . 0.5) '(74 . 0) '(49 . -0.25) '(74 . 0)
+            )))
+          (t nil)
+        )
+      )
+      (if created upper "CONTINUOUS")
+    )
+  )
+)
+
+(defun mcp-put-dxf (data code value)
+  (if (assoc code data)
+    (subst (cons code value) (assoc code data) data)
+    (append data (list (cons code value)))
+  )
+)
+
+(defun mcp-update-layer-properties (name color linetype lineweight / data actual)
+  (setq data (tblsearch "LAYER" name))
+  (if data
+    (progn
+      (if color (setq data (mcp-put-dxf data 62 (mcp-color-index color))))
+      (if linetype
+        (progn
+          (setq actual (mcp-ensure-linetype linetype))
+          (setq data (mcp-put-dxf data 6 actual))
+        )
+      )
+      (if lineweight
+        (setq data (mcp-put-dxf data 370 (mcp-lineweight-value lineweight)))
+      )
+      (entmod data)
+      (entupd (tblobjname "LAYER" name))
+    )
+  )
+  (if actual actual (if (assoc 6 data) (cdr (assoc 6 data)) "CONTINUOUS"))
+)
+
+(defun mcp-upsert-layer (name color linetype lineweight / actual data)
+  "Create or update a layer using symbol-table entities only."
+  (setq actual (mcp-ensure-linetype linetype))
+  (if (tblsearch "LAYER" name)
+    (mcp-update-layer-properties name color actual lineweight)
+    (progn
+      (setq data (list
+        '(0 . "LAYER") '(100 . "AcDbSymbolTableRecord")
+        '(100 . "AcDbLayerTableRecord") (cons 2 name) '(70 . 0)
+        (cons 62 (mcp-color-index color)) (cons 6 actual)
+        (cons 370 (mcp-lineweight-value lineweight))
+      ))
+      (entmakex data)
+    )
+  )
+  actual
+)
+
+(defun mcp-set-layer-flag (name bit enabled / data flags)
+  (setq data (tblsearch "LAYER" name))
+  (if data
+    (progn
+      (setq flags (if (assoc 70 data) (cdr (assoc 70 data)) 0))
+      (if enabled
+        (setq flags (logior flags bit))
+        (if (= (logand flags bit) bit) (setq flags (- flags bit)))
+      )
+      (entmod (mcp-put-dxf data 70 flags))
+      (entupd (tblobjname "LAYER" name))
+      T
+    )
+    nil
+  )
+)
+
+(defun ensure_layer_exists (name color linetype)
+  "Compatibility wrapper for prompt-free layer creation."
+  (mcp-upsert-layer name color linetype nil)
+)
+
+(defun mcp-run-hatch-command (ent pattern scale angle)
+  (command "_.-HATCH" "_P" pattern (rtos scale 2 6) (rtos angle 2 6) "_S" ent "" "")
 )
 
 (if (not set_current_layer)

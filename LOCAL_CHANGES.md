@@ -27,6 +27,18 @@
 10. Existing DXF files can be parsed into normalized, bounded audit JSON.
 11. Automatic screenshot attachments are disabled by default; direct window
     capture remains available for UI diagnostics.
+12. Standard mechanical layers are created without interactive `-LAYER` or
+    linetype prompts, including built-in `CENTER` and `HIDDEN` definitions.
+13. Structured entity batches provide a high-throughput alternative to
+    arbitrary AutoLISP while preserving the command whitelist.
+14. File IPC encodes Chinese annotation text as AutoCAD Unicode escapes and
+    exposes explicit hatch angle/scale parameters.
+15. `system.recover` cancels stuck commands outside the dispatcher and cleans
+    abandoned IPC files; timeouts trigger the same cancellation path.
+16. Full AutoCAD uses COM `Save`/`SaveAs` for DWG and DXF before falling back
+    to command-driven saving.
+17. Hidden automation sessions fall back to AutoCAD's COM `HWND`, and DXF
+    audits normalize `TEXT` and `MTEXT` heights without cross-type lookups.
 
 ## Codex registration
 

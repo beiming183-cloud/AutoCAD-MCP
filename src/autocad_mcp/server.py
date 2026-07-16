@@ -49,6 +49,7 @@ async def drawing(
       render_preview — Native deterministic preview. data: {path, paper?, orientation?, plot_style?}
       audit      — Structured drawing audit. data: {limit?, include_entities?, changed_only?, layer?, space?}
       audit_dxf  — Parse an existing DXF into normalized JSON. data: {path, limit?, include_entities?}
+      setup_mechanical — Create the seven monochrome GB/T mechanical-drafting layers.
       purge      — Purge unused objects.
       get_variables — Get system variables. data: {names: [...]}
       undo       — Undo last operation.
@@ -86,6 +87,8 @@ async def drawing(
         result = await backend.drawing_audit_dxf(
             data["path"], data.get("limit", 50), data.get("include_entities", True)
         )
+    elif operation == "setup_mechanical":
+        result = await backend.drawing_setup_mechanical()
     elif operation == "purge":
         result = await backend.drawing_purge()
     elif operation == "get_variables":
@@ -131,7 +134,8 @@ async def entity(
       create_arc        — data: {cx, cy, radius, start_angle, end_angle}, layer?
       create_ellipse    — data: {cx, cy, major_x, major_y, ratio}, layer?
       create_mtext      — data: {x, y, width, text, height?}, layer?
-      create_hatch      — entity_id, data: {pattern?}
+      create_hatch      — entity_id, data: {pattern?, angle?, scale?, layer?}
+      create_batch      — data: {entities: [{type, ...}], continue_on_error?}
 
     Read operations:
       list              — layer? → list entities
@@ -169,7 +173,17 @@ async def entity(
     elif operation == "create_mtext":
         result = await backend.create_mtext(data["x"], data["y"], data["width"], data["text"], data.get("height", 2.5), layer)
     elif operation == "create_hatch":
-        result = await backend.create_hatch(entity_id, data.get("pattern", "ANSI31"))
+        result = await backend.create_hatch(
+            entity_id,
+            data.get("pattern", "ANSI31"),
+            data.get("angle", 0.0),
+            data.get("scale", 1.0),
+            data.get("layer"),
+        )
+    elif operation == "create_batch":
+        result = await backend.create_batch(
+            data.get("entities", []), data.get("continue_on_error", False)
+        )
     # --- Read ---
     elif operation == "list":
         result = await backend.entity_list(layer)
@@ -220,7 +234,7 @@ async def layer(
 
     Operations:
       list            — List all layers with properties.
-      create          — data: {name, color?, linetype?}
+      create          — data: {name, color?, linetype?, lineweight?}
       set_current     — data: {name}
       set_properties  — data: {name, color?, linetype?, lineweight?}
       freeze          — data: {name}
@@ -234,7 +248,12 @@ async def layer(
     if operation == "list":
         result = await backend.layer_list()
     elif operation == "create":
-        result = await backend.layer_create(data["name"], data.get("color", "white"), data.get("linetype", "CONTINUOUS"))
+        result = await backend.layer_create(
+            data["name"],
+            data.get("color", "white"),
+            data.get("linetype", "CONTINUOUS"),
+            data.get("lineweight"),
+        )
     elif operation == "set_current":
         result = await backend.layer_set_current(data["name"])
     elif operation == "set_properties":
@@ -496,6 +515,7 @@ async def system(
       runtime       — Return process/runtime details for spawn diagnostics.
       init          — Re-initialize the backend.
       execute_lisp  — Execute arbitrary AutoLISP code (File IPC only). data: {code}
+      recover       — Cancel a stuck AutoCAD command and clear stale IPC state.
     """
     data = data or {}
 
@@ -530,6 +550,10 @@ async def system(
         client._backend = None
         backend = await get_backend()
         result = await backend.status()
+        return _json(result.to_dict())
+    elif operation == "recover":
+        backend = await get_backend()
+        result = await backend.recover()
         return _json(result.to_dict())
     elif operation == "execute_lisp":
         import os
@@ -587,5 +611,7 @@ def main():
         ],
     )
 
-    log.info("autocad_mcp_starting", version="3.1.0")
+    from autocad_mcp import __version__
+
+    log.info("autocad_mcp_starting", version=__version__)
     mcp.run(transport="stdio")

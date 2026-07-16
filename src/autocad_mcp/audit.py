@@ -56,7 +56,8 @@ def normalize_ezdxf_entity(entity: Any) -> dict[str, Any]:
     elif entity_type in ("TEXT", "MTEXT"):
         data["insert"] = _point(entity.dxf.get("insert"))
         data["text"] = entity.dxf.get("text", "")
-        data["height"] = _number(entity.dxf.get("height", entity.dxf.get("char_height")))
+        height_attribute = "char_height" if entity_type == "MTEXT" else "height"
+        data["height"] = _number(entity.dxf.get(height_attribute))
         data["rotation"] = _number(entity.dxf.get("rotation", 0))
     elif entity_type == "INSERT":
         data.update(

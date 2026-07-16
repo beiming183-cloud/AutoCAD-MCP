@@ -13,6 +13,7 @@ import structlog
 
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
 from autocad_mcp.audit import audit_dxf_file, build_audit, normalize_ezdxf_entity
+from autocad_mcp.drafting import lineweight_hundredths
 from autocad_mcp.screenshot import MatplotlibScreenshotProvider
 
 log = structlog.get_logger()
@@ -104,6 +105,9 @@ class EzdxfBackend(AutoCADBackend):
 
     async def drawing_save_as_dxf(self, path: str) -> CommandResult:
         return await self.drawing_save(path)
+
+    async def recover(self) -> CommandResult:
+        return CommandResult(ok=True, payload={"backend": "ezdxf", "recovered": True})
 
     async def drawing_audit(
         self,
@@ -410,19 +414,31 @@ class EzdxfBackend(AutoCADBackend):
     async def entity_chamfer(self, entity_id1, entity_id2, dist1, dist2) -> CommandResult:
         return CommandResult(ok=False, error="Chamfer not supported on ezdxf backend")
 
-    async def create_hatch(self, entity_id, pattern="ANSI31") -> CommandResult:
+    async def create_hatch(
+        self, entity_id, pattern="ANSI31", angle=0.0, scale=1.0, layer=None
+    ) -> CommandResult:
         try:
             e = self._doc.entitydb.get(entity_id)
             if e is None:
                 return CommandResult(ok=False, error=f"Entity {entity_id} not found")
-            hatch = self._msp.add_hatch()
-            hatch.set_pattern_fill(pattern, scale=1.0)
+            self._ensure_layer(layer)
+            hatch = self._msp.add_hatch(dxfattribs={"layer": layer or "0"})
+            hatch.set_pattern_fill(pattern, scale=scale, angle=angle)
             # Try to use the entity as a boundary path
             hatch.paths.add_polyline_path(
                 [(p[0], p[1]) for p in e.get_points(format="xy")],
                 is_closed=True,
             )
-            return CommandResult(ok=True, payload={"entity_type": "HATCH", "handle": hatch.dxf.handle})
+            return CommandResult(
+                ok=True,
+                payload={
+                    "entity_type": "HATCH",
+                    "handle": hatch.dxf.handle,
+                    "pattern": pattern,
+                    "angle": angle,
+                    "scale": scale,
+                },
+            )
         except Exception as ex:
             return CommandResult(ok=False, error=str(ex))
 
@@ -440,12 +456,48 @@ class EzdxfBackend(AutoCADBackend):
             })
         return CommandResult(ok=True, payload={"layers": layers})
 
-    async def layer_create(self, name, color="white", linetype="CONTINUOUS") -> CommandResult:
-        if name in self._doc.layers:
-            return CommandResult(ok=True, payload={"name": name, "existed": True})
+    def _ensure_linetype(self, name: str) -> str:
+        normalized = name.upper()
+        if normalized in self._doc.linetypes:
+            return normalized
+        definitions = {
+            "CENTER": (
+                "Center ____ _ ____ _ ____ _ ____",
+                [2.0, 1.25, -0.25, 0.25, -0.25],
+            ),
+            "HIDDEN": ("Hidden __ __ __ __ __ __ __", [0.75, 0.5, -0.25]),
+        }
+        definition = definitions.get(normalized)
+        if definition is None:
+            return "CONTINUOUS"
+        description, pattern = definition
+        self._doc.linetypes.add(normalized, pattern=pattern, description=description)
+        return normalized
+
+    async def layer_create(
+        self, name, color="white", linetype="CONTINUOUS", lineweight=None
+    ) -> CommandResult:
         color_int = self._color_to_int(color)
-        self._doc.layers.add(name, color=color_int, linetype=linetype)
-        return CommandResult(ok=True, payload={"name": name, "color": color_int})
+        actual_linetype = self._ensure_linetype(linetype)
+        existed = name in self._doc.layers
+        if existed:
+            layer = self._doc.layers.get(name)
+            layer.color = color_int
+            layer.dxf.linetype = actual_linetype
+        else:
+            layer = self._doc.layers.add(name, color=color_int, linetype=actual_linetype)
+        if lineweight is not None:
+            layer.dxf.lineweight = lineweight_hundredths(lineweight)
+        payload = {
+            "name": name,
+            "color": color_int,
+            "linetype": actual_linetype,
+            "lineweight": layer.dxf.get("lineweight", -3),
+            "existed": existed,
+        }
+        if actual_linetype != linetype.upper():
+            payload["warning"] = f"Linetype {linetype} unavailable; used CONTINUOUS"
+        return CommandResult(ok=True, payload=payload)
 
     async def layer_set_current(self, name) -> CommandResult:
         if name not in self._doc.layers:
@@ -460,7 +512,9 @@ class EzdxfBackend(AutoCADBackend):
         if color is not None:
             layer.color = self._color_to_int(color)
         if linetype is not None:
-            layer.dxf.linetype = linetype
+            layer.dxf.linetype = self._ensure_linetype(linetype)
+        if lineweight is not None:
+            layer.dxf.lineweight = lineweight_hundredths(lineweight)
         return CommandResult(ok=True, payload={"name": name})
 
     async def layer_freeze(self, name) -> CommandResult:

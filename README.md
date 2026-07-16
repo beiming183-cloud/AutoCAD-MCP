@@ -111,6 +111,7 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 | `render_preview` | Native PDF preview or deterministic headless PNG | Yes | Yes |
 | `audit` | Compact structured entity audit with change tracking | Yes | Yes |
 | `audit_dxf` | Parse an existing DXF into normalized JSON | Yes | Yes |
+| `setup_mechanical` | Create seven monochrome GB/T drafting layers | Yes | Yes |
 | `purge` | Purge unused objects | Yes | Yes |
 | `get_variables` | Get system variables by name | Yes | Yes |
 | `undo` | Undo last operation | Yes | No |
@@ -118,7 +119,11 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 
 ### `entity` — Entity CRUD + modification
 
-**Create:** `create_line`, `create_circle`, `create_polyline`, `create_rectangle`, `create_arc`, `create_ellipse`, `create_mtext`, `create_hatch`
+**Create:** `create_line`, `create_circle`, `create_polyline`, `create_rectangle`, `create_arc`, `create_ellipse`, `create_mtext`, `create_hatch`, `create_batch`
+
+`create_batch` accepts up to 500 structured entities in one MCP call. It supports line, circle, polyline, rectangle, arc, ellipse, text, mtext, and hatch records. A hatch can use `entity_id: "$last"` to reference the preceding entity. This is the preferred high-throughput path; it does not enable arbitrary AutoLISP.
+
+For `ANSI31`, pass `angle: 0` to retain the pattern's native 45-degree section angle. `scale` and hatch `layer` are also explicit parameters.
 
 **Read:** `list`, `count`, `get`
 
@@ -173,9 +178,11 @@ edit entities -> drawing.audit -> native render_preview -> audit_dxf for final d
 
 ### `system` — Server management
 
-`status`, `health`, `get_backend`, `runtime`, `init`, `execute_lisp`
+`status`, `health`, `get_backend`, `runtime`, `init`, `recover`, `execute_lisp`
 
-> `execute_lisp` runs arbitrary AutoLISP code (File IPC only). Pass `data: {code: "(+ 1 2)"}`. This turns the server into an extensible automation platform — any valid AutoLISP expression can be executed.
+`recover` cancels stale AutoCAD command-line state and removes abandoned IPC files without calling the potentially blocked dispatcher. Arbitrary AutoLISP remains disabled unless `AUTOCAD_MCP_ALLOW_ARBITRARY_LISP=true` is explicitly configured.
+
+> `execute_lisp` is an explicit opt-in escape hatch for trusted local use. Normal automation should use the structured tools and `create_batch`.
 
 ## Architecture
 
@@ -231,7 +238,19 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 
 The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
 
-## What's New in v3.3
+## What's New in v3.4
+
+- **Prompt-free layer management** - common center and hidden linetypes are created or loaded without opening an interactive linetype prompt.
+- **Mechanical drafting profile** - `drawing.setup_mechanical` creates `OUTLINE`, `THIN`, `CENTER`, `HIDDEN`, `HATCH`, `DIM`, and `TEXT` with monochrome GB/T lineweights.
+- **Structured batch creation** - up to 500 whitelisted entities can be submitted in one MCP call without enabling arbitrary AutoLISP.
+- **Portable Chinese text** - File IPC converts non-ASCII annotation text to AutoCAD `\\U+XXXX` escapes.
+- **Reliable hatching** - pattern angle and scale are explicit; `ANSI31` defaults to an added angle of zero.
+- **Out-of-band recovery** - `system.recover` cancels stuck commands and cleans IPC state without waiting for the dispatcher.
+- **Native save path** - full AutoCAD saves DWG/DXF through COM first and uses the AutoLISP command path only as a fallback.
+- **Automation-session discovery** - hidden AutoCAD instances can be found through their COM window handle when no visible main window is available.
+- **TEXT audit fix** - final DXF audits read `TEXT` and `MTEXT` heights through their correct entity-specific attributes.
+
+### v3.3
 
 - **Structured drawing audits** - compact counts, layers, bounds, normalized geometry, and change fingerprints.
 - **Native preview rendering** - full AutoCAD plots PDF through `PlotToFile`; ezdxf writes deterministic PNG.
