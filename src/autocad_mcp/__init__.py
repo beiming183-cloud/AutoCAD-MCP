@@ -1,3 +1,3 @@
-"""AutoCAD MCP Server v3.7.0 with topology DRC and native solid workflows."""
+"""AutoCAD MCP Server v3.8.0 with verified entity contracts."""
 
-__version__ = "3.7.0"
+__version__ = "3.8.0"

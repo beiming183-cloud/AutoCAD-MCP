@@ -180,6 +180,23 @@ async def test_delivery_applies_a3_fixed_scale(monkeypatch, tmp_path):
     assert all(check["passed"] for check in manifest["validation"]["checks"])
 
 
+@pytest.mark.asyncio
+async def test_delivery_rejects_fixed_title_scale_with_fit_plot(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUTOCAD_MCP_OUTPUT_ROOT", str(tmp_path / "CAD-Automation"))
+
+    result = await deliver_drawing(
+        FakeDeliveryBackend(),
+        {
+            "name": "scale-conflict",
+            "metadata": {"scale": "1:1"},
+            "plot": {"scale_mode": "fit"},
+        },
+    )
+
+    assert result.ok is False
+    assert result.error_code == "E_PLOT_SCALE_MISMATCH"
+
+
 def test_export_checks_compare_types_layers_bounds_digest_and_units():
     source = {
         "entity_count": 2,

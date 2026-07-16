@@ -2,13 +2,15 @@
 
 MCP server for full AutoCAD automation, AutoCAD LT automation, and headless DXF generation.
 
+Version 3.8 treats every structured entity creation as a checked transaction: request fields are strict and immutable, the created handle is read back, geometry and layer are compared, and a mismatch is deleted with `E_POSTCONDITION_MISMATCH`. Atomic batches roll back when any semantic postcondition fails.
+
 This edition is based on [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp) and keeps its MIT license. It adds full AutoCAD COM command delivery, process-based window detection, optional AutoCAD startup, and session-scoped dispatcher loading.
 
 Two backends, one API:
 
 | Backend | Runtime | Requires AutoCAD? | Validation feedback |
 |---------|---------|-------------------|------------|
-| **File IPC** | Windows Python | Yes - full AutoCAD or AutoCAD LT 2024+ | Topology audit + native PDF/PNG |
+| **File IPC** | Windows Python | Yes - full AutoCAD or AutoCAD LT 2024+ | Topology audit + native PDF and direct PNG |
 | **ezdxf** | Any platform | No (headless) | Structured audit + deterministic PNG |
 
 The server exposes **9 consolidated tools** (`drawing`, `entity`, `solid`, `layer`, `block`, `annotation`, `pid`, `view`, `system`) over the standard MCP stdio transport. It is client-independent and works with Codex, Claude Code, Claude Desktop, Cursor, and other MCP-compatible clients.
@@ -39,7 +41,7 @@ Open AutoCAD or AutoCAD LT and load `mcp_dispatch.lsp` using **APPLOAD**:
 1. Type `APPLOAD` in the AutoCAD command line
 2. Browse to `<repo>/lisp-code/mcp_dispatch.lsp`
 3. Click **Load**
-4. You should see: `=== MCP Dispatch v3.7.0 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
+4. You should see: `=== MCP Dispatch v3.8.0 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
 
 > **Tip:** Add the file to your AutoCAD Startup Suite (in the APPLOAD dialog) so it loads automatically with every drawing.
 
@@ -75,7 +77,9 @@ The same server command can be used in Claude Code project-level `.mcp.json`:
         "PYTHONPATH": "C:\\path\\to\\autocad-mcp\\src",
         "AUTOCAD_MCP_BACKEND": "file_ipc",
         "AUTOCAD_MCP_AUTOSTART": "true",
-        "AUTOCAD_MCP_VISIBLE": "true"
+        "AUTOCAD_MCP_VISIBLE": "true",
+        "AUTOCAD_MCP_WINDOW_MODE": "minimized",
+        "AUTOCAD_MCP_ACTIVATE_ON_DRAW": "false"
       }
     }
   }
@@ -286,8 +290,9 @@ The File IPC backend sends `(c:mcp-dispatch)` to the active drawing. Full AutoCA
 | `AUTOCAD_MCP_DOCUMENT_TIMEOUT` | `30.0` | Seconds to wait for COM registration and an active document after the window appears (5-120) |
 | `AUTOCAD_MCP_ONLY_TEXT` | `true` | Disable automatic screenshot attachments; direct diagnostic capture remains available |
 | `AUTOCAD_MCP_AUTOSTART` | `false` | Start AutoCAD automatically when File IPC is requested and no AutoCAD window exists |
-| `AUTOCAD_MCP_VISIBLE` | `true` | Keep the AutoCAD window shown and restore it before drawing |
-| `AUTOCAD_MCP_ACTIVATE_ON_DRAW` | `false` | Bring AutoCAD to the foreground before each structured drawing command |
+| `AUTOCAD_MCP_VISIBLE` | `true` | Keep AutoCAD as a visible desktop application rather than a hidden automation session |
+| `AUTOCAD_MCP_WINDOW_MODE` | `minimized` | Initial policy: `minimized` (taskbar, no activation), `visible` (show without activation), or `foreground` |
+| `AUTOCAD_MCP_ACTIVATE_ON_DRAW` | `false` | Allow per-command activation only when `AUTOCAD_MCP_WINDOW_MODE=foreground` |
 | `AUTOCAD_MCP_AUTO_FIT` | `true` | Automatically center and fit drawing extents after geometry changes |
 | `AUTOCAD_MCP_OUTPUT_ROOT` | `~/Documents/AutoCAD-MCP` | Unified root for specs, scripts, models, drawings, reports, outputs, jobs, templates, logs, and archives |
 | `AUTOCAD_MCP_ALLOW_EXTERNAL_OUTPUTS` | `false` | Permit writes outside the managed output root; disabled by default |

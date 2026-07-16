@@ -160,26 +160,23 @@ async def test_file_ipc_preview_reports_png_not_pdf(monkeypatch, tmp_path):
     backend = FileIPCBackend()
     output = tmp_path / "autocad-preview.png"
 
-    def fake_plot(path, *args):
-        Path(path).write_bytes(b"PDF")
-        return {"paper": "A3", "orientation": "landscape", "plot_style": "monochrome.ctb"}
-
-    def fake_raster(pdf_path, png_path, *, dpi, background):
+    def fake_plot(png_path, *, paper, orientation, plot_style, dpi):
         png_path.write_bytes(b"\x89PNG\r\n\x1a\npreview")
         return {
-            "path": str(png_path), "format": "png", "dpi": dpi, "background": background,
+            "path": str(png_path), "format": "png", "dpi": dpi, "background": "white",
             "width": 100, "height": 50, "bytes": png_path.stat().st_size, "sha256": "a" * 64,
+            "renderer": "autocad-native-png-plot", "paper": paper,
+            "orientation": orientation, "plot_style": plot_style,
         }
 
-    monkeypatch.setattr(backend, "_plot_preview_via_com", fake_plot)
-    monkeypatch.setattr(backend, "_rasterize_pdf_to_png", fake_raster)
+    monkeypatch.setattr(backend, "_plot_png_via_com", fake_plot)
     monkeypatch.setattr(backend, "_collect_entities_via_com", lambda: [])
 
     result = await backend.drawing_render_preview(str(output), paper="A3", dpi=120)
 
     assert result.ok is True
     assert result.payload["format"] == "png"
-    assert result.payload["renderer"] == "autocad-plot+pymupdf"
+    assert result.payload["renderer"] == "autocad-native-png-plot"
     assert result.payload["width"] == 100
 
 

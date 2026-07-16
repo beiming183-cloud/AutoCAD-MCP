@@ -17,7 +17,6 @@ import math
 import os
 import re
 import sys
-import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -246,6 +245,7 @@ class FileIPCBackend(AutoCADBackend):
         self._suspend_auto_fit = 0
         self._dispatcher_version: str | None = None
         self._product_info: dict = {}
+        self._window_policy_applied = False
 
     @property
     def name(self) -> str:
@@ -559,10 +559,11 @@ class FileIPCBackend(AutoCADBackend):
         Sends ESC keystrokes first to cancel any stale pending command
         (e.g. from a previous timeout leaving AutoCAD in a command prompt).
         """
-        self._ensure_autocad_visible(
-            activate=os.environ.get("AUTOCAD_MCP_ACTIVATE_ON_DRAW", "false").lower()
-            in ("1", "true", "yes", "on")
-        )
+        mode = os.environ.get("AUTOCAD_MCP_WINDOW_MODE", "minimized").strip().lower()
+        activate = mode == "foreground" and os.environ.get(
+            "AUTOCAD_MCP_ACTIVATE_ON_DRAW", "false"
+        ).lower() in ("1", "true", "yes", "on")
+        self._ensure_autocad_visible(activate=activate)
         if not self._wait_for_autocad_idle(timeout=5.0):
             self._cancel_active_command()
             if not self._wait_for_autocad_idle(timeout=2.0):
@@ -600,7 +601,11 @@ class FileIPCBackend(AutoCADBackend):
             "yes",
             "on",
         )
-        status = {"configured_visible": configured, "hwnd": self._hwnd}
+        status = {
+            "configured_visible": configured,
+            "window_mode": os.environ.get("AUTOCAD_MCP_WINDOW_MODE", "minimized").lower(),
+            "hwnd": self._hwnd,
+        }
         if sys.platform == "win32" and self._hwnd:
             try:
                 import win32gui
@@ -674,7 +679,7 @@ class FileIPCBackend(AutoCADBackend):
             return {"configured": configured, "fitted": True, "renderer": "autocad-command"}
 
     def _ensure_autocad_visible(self, activate: bool = False) -> dict:
-        """Show and restore AutoCAD so drawing actions can be watched live."""
+        """Apply a non-disruptive window policy without stealing the user's focus."""
         configured = os.environ.get("AUTOCAD_MCP_VISIBLE", "true").lower() in (
             "1",
             "true",
@@ -683,6 +688,12 @@ class FileIPCBackend(AutoCADBackend):
         )
         if not configured:
             return {"configured_visible": False, "shown": False}
+
+        mode = os.environ.get("AUTOCAD_MCP_WINDOW_MODE", "minimized").strip().lower()
+        if mode not in {"minimized", "visible", "foreground"}:
+            mode = "minimized"
+        if activate:
+            mode = "foreground"
 
         transport = "win32"
         try:
@@ -703,18 +714,24 @@ class FileIPCBackend(AutoCADBackend):
                 import win32con
                 import win32gui
 
-                win32gui.ShowWindow(self._hwnd, win32con.SW_RESTORE)
-                if activate:
+                if mode == "foreground":
+                    win32gui.ShowWindow(self._hwnd, win32con.SW_RESTORE)
                     try:
                         win32gui.SetForegroundWindow(self._hwnd)
                     except Exception:
                         pass
+                elif mode == "visible":
+                    win32gui.ShowWindow(self._hwnd, win32con.SW_SHOWNOACTIVATE)
+                elif not self._window_policy_applied:
+                    win32gui.ShowWindow(self._hwnd, win32con.SW_SHOWMINNOACTIVE)
             except Exception:
                 pass
+        self._window_policy_applied = True
         return {
             "configured_visible": True,
             "shown": bool(self._hwnd),
-            "activated": bool(activate),
+            "window_mode": mode,
+            "activated": mode == "foreground",
             "transport": transport,
         }
 
@@ -856,11 +873,44 @@ class FileIPCBackend(AutoCADBackend):
             return CommandResult(ok=False, error=str(exc), error_code="E_DXF_EXPORT")
 
     async def drawing_create(self, name: str | None = None) -> CommandResult:
-        result = await self._dispatch("drawing-create", {"name": name})
-        if result.ok:
+        requested = str(name).strip() if name else None
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            document = application.Documents.Add()
+            if requested:
+                output = Path(requested).expanduser().resolve()
+                if output.suffix.lower() != ".dwg":
+                    output = output.with_suffix(".dwg")
+                output.parent.mkdir(parents=True, exist_ok=True)
+                document.SaveAs(str(output), 64)
+            actual_path = str(document.FullName or document.Name)
+            actual_name = str(document.Name)
+            if requested:
+                expected = str(Path(requested).expanduser().resolve().with_suffix(".dwg"))
+                if os.path.normcase(str(Path(actual_path).resolve())) != os.path.normcase(expected):
+                    raise RuntimeError(f"AutoCAD created {actual_path} instead of {expected}")
+
+            dispatcher = Path(os.environ.get("AUTOCAD_MCP_LISP_PATH", "") or (LISP_DIR / "mcp_dispatch.lsp"))
+            self._type_command(f'(load "{str(dispatcher.resolve()).replace(chr(92), "/")}")')
+            self._wait_for_autocad_idle(timeout=10.0)
             self._audit_revision = 0
             self._audit_fingerprints = None
-        return result
+            self._semantic_store().clear()
+            return CommandResult(
+                ok=True,
+                payload={
+                    "requested_name": requested,
+                    "actual_name": actual_name,
+                    "actual_path": actual_path,
+                    "name_honored": not requested or os.path.normcase(actual_path) == os.path.normcase(expected),
+                },
+            )
+        except Exception as exc:
+            return CommandResult(ok=False, error=f"Drawing create failed: {exc}")
 
     async def drawing_purge(self) -> CommandResult:
         return await self._dispatch("drawing-purge", {})
@@ -946,6 +996,12 @@ class FileIPCBackend(AutoCADBackend):
                 entities = [details.get(entity.get("handle"), entity) for entity in entities]
             source = "autolisp-fallback"
 
+        semantics = self._semantic_store()
+        entities = [
+            {**entity, **({"semantics": semantics[str(entity.get("handle"))]} if str(entity.get("handle")) in semantics else {})}
+            for entity in entities
+        ]
+
         self._audit_revision += 1
         payload, fingerprints = build_audit(
             entities,
@@ -1019,13 +1075,9 @@ class FileIPCBackend(AutoCADBackend):
         output.parent.mkdir(parents=True, exist_ok=True)
         if force:
             output.unlink(missing_ok=True)
-        temporary_pdf = Path(tempfile.gettempdir()) / f"autocad-mcp-preview-{uuid.uuid4().hex}.pdf"
         try:
-            plot = self._plot_preview_via_com(
-                str(temporary_pdf), paper, orientation, plot_style, "fit", "1:1", True
-            )
-            raster = self._rasterize_pdf_to_png(
-                temporary_pdf, output, dpi=int(dpi), background=str(background).lower()
+            raster = self._plot_png_via_com(
+                output, paper=paper, orientation=orientation, plot_style=plot_style, dpi=int(dpi)
             )
             try:
                 digest = geometry_digest(self._collect_entities_via_com())
@@ -1035,25 +1087,130 @@ class FileIPCBackend(AutoCADBackend):
                 ok=True,
                 payload={
                     **raster,
-                    "renderer": "autocad-plot+pymupdf",
-                    "paper": plot.get("paper"),
-                    "orientation": plot.get("orientation"),
-                    "plot_style": plot.get("plot_style"),
                     "geometry_digest": digest,
                     "force_overwrite": bool(force),
                 },
             )
         except Exception as exc:
             return CommandResult(ok=False, error=f"PNG preview failed: {exc}")
-        finally:
-            for _ in range(20):
-                try:
-                    temporary_pdf.unlink(missing_ok=True)
-                    break
-                except OSError:
-                    time.sleep(0.1)
+
+    def _plot_png_via_com(
+        self, output: Path, *, paper: str, orientation: str, plot_style: str, dpi: int
+    ) -> dict:
+        import pythoncom
+        import win32com.client
+        from PIL import Image
+
+        pythoncom.CoInitialize()
+        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        document = application.ActiveDocument
+        layout = document.ActiveLayout
+        device = "PublishToWeb PNG.pc3"
+        saved = {}
+        for name in (
+            "ConfigName", "CanonicalMediaName", "PaperUnits", "PlotType",
+            "UseStandardScale", "StandardScale", "CenterPlot", "PlotRotation",
+            "StyleSheet", "PlotWithPlotStyles",
+        ):
+            try:
+                saved[name] = getattr(layout, name)
+            except Exception:
+                pass
+        try:
+            old_background_plot = document.GetVariable("BACKGROUNDPLOT")
+        except Exception:
+            old_background_plot = None
+
+        try:
+            document.SetVariable("BACKGROUNDPLOT", 0)
+            layout.ConfigName = device
+            layout.RefreshPlotDeviceInfo()
+            selected_orientation = str(orientation).lower()
+            if selected_orientation == "auto":
+                ext_min = list(document.GetVariable("EXTMIN"))
+                ext_max = list(document.GetVariable("EXTMAX"))
+                selected_orientation = (
+                    "landscape"
+                    if abs(ext_max[0] - ext_min[0]) >= abs(ext_max[1] - ext_min[1])
+                    else "portrait"
+                )
+
+            paper_sizes = {
+                "A0": (841.0, 1189.0), "A1": (594.0, 841.0),
+                "A2": (420.0, 594.0), "A3": (297.0, 420.0), "A4": (210.0, 297.0),
+            }
+            paper_width, paper_height = paper_sizes.get(str(paper).upper(), paper_sizes["A4"])
+            if selected_orientation == "landscape":
+                paper_width, paper_height = max(paper_width, paper_height), min(paper_width, paper_height)
             else:
-                log.warning("preview_temp_pdf_cleanup_deferred", path=str(temporary_pdf))
+                paper_width, paper_height = min(paper_width, paper_height), max(paper_width, paper_height)
+            target_width = paper_width / 25.4 * dpi
+            target_height = paper_height / 25.4 * dpi
+
+            candidates = []
+            for media in list(layout.GetCanonicalMediaNames()):
+                match = re.search(r"(\d+(?:\.\d+)?)\D+x\D*(\d+(?:\.\d+)?)\D*Pixels", str(media), re.I)
+                if not match:
+                    continue
+                width, height = float(match.group(1)), float(match.group(2))
+                aspect_error = abs(math.log((width / height) / (target_width / target_height)))
+                size_error = abs(math.log((width * height) / (target_width * target_height)))
+                candidates.append((aspect_error * 8 + size_error, str(media), width, height))
+            if not candidates:
+                raise RuntimeError("AutoCAD PNG plot device exposes no usable raster media")
+            _, media, _, _ = min(candidates, key=lambda item: item[0])
+            layout.CanonicalMediaName = media
+            layout.PlotType = 1
+            layout.UseStandardScale = True
+            layout.StandardScale = 0
+            layout.CenterPlot = True
+            layout.PlotRotation = 1 if selected_orientation == "landscape" else 0
+            if plot_style:
+                try:
+                    layout.StyleSheet = plot_style
+                    layout.PlotWithPlotStyles = True
+                except Exception:
+                    pass
+
+            output.unlink(missing_ok=True)
+            plotted = bool(document.Plot.PlotToFile(str(output), device))
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                if output.is_file() and output.stat().st_size > 0:
+                    break
+                time.sleep(0.1)
+            if not output.is_file() or output.stat().st_size <= 0:
+                raise RuntimeError(f"AutoCAD PNG PlotToFile returned {plotted} without an output file")
+            with Image.open(output) as image:
+                width, height = image.size
+            return {
+                "path": str(output),
+                "format": "png",
+                "renderer": "autocad-native-png-plot",
+                "paper": paper,
+                "orientation": selected_orientation,
+                "plot_style": plot_style,
+                "media": media,
+                "requested_dpi": dpi,
+                "dpi": round(width / (paper_width / 25.4), 3),
+                "background": "white",
+                "width": width,
+                "height": height,
+                "bytes": output.stat().st_size,
+                "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+                "device": device,
+            }
+        finally:
+            for name, value in saved.items():
+                try:
+                    setattr(layout, name, value)
+                except Exception:
+                    pass
+            if old_background_plot is not None:
+                try:
+                    document.SetVariable("BACKGROUNDPLOT", old_background_plot)
+                except Exception:
+                    pass
 
     async def drawing_get_variables(self, names: list[str] | None = None) -> CommandResult:
         if names:
@@ -1395,35 +1552,151 @@ class FileIPCBackend(AutoCADBackend):
 
     # --- Entity operations ---
 
+    def _create_entity_via_com(self, kind: str, params: dict, layer: str | None):
+        pythoncom, win32com, document, modelspace = self._solid_context()
+        target_layer = str(layer or "0")
+        if target_layer != "0":
+            try:
+                document.Layers.Item(target_layer)
+            except Exception:
+                document.Layers.Add(target_layer)
+
+        if kind == "line":
+            entity = modelspace.AddLine(
+                self._solid_point(pythoncom, win32com, [params["x1"], params["y1"]]),
+                self._solid_point(pythoncom, win32com, [params["x2"], params["y2"]]),
+            )
+        elif kind == "circle":
+            entity = modelspace.AddCircle(
+                self._solid_point(pythoncom, win32com, [params["cx"], params["cy"]]),
+                float(params["radius"]),
+            )
+        elif kind in {"polyline", "rectangle"}:
+            points = params["points"]
+            coordinates = [float(value) for point in points for value in point[:2]]
+            entity = modelspace.AddLightWeightPolyline(
+                win32com.client.VARIANT(
+                    pythoncom.VT_ARRAY | pythoncom.VT_R8, coordinates
+                )
+            )
+            entity.Closed = bool(params.get("closed", False))
+        elif kind == "arc":
+            entity = modelspace.AddArc(
+                self._solid_point(pythoncom, win32com, [params["cx"], params["cy"]]),
+                float(params["radius"]),
+                math.radians(float(params["start_angle"])),
+                math.radians(float(params["end_angle"])),
+            )
+        elif kind == "ellipse":
+            major_axis = [
+                float(params["major_x"]) - float(params["cx"]),
+                float(params["major_y"]) - float(params["cy"]),
+                0.0,
+            ]
+            entity = modelspace.AddEllipse(
+                self._solid_point(pythoncom, win32com, [params["cx"], params["cy"]]),
+                self._solid_point(pythoncom, win32com, major_axis),
+                float(params["ratio"]),
+            )
+        elif kind == "mtext":
+            entity = modelspace.AddMText(
+                self._solid_point(pythoncom, win32com, [params["x"], params["y"]]),
+                float(params["width"]),
+                str(params["text"]),
+            )
+            entity.Height = float(params.get("height", 2.5))
+        elif kind == "text":
+            entity = modelspace.AddText(
+                str(params["text"]),
+                self._solid_point(pythoncom, win32com, [params["x"], params["y"]]),
+                float(params.get("height", 2.5)),
+            )
+            entity.Rotation = math.radians(float(params.get("rotation", 0.0)))
+        else:
+            raise ValueError(f"Unsupported COM entity kind: {kind}")
+
+        entity.Layer = target_layer
+        entity.Update()
+        return CommandResult(
+            ok=True,
+            payload={
+                "entity_type": _com_entity_to_dict(entity)["type"],
+                "handle": str(entity.Handle),
+                "renderer": "autocad-com",
+            },
+        )
+
+    async def _create_with_com_fallback(
+        self, kind: str, params: dict, layer: str | None, command: str, dispatch_params: dict
+    ) -> CommandResult:
+        try:
+            result = self._create_entity_via_com(kind, params, layer)
+            self._auto_fit_view()
+            return result
+        except Exception as com_error:
+            result = await self._dispatch(command, dispatch_params)
+            if result.ok and isinstance(result.payload, dict):
+                result.payload["renderer"] = "autolisp-fallback"
+                result.payload["com_warning"] = str(com_error)
+            return result
+
     async def create_line(self, x1, y1, x2, y2, layer=None) -> CommandResult:
-        return await self._dispatch("create-line", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "layer": layer})
+        params = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+        return await self._create_with_com_fallback(
+            "line", params, layer, "create-line", {**params, "layer": layer}
+        )
 
     async def create_circle(self, cx, cy, radius, layer=None) -> CommandResult:
-        return await self._dispatch("create-circle", {"cx": cx, "cy": cy, "radius": radius, "layer": layer})
+        params = {"cx": cx, "cy": cy, "radius": radius}
+        return await self._create_with_com_fallback(
+            "circle", params, layer, "create-circle", {**params, "layer": layer}
+        )
 
     async def create_polyline(self, points, closed=False, layer=None) -> CommandResult:
         pts_str = ";".join(f"{p[0]},{p[1]}" for p in points)
-        return await self._dispatch("create-polyline", {
-            "points_str": pts_str, "closed": "1" if closed else "0", "layer": layer
-        })
+        return await self._create_with_com_fallback(
+            "polyline",
+            {"points": points, "closed": closed},
+            layer,
+            "create-polyline",
+            {"points_str": pts_str, "closed": "1" if closed else "0", "layer": layer},
+        )
 
     async def create_rectangle(self, x1, y1, x2, y2, layer=None) -> CommandResult:
-        return await self._dispatch("create-rectangle", {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "layer": layer})
+        params = {
+            "points": [[x1, y1], [x2, y1], [x2, y2], [x1, y2]],
+            "closed": True,
+        }
+        return await self._create_with_com_fallback(
+            "rectangle", params, layer, "create-rectangle",
+            {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "layer": layer},
+        )
 
     async def create_arc(self, cx, cy, radius, start_angle, end_angle, layer=None) -> CommandResult:
-        return await self._dispatch("create-arc", {"cx": cx, "cy": cy, "radius": radius, "start_angle": start_angle, "end_angle": end_angle, "layer": layer})
+        params = {"cx": cx, "cy": cy, "radius": radius, "start_angle": start_angle, "end_angle": end_angle}
+        return await self._create_with_com_fallback(
+            "arc", params, layer, "create-arc", {**params, "layer": layer}
+        )
 
     async def create_ellipse(self, cx, cy, major_x, major_y, ratio, layer=None) -> CommandResult:
-        return await self._dispatch("create-ellipse", {"cx": cx, "cy": cy, "major_x": major_x, "major_y": major_y, "ratio": ratio, "layer": layer})
+        params = {"cx": cx, "cy": cy, "major_x": major_x, "major_y": major_y, "ratio": ratio}
+        return await self._create_with_com_fallback(
+            "ellipse", params, layer, "create-ellipse", {**params, "layer": layer}
+        )
 
     async def create_mtext(self, x, y, width, text, height=2.5, layer=None) -> CommandResult:
-        return await self._dispatch("create-mtext", {"x": x, "y": y, "width": width, "text": encode_autocad_text(text), "height": height, "layer": layer})
+        params = {"x": x, "y": y, "width": width, "text": text, "height": height}
+        return await self._create_with_com_fallback(
+            "mtext", params, layer, "create-mtext",
+            {**params, "text": encode_autocad_text(text), "layer": layer},
+        )
 
     async def create_batch(
         self,
         entities: list[dict],
         continue_on_error: bool = False,
         atomic: bool = False,
+        strict: bool = True,
     ) -> CommandResult:
         self._suspend_auto_fit += 1
         try:
@@ -1435,7 +1708,9 @@ class FileIPCBackend(AutoCADBackend):
                         error=f"Unable to begin AutoCAD transaction: {begin.error}",
                         error_code="E_TRANSACTION_BEGIN",
                     )
-            result = await super().create_batch(entities, continue_on_error, atomic=False)
+            result = await super().create_batch(
+                entities, continue_on_error, atomic=False, strict=strict
+            )
             if atomic:
                 transaction = await self._dispatch(
                     "transaction-commit" if result.ok else "transaction-rollback", {}
@@ -1485,7 +1760,11 @@ class FileIPCBackend(AutoCADBackend):
 
     async def entity_get(self, entity_id) -> CommandResult:
         try:
-            return CommandResult(ok=True, payload=self._get_entity_via_com(entity_id))
+            payload = self._get_entity_via_com(entity_id)
+            semantics = self._semantic_store().get(str(entity_id))
+            if semantics:
+                payload["semantics"] = dict(semantics)
+            return CommandResult(ok=True, payload=payload)
         except Exception as com_error:
             result = await self._dispatch("entity-get", {"entity_id": entity_id})
             if result.ok and isinstance(result.payload, dict):
@@ -1493,7 +1772,10 @@ class FileIPCBackend(AutoCADBackend):
             return result
 
     async def entity_erase(self, entity_id) -> CommandResult:
-        return await self._dispatch("entity-erase", {"entity_id": entity_id})
+        result = await self._dispatch("entity-erase", {"entity_id": entity_id})
+        if result.ok:
+            self._semantic_store().pop(str(entity_id), None)
+        return result
 
     async def entity_copy(self, entity_id, dx, dy) -> CommandResult:
         return await self._dispatch("entity-copy", {"entity_id": entity_id, "dx": dx, "dy": dy})
@@ -1988,7 +2270,11 @@ class FileIPCBackend(AutoCADBackend):
     # --- Annotation ---
 
     async def create_text(self, x, y, text, height=2.5, rotation=0.0, layer=None) -> CommandResult:
-        return await self._dispatch("create-text", {"x": x, "y": y, "text": encode_autocad_text(text), "height": height, "rotation": rotation, "layer": layer})
+        params = {"x": x, "y": y, "text": text, "height": height, "rotation": rotation}
+        return await self._create_with_com_fallback(
+            "text", params, layer, "create-text",
+            {**params, "text": encode_autocad_text(text), "layer": layer},
+        )
 
     async def create_dimension_linear(self, x1, y1, x2, y2, dim_x, dim_y) -> CommandResult:
         try:
@@ -2161,6 +2447,22 @@ class FileIPCBackend(AutoCADBackend):
 
     async def show_window(self, activate: bool = True) -> CommandResult:
         return CommandResult(ok=True, payload=self._ensure_autocad_visible(activate=activate))
+
+    async def minimize_window(self) -> CommandResult:
+        if sys.platform != "win32" or not self._hwnd:
+            return CommandResult(ok=False, error="AutoCAD window is unavailable")
+        try:
+            import win32con
+            import win32gui
+
+            win32gui.ShowWindow(self._hwnd, win32con.SW_SHOWMINNOACTIVE)
+            self._window_policy_applied = True
+            return CommandResult(
+                ok=True,
+                payload={"window_mode": "minimized", "activated": False, "hwnd": self._hwnd},
+            )
+        except Exception as exc:
+            return CommandResult(ok=False, error=f"Failed to minimize AutoCAD: {exc}")
 
     async def get_screenshot(self) -> CommandResult:
         if self._screenshot_provider:

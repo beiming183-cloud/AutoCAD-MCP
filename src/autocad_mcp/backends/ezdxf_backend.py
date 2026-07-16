@@ -130,6 +130,11 @@ class EzdxfBackend(AutoCADBackend):
                 for entity in self._msp
                 if not layer or entity.dxf.get("layer", "0") == layer
             ]
+            semantics = self._semantic_store()
+            entities = [
+                {**entity, **({"semantics": semantics[str(entity.get("handle"))]} if str(entity.get("handle")) in semantics else {})}
+                for entity in entities
+            ]
             self._audit_revision += 1
             payload, fingerprints = build_audit(
                 entities,
@@ -212,7 +217,16 @@ class EzdxfBackend(AutoCADBackend):
         self._save_path = f"{name}.dxf" if name else None
         self._audit_revision = 0
         self._audit_fingerprints = None
-        return CommandResult(ok=True, payload={"name": name or "untitled"})
+        self._semantic_store().clear()
+        return CommandResult(
+            ok=True,
+            payload={
+                "name": name or "untitled",
+                "requested_name": name,
+                "actual_name": self._save_path or "untitled.dxf",
+                "name_honored": bool(name),
+            },
+        )
 
     async def drawing_purge(self) -> CommandResult:
         if not self._doc:
@@ -228,6 +242,7 @@ class EzdxfBackend(AutoCADBackend):
             self._save_path = path
             self._audit_revision = 0
             self._audit_fingerprints = None
+            self._semantic_store().clear()
             return CommandResult(ok=True, payload={"path": path})
         except Exception as ex:
             return CommandResult(ok=False, error=str(ex))
@@ -352,6 +367,39 @@ class EzdxfBackend(AutoCADBackend):
             elif e.dxftype() == "CIRCLE":
                 info["center"] = list(e.dxf.center)[:2]
                 info["radius"] = e.dxf.radius
+            elif e.dxftype() == "ARC":
+                info.update(
+                    center=list(e.dxf.center)[:2],
+                    radius=e.dxf.radius,
+                    start_angle=e.dxf.start_angle,
+                    end_angle=e.dxf.end_angle,
+                )
+            elif e.dxftype() == "ELLIPSE":
+                info.update(
+                    center=list(e.dxf.center)[:2],
+                    major_axis=list(e.dxf.major_axis)[:2],
+                    ratio=e.dxf.ratio,
+                )
+            elif e.dxftype() == "LWPOLYLINE":
+                info["points"] = [[float(point[0]), float(point[1])] for point in e.get_points()]
+                info["closed"] = bool(e.closed)
+            elif e.dxftype() == "MTEXT":
+                info.update(
+                    insert=list(e.dxf.insert)[:2],
+                    text=e.text,
+                    height=e.dxf.char_height,
+                    width=e.dxf.width,
+                )
+            elif e.dxftype() == "TEXT":
+                info.update(
+                    insert=list(e.dxf.insert)[:2],
+                    text=e.dxf.text,
+                    height=e.dxf.height,
+                    rotation=e.dxf.rotation,
+                )
+            semantics = self._semantic_store().get(str(entity_id))
+            if semantics:
+                info["semantics"] = dict(semantics)
             return CommandResult(ok=True, payload=info)
         except Exception as ex:
             return CommandResult(ok=False, error=str(ex))
@@ -367,6 +415,7 @@ class EzdxfBackend(AutoCADBackend):
                 else:
                     return CommandResult(ok=False, error=f"Entity {entity_id} not found")
             self._msp.delete_entity(e)
+            self._semantic_store().pop(str(entity_id), None)
             return CommandResult(ok=True, payload={"erased": entity_id})
         except Exception as ex:
             return CommandResult(ok=False, error=str(ex))

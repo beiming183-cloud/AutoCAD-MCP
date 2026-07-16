@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from autocad_mcp.errors import error_payload
+from autocad_mcp.contracts import EntityExpectation, build_entity_expectation, compare_entity
 
 
 @dataclass
@@ -230,6 +231,7 @@ class AutoCADBackend(ABC):
         entities: list[dict[str, Any]],
         continue_on_error: bool = False,
         atomic: bool = False,
+        strict: bool = True,
     ) -> CommandResult:
         """Create a bounded structured entity batch without arbitrary code execution."""
         if len(entities) > 500:
@@ -242,7 +244,15 @@ class AutoCADBackend(ABC):
         for index, item in enumerate(entities):
             kind = str(item.get("type", "")).lower()
             layer = item.get("layer")
+            expectation: EntityExpectation | None = None
             try:
+                if kind != "hatch":
+                    expectation = build_entity_expectation(
+                        kind,
+                        {key: value for key, value in item.items() if key not in {"type", "layer"}},
+                        layer=layer,
+                        strict=strict,
+                    )
                 if kind == "line":
                     result = await self.create_line(
                         item["x1"], item["y1"], item["x2"], item["y2"], layer
@@ -308,8 +318,14 @@ class AutoCADBackend(ABC):
                     )
                 else:
                     result = CommandResult(ok=False, error=f"Unsupported batch type: {kind}")
+                if expectation is not None:
+                    result = await self.verify_created_entity(expectation, result)
             except (KeyError, TypeError, ValueError) as exc:
-                result = CommandResult(ok=False, error=f"Invalid {kind or 'entity'}: {exc}")
+                result = CommandResult(
+                    ok=False,
+                    error=f"Invalid {kind or 'entity'}: {exc}",
+                    error_code="E_PARAMETER_REJECTED",
+                )
 
             entry = {"index": index, "type": kind, **result.to_dict()}
             results.append(entry)
@@ -352,6 +368,86 @@ class AutoCADBackend(ABC):
             if failures
             else None,
         )
+
+    async def verify_created_entity(
+        self,
+        expectation: EntityExpectation,
+        result: CommandResult,
+        *,
+        tolerance: float = 0.000001,
+    ) -> CommandResult:
+        """Read back a created entity and remove it if its postcondition is false."""
+        if not result.ok or not isinstance(result.payload, dict):
+            return result
+        handle = result.payload.get("handle")
+        if not handle:
+            return CommandResult(
+                ok=False,
+                error="Entity creation returned no handle for postcondition verification",
+                error_code="E_POSTCONDITION_MISMATCH",
+                payload={
+                    "requested": expectation.requested(),
+                    "actual": None,
+                    "diff": [{"path": "handle", "requested": "created handle", "actual": None}],
+                    "deleted": False,
+                },
+            )
+
+        readback = await self.entity_get(str(handle))
+        actual = readback.payload if readback.ok and isinstance(readback.payload, dict) else None
+        differences = (
+            compare_entity(expectation, actual, tolerance=tolerance)
+            if actual is not None
+            else [{"path": "entity_get", "requested": "readable entity", "actual": readback.error}]
+        )
+        if differences:
+            deletion = await self.entity_erase(str(handle))
+            self._semantic_store().pop(str(handle), None)
+            return CommandResult(
+                ok=False,
+                error=f"Created entity {handle} did not match its immutable request",
+                error_code="E_POSTCONDITION_MISMATCH",
+                recoverable=False,
+                recommended_action="stop_and_inspect_backend_state",
+                payload={
+                    "handle": str(handle),
+                    "requested": expectation.requested(),
+                    "actual": actual,
+                    "diff": differences,
+                    "deleted": deletion.ok,
+                    "delete_error": deletion.error,
+                },
+            )
+
+        semantics = expectation.semantic_dict()
+        if semantics:
+            self._semantic_store()[str(handle)] = semantics
+            actual = {**actual, "semantics": semantics}
+        return CommandResult(
+            ok=True,
+            payload={
+                **result.payload,
+                "verified": True,
+                "requested": expectation.requested(),
+                "actual": actual,
+                "diff": [],
+            },
+        )
+
+    def _semantic_store(self) -> dict[str, dict[str, Any]]:
+        store = getattr(self, "_entity_semantics", None)
+        if store is None:
+            store = {}
+            setattr(self, "_entity_semantics", store)
+        return store
+
+    async def entity_get_with_semantics(self, entity_id: str) -> CommandResult:
+        result = await self.entity_get(entity_id)
+        if result.ok and isinstance(result.payload, dict):
+            semantics = self._semantic_store().get(str(entity_id))
+            if semantics:
+                result.payload = {**result.payload, "semantics": dict(semantics)}
+        return result
 
     async def entity_list(self, layer: str | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
@@ -577,6 +673,9 @@ class AutoCADBackend(ABC):
         return CommandResult(ok=False, error="Not supported on this backend")
 
     async def show_window(self, activate: bool = True) -> CommandResult:
+        return CommandResult(ok=False, error="Window display is not supported on this backend")
+
+    async def minimize_window(self) -> CommandResult:
         return CommandResult(ok=False, error="Window display is not supported on this backend")
 
     async def get_screenshot(self) -> CommandResult:

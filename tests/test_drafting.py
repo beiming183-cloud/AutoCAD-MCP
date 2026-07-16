@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, MagicMock
+
 from autocad_mcp.backends.ezdxf_backend import EzdxfBackend
 from autocad_mcp.backends.file_ipc import FileIPCBackend
 from autocad_mcp.drafting import encode_autocad_text, lineweight_hundredths, tangent_arc_from_start
@@ -90,10 +92,28 @@ async def test_file_ipc_atomic_batch_uses_autocad_transaction():
 
     async def fake_dispatch(command, params):
         commands.append(command)
-        payload = {"handle": "A"} if command == "create-line" else {"transaction": command}
+        if command == "create-line":
+            payload = {"handle": "A"}
+        elif command == "entity-get":
+            payload = {
+                "type": "LINE", "handle": "A", "layer": "0",
+                "start": [0, 0], "end": [10, 0],
+            }
+        else:
+            payload = {"transaction": command}
         return CommandResult(ok=True, payload=payload)
 
     backend._dispatch = fake_dispatch
+    backend._create_entity_via_com = MagicMock(side_effect=RuntimeError("COM disabled in unit test"))
+    backend.entity_get = AsyncMock(
+        return_value=CommandResult(
+            ok=True,
+            payload={
+                "type": "LINE", "handle": "A", "layer": "0",
+                "start": [0, 0], "end": [10, 0],
+            },
+        )
+    )
     result = await backend.create_batch(
         [
             {"type": "line", "x1": 0, "y1": 0, "x2": 10, "y2": 0},
@@ -109,6 +129,7 @@ async def test_file_ipc_atomic_batch_uses_autocad_transaction():
 
 async def test_file_ipc_encodes_text_before_dispatch():
     backend = FileIPCBackend()
+    backend._create_entity_via_com = MagicMock(side_effect=RuntimeError("COM disabled in unit test"))
     captured = {}
 
     async def fake_dispatch(command, params):

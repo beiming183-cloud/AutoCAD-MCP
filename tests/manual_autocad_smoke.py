@@ -1,4 +1,4 @@
-"""Manual visible-AutoCAD smoke test for native v3.7 workflows."""
+"""Manual minimized-AutoCAD smoke test for native v3.8 workflows."""
 
 from __future__ import annotations
 
@@ -57,6 +57,13 @@ async def run(output_root: Path, *, keep_artifacts: bool = False) -> dict:
     output_root = output_root / datetime.now().strftime("%Y%m%d-%H%M%S")
     output_root.mkdir(parents=True, exist_ok=False)
     backend = FileIPCBackend()
+    foreground_before = None
+    try:
+        import win32gui
+
+        foreground_before = win32gui.GetForegroundWindow()
+    except Exception:
+        pass
     startup = await backend.ensure_ready()
     if not startup.ok:
         raise RuntimeError(startup.to_dict())
@@ -125,6 +132,15 @@ async def run(output_root: Path, *, keep_artifacts: bool = False) -> dict:
     if not joined.ok:
         raise RuntimeError(joined.to_dict())
 
+    semantic_tags = {
+        cutter.payload["handle"]: {"component_id": "TRIM-CUTTER", "line_class": "outline", "intentional_open_end": "both"},
+        target.payload["handle"]: {"component_id": "TRIM-TARGET", "line_class": "outline", "intentional_open_end": "start"},
+        boundary.payload["handle"]: {"component_id": "EXTEND-BOUNDARY", "line_class": "outline", "intentional_open_end": "both"},
+        extend_target.payload["handle"]: {"component_id": "EXTEND-TARGET", "line_class": "outline", "intentional_open_end": "start"},
+        joined.payload["handle"]: {"component_id": "JOINED-CHAIN", "line_class": "outline", "intentional_open_end": "both"},
+    }
+    backend._semantic_store().update(semantic_tags)
+
     constrained = await backend.entity_constrain(
         "horizontal", [extend_target.payload["handle"]]
     )
@@ -154,10 +170,12 @@ async def run(output_root: Path, *, keep_artifacts: bool = False) -> dict:
     )
     if not audit.ok:
         raise RuntimeError(audit.to_dict())
+    if audit.payload["geometry_drc"]["status"] != "PASS":
+        raise RuntimeError({"message": "Smoke geometry DRC did not pass", "audit": audit.payload})
 
-    dwg_path = output_root / "v370-visible-validation.dwg"
-    dxf_path = output_root / "v370-visible-validation.dxf"
-    png_path = output_root / "v370-visible-validation.png"
+    dwg_path = output_root / "v380-minimized-validation.dwg"
+    dxf_path = output_root / "v380-minimized-validation.dxf"
+    png_path = output_root / "v380-minimized-validation.png"
     saved = await backend.drawing_save(str(dwg_path))
     if not saved.ok:
         raise RuntimeError(saved.to_dict())
@@ -174,12 +192,27 @@ async def run(output_root: Path, *, keep_artifacts: bool = False) -> dict:
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "document": document_name,
         "ready": ready.payload,
+        "window": {
+            **backend._window_visibility_status(),
+            "foreground_before": foreground_before,
+            "foreground_after": (
+                win32gui.GetForegroundWindow() if foreground_before is not None else None
+            ),
+        },
         "atomic_rollback": {
             "error_code": failed_batch.error_code,
             "count_before": count_before,
             "count_after": count_after,
             "rolled_back": failed_batch.payload.get("rolled_back"),
         },
+        "creation_postconditions": [
+            {
+                "handle": entry["payload"]["handle"],
+                "verified": entry["payload"]["verified"],
+                "diff": entry["payload"]["diff"],
+            }
+            for entry in successful_batch.payload["results"]
+        ],
         "trimmed_entity": trimmed.payload,
         "extended_entity": extended_entity.payload,
         "joined": joined.payload,
@@ -199,7 +232,7 @@ async def run(output_root: Path, *, keep_artifacts: bool = False) -> dict:
             "png": _artifact(png_path),
         },
     }
-    record_path = output_root / "v370-visible-validation.json"
+    record_path = output_root / "v380-minimized-validation.json"
     record_path.write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )

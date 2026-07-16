@@ -269,6 +269,7 @@ def _entity_segments(entity: dict[str, Any]) -> list[dict[str, Any]]:
     entity_type = str(entity.get("type", "UNKNOWN"))
     handle = str(entity.get("handle", ""))
     layer = str(entity.get("layer", "0"))
+    semantics = dict(entity.get("semantics") or {})
     if entity_type == "LINE":
         points = [entity.get("start"), entity.get("end")]
         closed = False
@@ -290,6 +291,8 @@ def _entity_segments(entity: dict[str, Any]) -> list[dict[str, Any]]:
                 "entity": handle,
                 "segment": index,
                 "layer": layer,
+                "component_id": semantics.get("component_id"),
+                "line_class": semantics.get("line_class"),
                 "start": points[index],
                 "end": points[(index + 1) % len(points)],
             }
@@ -301,6 +304,7 @@ def _entity_endpoints(entity: dict[str, Any]) -> list[dict[str, Any]]:
     entity_type = str(entity.get("type", "UNKNOWN"))
     handle = str(entity.get("handle", ""))
     layer = str(entity.get("layer", "0"))
+    semantics = dict(entity.get("semantics") or {})
     if entity_type in ("LINE", "ARC"):
         pairs = (("start", entity.get("start")), ("end", entity.get("end")))
     elif entity_type in ("LWPOLYLINE", "POLYLINE", "POLYLINE2D", "POLYLINE3D"):
@@ -311,7 +315,16 @@ def _entity_endpoints(entity: dict[str, Any]) -> list[dict[str, Any]]:
     else:
         return []
     return [
-        {"id": f"{handle}:{name}", "entity": handle, "endpoint": name, "layer": layer, "point": point}
+        {
+            "id": f"{handle}:{name}",
+            "entity": handle,
+            "endpoint": name,
+            "layer": layer,
+            "point": point,
+            "component_id": semantics.get("component_id"),
+            "line_class": semantics.get("line_class"),
+            "intentional_open_end": semantics.get("intentional_open_end"),
+        }
         for name, point in pairs
         if isinstance(point, list) and len(point) >= 2
     ]
@@ -370,6 +383,7 @@ def audit_geometry(
         "DANGLING_ENDPOINT": [],
         "NEAR_MISS_ENDPOINT": [],
         "INTERIOR_CROSSING": [],
+        "UNASSIGNED_ENTITY": [],
     }
     signature_handles: dict[str, list[str]] = {}
     duplicate_supported = {
@@ -451,7 +465,13 @@ def audit_geometry(
 
     def topology_entity(entity: dict[str, Any]) -> bool:
         layer = str(entity.get("layer", "0")).upper()
-        return layer not in ignored_layers and (selected_layers is None or layer in selected_layers)
+        line_class = str((entity.get("semantics") or {}).get("line_class", "outline")).lower()
+        ignored_classes = {"center", "hidden", "leader", "dimension", "table", "construction"}
+        return (
+            layer not in ignored_layers
+            and line_class not in ignored_classes
+            and (selected_layers is None or layer in selected_layers)
+        )
 
     topology_entities = [entity for entity in entities if topology_entity(entity)]
     endpoints = [endpoint for entity in topology_entities for endpoint in _entity_endpoints(entity)]
@@ -508,12 +528,17 @@ def audit_geometry(
 
     for endpoint in endpoints:
         if not connections[endpoint["id"]]:
+            intentional = endpoint.get("intentional_open_end")
+            if intentional in {endpoint["endpoint"], "both"}:
+                continue
             findings["DANGLING_ENDPOINT"].append(
                 {
                     "entity": endpoint["entity"],
                     "endpoint": endpoint["endpoint"],
                     "point": endpoint["point"],
                     "layer": endpoint["layer"],
+                    "component_id": endpoint.get("component_id"),
+                    "line_class": endpoint.get("line_class"),
                 }
             )
 
@@ -542,14 +567,23 @@ def audit_geometry(
                         "entities": [first["entity"], second["entity"]],
                         "segments": [first["segment"], second["segment"]],
                         "point": [round(value, 6) for value in intersection],
+                        "components": [first.get("component_id"), second.get("component_id")],
+                        "line_classes": [first.get("line_class"), second.get("line_class")],
                     }
                 )
 
+    if options.get("require_component_id", False):
+        findings["UNASSIGNED_ENTITY"] = [
+            {"entity": str(entity.get("handle", "")), "layer": entity.get("layer", "0")}
+            for entity in topology_entities
+            if not (entity.get("semantics") or {}).get("component_id")
+        ]
+
     rule_results = []
     policy_by_rule = {
-        "DANGLING_ENDPOINT": options.get("dangling_endpoint_policy", "warning"),
+        "DANGLING_ENDPOINT": options.get("dangling_endpoint_policy", "fail"),
         "NEAR_MISS_ENDPOINT": options.get("near_miss_policy", "warning"),
-        "INTERIOR_CROSSING": options.get("intersection_policy", "warning"),
+        "INTERIOR_CROSSING": options.get("intersection_policy", "fail"),
     }
     for rule_id, items in findings.items():
         status = (

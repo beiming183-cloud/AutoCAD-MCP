@@ -19,6 +19,7 @@ from autocad_mcp.client import (
     get_backend,
     tool_error,
 )
+from autocad_mcp.contracts import build_entity_expectation
 from autocad_mcp.delivery import deliver_drawing
 from autocad_mcp.drafting import tangent_arc_from_start
 from autocad_mcp.workspace import resolve_output_target, workspace_info
@@ -73,7 +74,19 @@ async def drawing(
     backend = await get_backend()
 
     if operation == "create":
-        result = await backend.drawing_create(data.get("name"))
+        requested_name = data.get("name")
+        if requested_name:
+            category = "drawings" if backend.name == "file_ipc" else "dxf"
+            extension = ".dwg" if backend.name == "file_ipc" else ".dxf"
+            target = resolve_output_target(
+                data.get("path"),
+                category=category,
+                extension=extension,
+                default_stem=str(requested_name),
+            )
+            result = await backend.drawing_create(str(target.path))
+        else:
+            result = await backend.drawing_create(None)
     elif operation == "info":
         result = await backend.drawing_info()
     elif operation == "save":
@@ -95,6 +108,14 @@ async def drawing(
         )
         result = await backend.drawing_save_as_dxf(str(target.path))
     elif operation == "plot_pdf":
+        scale_mode = str(data.get("scale_mode", "fit")).lower()
+        declared_scale = data.get("declared_scale")
+        if declared_scale is not None and scale_mode == "fit" and str(declared_scale).upper() not in {"FIT", "NTS"}:
+            return tool_error(
+                "A fit-to-extents PDF cannot declare a fixed drawing scale",
+                code="E_PLOT_SCALE_MISMATCH",
+                recommended_action="use_declared_scale_fit_or_nts",
+            )
         target = resolve_output_target(
             data.get("path"),
             category="pdf",
@@ -106,7 +127,7 @@ async def drawing(
             data.get("paper", "A4"),
             data.get("orientation", "auto"),
             data.get("plot_style", "monochrome.ctb"),
-            data.get("scale_mode", "fit"),
+            scale_mode,
             data.get("scale", "1:1"),
             data.get("center", True),
         )
@@ -180,6 +201,7 @@ async def entity(
     layer: str | None = None,
     entity_id: str | None = None,
     data: dict | None = None,
+    strict: bool = True,
     include_screenshot: bool = False,
 ) -> ToolResult:
     """Entity creation, querying, and modification.
@@ -215,6 +237,28 @@ async def entity(
     data = data or {}
     backend = await get_backend()
 
+    expectation = None
+    create_kind = operation.removeprefix("create_")
+    if operation in {
+        "create_line", "create_circle", "create_polyline", "create_rectangle",
+        "create_arc", "create_ellipse", "create_mtext", "create_text",
+    }:
+        params = dict(data)
+        if operation in {"create_line", "create_rectangle"}:
+            params.update(x1=x1, y1=y1, x2=x2, y2=y2)
+        elif operation == "create_polyline":
+            params["points"] = points
+        try:
+            expectation = build_entity_expectation(
+                create_kind, params, layer=layer, strict=bool(strict)
+            )
+        except (TypeError, ValueError) as exc:
+            return tool_error(
+                str(exc),
+                code="E_PARAMETER_REJECTED",
+                recommended_action="correct_request_fields",
+            )
+
     # --- Create ---
     if operation == "create_line":
         result = await backend.create_line(x1, y1, x2, y2, layer)
@@ -242,6 +286,11 @@ async def entity(
         result = await backend.create_ellipse(data["cx"], data["cy"], data["major_x"], data["major_y"], data["ratio"], layer)
     elif operation == "create_mtext":
         result = await backend.create_mtext(data["x"], data["y"], data["width"], data["text"], data.get("height", 2.5), layer)
+    elif operation == "create_text":
+        result = await backend.create_text(
+            data["x"], data["y"], data["text"], data.get("height", 2.5),
+            data.get("rotation", 0.0), layer,
+        )
     elif operation == "create_hatch":
         result = await backend.create_hatch(
             entity_id,
@@ -255,6 +304,7 @@ async def entity(
             data.get("entities", []),
             data.get("continue_on_error", False),
             data.get("atomic", True),
+            data.get("strict", strict),
         )
     # --- Read ---
     elif operation == "list":
@@ -262,7 +312,7 @@ async def entity(
     elif operation == "count":
         result = await backend.entity_count(layer)
     elif operation == "get":
-        result = await backend.entity_get(entity_id)
+        result = await backend.entity_get_with_semantics(entity_id)
     # --- Modify ---
     elif operation == "copy":
         result = await backend.entity_copy(entity_id, data["dx"], data["dy"])
@@ -296,6 +346,9 @@ async def entity(
         result = await backend.entity_erase(entity_id)
     else:
         return tool_error(f"Unknown entity operation: {operation}", code="E_UNSUPPORTED_OPERATION")
+
+    if expectation is not None:
+        result = await backend.verify_created_entity(expectation, result)
 
     return await add_screenshot_if_available(result, include_screenshot)
 
@@ -623,6 +676,9 @@ async def view(
         return _json(result.to_dict())
     elif operation == "show_window":
         result = await backend.show_window(activate=True)
+        return _json(result.to_dict())
+    elif operation == "minimize_window":
+        result = await backend.minimize_window()
         return _json(result.to_dict())
     elif operation == "get_screenshot":
         result = await backend.get_screenshot()

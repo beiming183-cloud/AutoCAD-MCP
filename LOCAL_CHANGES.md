@@ -22,8 +22,8 @@
    command delivery; the original window-message path remains the LT fallback.
 8. Structured drawing audits report bounded entity geometry, layer/type counts,
    drawing bounds, and added/modified/removed handles.
-9. Full AutoCAD produces milestone previews as verified PNG files rasterized
-   from native plots instead of desktop/window screenshots.
+9. Full AutoCAD produces milestone previews directly through its native PNG
+   plot device instead of desktop/window screenshots or temporary PDF files.
 10. Existing DXF files can be parsed into normalized, bounded audit JSON.
 11. Automatic screenshot attachments are disabled by default; direct window
     capture remains available for UI diagnostics.
@@ -39,8 +39,9 @@
     export API for DXF.
 17. Hidden automation sessions fall back to AutoCAD's COM `HWND`, and DXF
     audits normalize `TEXT` and `MTEXT` heights without cross-type lookups.
-18. AutoCAD is visible by default, can be brought to the foreground before
-    every drawing command, and exposes `view.show_window` for manual restore.
+18. AutoCAD is visible but initially minimized by default. Drawing never steals
+    focus; a user-restored window remains open, and `view.show_window` is the
+    explicit foreground action while `view.minimize_window` returns it to the taskbar.
 19. Transient COM call rejection while AutoCAD is still loading is retried for
     up to five seconds before falling back to window-message delivery.
 20. IPC waits for `CMDACTIVE=0` before and after requests, and entity-producing
@@ -78,12 +79,23 @@
     sweeps, and boolean solids through a dedicated standard MCP tool.
 35. Entity queries include arc endpoints, polyline bulges, MText width and
     attachment, block attributes, ownership, bounds, length, and area when available.
-36. `drawing.render_preview` writes a real white-background PNG with explicit
-    DPI, pixel dimensions, force-overwrite behavior, SHA-256, and geometry digest.
+36. `drawing.render_preview` writes a real white-background native-plot PNG with
+    requested/actual DPI, pixel dimensions, force-overwrite behavior, SHA-256,
+    and geometry digest, without launching or retaining a PDF.
 37. Active-document readiness has a separate bounded timeout so a newly started
     AutoCAD window can finish COM registration before dispatcher loading begins.
 38. The manual visible-AutoCAD smoke test closes and deletes generated test CAD
     artifacts by default while retaining a timestamped JSON evidence record.
+39. Structured entity creation uses frozen strict contracts, reads every handle
+    back, and returns `requested`, `actual`, and `diff`; mismatches are erased with
+    `E_POSTCONDITION_MISMATCH` and fail the surrounding atomic transaction.
+40. Entity semantics (`component_id`, `line_class`, `intentional_open_end`) feed
+    topology audits. Unclassified dangling endpoints and interior crossings now
+    fail by default, while explicit intentional open ends can be accepted.
+41. Plot delivery rejects title-block scale declarations that conflict with the
+    actual fit/fixed plotting mode, and PDF generation never launches a viewer.
+42. `drawing.create` reports and verifies its requested and actual managed file
+    name instead of silently returning `Drawing1.dwg`.
 
 ## MCP client registration
 

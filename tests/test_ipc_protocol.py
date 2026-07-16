@@ -620,3 +620,35 @@ def test_dispatch_trigger_refuses_persistently_busy_command_state(monkeypatch):
     assert backend._type_dispatch_trigger() is False
     cancel.assert_called_once()
     typed.assert_not_called()
+
+
+def test_minimized_window_policy_never_steals_focus_and_respects_manual_restore(monkeypatch):
+    import sys
+    import types
+
+    from autocad_mcp.backends.file_ipc import FileIPCBackend
+
+    win32gui = MagicMock()
+    win32con = types.SimpleNamespace(SW_RESTORE=9, SW_SHOWNOACTIVATE=4, SW_SHOWMINNOACTIVE=7)
+    pythoncom = types.SimpleNamespace(CoInitialize=lambda: None)
+    client = types.SimpleNamespace(GetActiveObject=MagicMock(side_effect=RuntimeError("no COM")))
+    win32com = types.SimpleNamespace(client=client)
+    monkeypatch.setitem(sys.modules, "win32gui", win32gui)
+    monkeypatch.setitem(sys.modules, "win32con", win32con)
+    monkeypatch.setitem(sys.modules, "pythoncom", pythoncom)
+    monkeypatch.setitem(sys.modules, "win32com", win32com)
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+    monkeypatch.setenv("AUTOCAD_MCP_VISIBLE", "true")
+    monkeypatch.setenv("AUTOCAD_MCP_WINDOW_MODE", "minimized")
+
+    backend = FileIPCBackend()
+    backend._hwnd = 123
+    first = backend._ensure_autocad_visible()
+    win32gui.ShowWindow.reset_mock()
+    second = backend._ensure_autocad_visible()
+
+    assert first["window_mode"] == "minimized"
+    assert first["activated"] is False
+    assert second["activated"] is False
+    win32gui.SetForegroundWindow.assert_not_called()
+    win32gui.ShowWindow.assert_not_called()

@@ -146,6 +146,24 @@ async def deliver_drawing(
     plot.setdefault("scale_mode", "fit")
     plot.setdefault("scale", "1:1")
     plot.setdefault("center", True)
+    declared_scale = plot.get("declared_scale") or (request.get("metadata") or {}).get("scale")
+    if declared_scale is not None:
+        normalized_declared = str(declared_scale).strip().upper()
+        if plot["scale_mode"] == "fit" and normalized_declared not in {"FIT", "NTS"}:
+            return CommandResult(
+                ok=False,
+                error=(
+                    f"Declared scale {declared_scale} conflicts with fit-to-extents plotting; "
+                    "declare FIT/NTS or request a fixed scale"
+                ),
+                error_code="E_PLOT_SCALE_MISMATCH",
+            )
+        if plot["scale_mode"] == "fixed" and normalized_declared != str(plot["scale"]).strip().upper():
+            return CommandResult(
+                ok=False,
+                error=f"Declared scale {declared_scale} does not match fixed plot scale {plot['scale']}",
+                error_code="E_PLOT_SCALE_MISMATCH",
+            )
     manifest: dict[str, Any] = {
         "schema_version": 1,
         "job_id": job["job_id"],
