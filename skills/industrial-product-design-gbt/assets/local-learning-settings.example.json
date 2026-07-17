@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "auto_capture": true,
+  "default_branch": "main",
+  "capture_events": [
+    "explicit-user-feedback",
+    "concept-selection-or-rejection",
+    "accepted-or-rejected-revision",
+    "meaningful-source-redesign",
+    "gate-escape",
+    "backend-evidence-failure",
+    "prototype-or-test-disposition",
+    "milestone-handoff",
+    "project-closure"
+  ],
+  "minimum_capture": "meaningful-iteration",
+  "store": "local-learning/project-feedback.jsonl",
+  "may_store_locally": true,
+  "may_publish": false,
+  "include_private_asset_contents": false,
+  "notify_user": "final-summary"
+}

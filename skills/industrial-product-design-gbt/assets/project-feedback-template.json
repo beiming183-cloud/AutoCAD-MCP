@@ -1,8 +1,19 @@
 {
-  "schema_version": 1,
-  "record_id": "PROJECT-REVISION-EVENT",
+  "schema_version": 2,
+  "record_id": "AUTO",
   "project_id": "PROJECT-ID",
   "project_revision": "REVISION",
+  "iteration": {
+    "index": null,
+    "branch": "main",
+    "parent_record_id": null,
+    "status": "proposed",
+    "reason": "Why this iteration was created",
+    "baseline_revision": "previous revision or none",
+    "candidate_revision": "current revision",
+    "change_summary": ["meaningful source-level change"],
+    "design_dna_disposition": "preserved | explicitly-changed | violated"
+  },
   "timestamp": "YYYY-MM-DDTHH:MM:SS+08:00",
   "task_summary": "What the other task or window attempted",
   "maturity": "concept",

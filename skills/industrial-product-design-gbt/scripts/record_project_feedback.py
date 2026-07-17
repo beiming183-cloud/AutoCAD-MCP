@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -48,6 +49,8 @@ FORBIDDEN_KEY_PARTS = (
 )
 
 VALID_SCOPES = {"project-only", "tentative", "cross-project", "backend-specific", "gate-change"}
+VALID_ITERATION_STATUS = {"proposed", "rejected", "accepted", "superseded", "rolled-back"}
+SUPPORTED_SCHEMA_VERSIONS = {1, 2}
 
 
 def substantive(value) -> bool:
@@ -84,8 +87,31 @@ def validate(data: dict) -> list[dict]:
         elif not substantive(data[field]):
             findings.append({"code": "FIELD_EMPTY", "field": field})
 
-    if data.get("schema_version") != 1:
+    if data.get("schema_version") not in SUPPORTED_SCHEMA_VERSIONS:
         findings.append({"code": "SCHEMA_VERSION_UNSUPPORTED", "value": data.get("schema_version")})
+
+    if data.get("schema_version") == 2:
+        iteration = data.get("iteration")
+        if not isinstance(iteration, dict):
+            findings.append({"code": "ITERATION_OBJECT_REQUIRED"})
+        else:
+            index = iteration.get("index")
+            if not isinstance(index, int) or isinstance(index, bool) or index < 1:
+                findings.append({"code": "ITERATION_INDEX_INVALID", "value": index})
+            for field in ("branch", "status", "reason", "baseline_revision", "candidate_revision", "change_summary", "design_dna_disposition"):
+                if not substantive(iteration.get(field)):
+                    findings.append({"code": "ITERATION_FIELD_MISSING", "field": field})
+            if iteration.get("status") not in VALID_ITERATION_STATUS:
+                findings.append({"code": "ITERATION_STATUS_INVALID", "value": iteration.get("status")})
+            if isinstance(index, int) and not isinstance(index, bool) and index > 1 and not substantive(iteration.get("parent_record_id")):
+                findings.append({"code": "ITERATION_PARENT_REQUIRED", "index": index})
+
+            outcome = data.get("outcome")
+            if isinstance(outcome, dict) and isinstance(outcome.get("accepted"), bool):
+                if iteration.get("status") == "accepted" and outcome.get("accepted") is not True:
+                    findings.append({"code": "ACCEPTED_STATUS_OUTCOME_MISMATCH"})
+                if iteration.get("status") in {"rejected", "rolled-back", "superseded"} and outcome.get("accepted") is not False:
+                    findings.append({"code": "NONCURRENT_STATUS_OUTCOME_MISMATCH", "status": iteration.get("status")})
 
     feedback = data.get("feedback")
     if isinstance(feedback, list):
@@ -116,10 +142,10 @@ def validate(data: dict) -> list[dict]:
     return findings
 
 
-def existing_ids(store: Path) -> set[str]:
+def existing_records(store: Path) -> list[dict]:
     if not store.is_file():
-        return set()
-    ids = set()
+        return []
+    records = []
     for line_number, line in enumerate(store.read_text(encoding="utf-8").splitlines(), start=1):
         if not line.strip():
             continue
@@ -127,33 +153,128 @@ def existing_ids(store: Path) -> set[str]:
             item = json.loads(line)
         except json.JSONDecodeError as exc:
             raise ValueError(f"invalid JSONL in {store} at line {line_number}: {exc}") from exc
-        if isinstance(item, dict) and item.get("record_id"):
-            ids.add(str(item["record_id"]))
-    return ids
+        if isinstance(item, dict):
+            records.append(item)
+    return records
+
+
+def validate_lineage(data: dict, records: list[dict]) -> list[dict]:
+    findings = []
+    record_id = str(data.get("record_id"))
+    if any(str(item.get("record_id")) == record_id for item in records):
+        findings.append({"code": "RECORD_ID_DUPLICATE", "record_id": record_id})
+
+    if data.get("schema_version") != 2 or not isinstance(data.get("iteration"), dict):
+        return findings
+
+    iteration = data["iteration"]
+    key = (str(data.get("project_id")), str(iteration.get("branch")), iteration.get("index"))
+    for item in records:
+        other = item.get("iteration")
+        if not isinstance(other, dict):
+            continue
+        other_key = (str(item.get("project_id")), str(other.get("branch")), other.get("index"))
+        if other_key == key:
+            findings.append({"code": "PROJECT_BRANCH_ITERATION_DUPLICATE", "project_id": key[0], "branch": key[1], "index": key[2]})
+            break
+
+    index = iteration.get("index")
+    parent_id = iteration.get("parent_record_id")
+    if isinstance(index, int) and not isinstance(index, bool) and index > 1 and substantive(parent_id):
+        parent = next((item for item in records if str(item.get("record_id")) == str(parent_id)), None)
+        if parent is None:
+            findings.append({"code": "ITERATION_PARENT_NOT_FOUND", "parent_record_id": parent_id})
+        else:
+            if str(parent.get("project_id")) != str(data.get("project_id")):
+                findings.append({"code": "ITERATION_PARENT_PROJECT_MISMATCH", "parent_record_id": parent_id})
+            parent_iteration = parent.get("iteration")
+            if isinstance(parent_iteration, dict) and isinstance(parent_iteration.get("index"), int) and parent_iteration["index"] >= index:
+                findings.append({"code": "ITERATION_PARENT_ORDER_INVALID", "parent_index": parent_iteration["index"], "index": index})
+    return findings
+
+
+def safe_id(value) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value).strip()).strip("-")
+    return normalized or "record"
+
+
+def apply_auto_lineage(data: dict, records: list[dict]) -> None:
+    if data.get("schema_version") in (None, "AUTO"):
+        data["schema_version"] = 2
+    if data.get("schema_version") != 2:
+        return
+
+    iteration = data.setdefault("iteration", {})
+    if not isinstance(iteration, dict):
+        return
+    branch = iteration.get("branch")
+    if not substantive(branch) or branch == "AUTO":
+        branch = "main"
+        iteration["branch"] = branch
+
+    same_branch = []
+    for item in records:
+        other = item.get("iteration")
+        if (
+            isinstance(other, dict)
+            and str(item.get("project_id")) == str(data.get("project_id"))
+            and str(other.get("branch")) == str(branch)
+            and isinstance(other.get("index"), int)
+            and not isinstance(other.get("index"), bool)
+        ):
+            same_branch.append(item)
+    same_branch.sort(key=lambda item: item["iteration"]["index"])
+
+    index = iteration.get("index")
+    if not isinstance(index, int) or isinstance(index, bool) or index < 1:
+        index = same_branch[-1]["iteration"]["index"] + 1 if same_branch else 1
+        iteration["index"] = index
+
+    if index == 1 and iteration.get("parent_record_id") in (None, "", "AUTO"):
+        iteration["parent_record_id"] = None
+    elif index > 1 and iteration.get("parent_record_id") in (None, "", "AUTO"):
+        prior = [item for item in same_branch if item["iteration"]["index"] < index]
+        if prior:
+            iteration["parent_record_id"] = prior[-1].get("record_id")
+
+    if data.get("record_id") in (None, "", "AUTO"):
+        data["record_id"] = "-".join(
+            (
+                safe_id(data.get("project_id")),
+                safe_id(branch),
+                f"i{index}",
+                safe_id(iteration.get("candidate_revision", data.get("project_revision"))),
+            )
+        )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
     parser.add_argument("--store", type=Path)
+    parser.add_argument("--auto-lineage", action="store_true", help="Assign record ID, branch iteration, and parent from the local store")
     args = parser.parse_args()
 
     try:
+        skill_root = Path(__file__).resolve().parent.parent
+        store = args.store or skill_root / "local-learning" / "project-feedback.jsonl"
+        store = store.expanduser().resolve()
+        records = existing_records(store)
         data = json.loads(args.input.read_text(encoding="utf-8"))
+        if args.auto_lineage:
+            apply_auto_lineage(data, records)
         findings = validate(data)
         if findings:
             report = {"validator": "record_project_feedback", "status": "FAIL", "findings": findings}
             print(json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True))
             return 2
 
-        skill_root = Path(__file__).resolve().parent.parent
-        store = args.store or skill_root / "local-learning" / "project-feedback.jsonl"
-        store = store.expanduser().resolve()
-        if str(data["record_id"]) in existing_ids(store):
+        lineage_findings = validate_lineage(data, records)
+        if lineage_findings:
             report = {
                 "validator": "record_project_feedback",
                 "status": "FAIL",
-                "findings": [{"code": "RECORD_ID_DUPLICATE", "record_id": data["record_id"]}],
+                "findings": lineage_findings,
             }
             print(json.dumps(report, ensure_ascii=True, indent=2, sort_keys=True))
             return 2
@@ -169,6 +290,8 @@ def main() -> int:
         "validator": "record_project_feedback",
         "status": "PASS",
         "record_id": data["record_id"],
+        "project_id": data.get("project_id"),
+        "iteration": data.get("iteration"),
         "store": str(store),
         "boundary": "Storage success does not prove that a lesson is correct, reusable, or authorized for publication.",
     }

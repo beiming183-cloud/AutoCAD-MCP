@@ -166,6 +166,19 @@ When feedback reports poor appearance, poor practicality, misalignment, unequal 
 
 At meaningful milestones or project closure, capture cross-window feedback with `project-learning-loop.md`. Keep raw personal records under ignored `local-learning/`; do not commit project paths, proprietary geometry, private images, or user-specific preferences to a public repository without explicit authority.
 
+For repeated work on one product, preserve a project/branch/iteration lineage rather than overwriting prior attempts. Count repeated iterations as one project when generalizing preferences, but treat the same escaped defect across iterations as evidence that the owning gate or parameter source needs repair.
+
+## Automatic Local Learning
+
+When ignored `local-learning/settings.json` exists with `auto_capture: true`, capture project learning automatically. Do not require the user to fill or copy a template when the current task already contains the required evidence.
+
+- Trigger on explicit like/dislike feedback, concept selection/rejection, accepted or rejected revisions, meaningful source redesign, gate escape, backend evidence failure, prototype/test disposition, milestone handoff, and project closure.
+- Build a schema-v2 record from the active project identity, exact user wording, design DNA, affected view/feature/state, expected versus observed result, source-level change, evidence, user disposition, unresolved scope, and privacy boundary.
+- Run `scripts/record_project_feedback.py <temporary-record.json> --auto-lineage`; let it assign the next branch iteration, parent record, and record ID.
+- Skip autosaves, formatting-only edits, unchanged repeated messages, and events without decision value.
+- Keep `may_publish: false` and never embed credentials or private asset content. Store controlled paths, IDs, hashes, or bounded descriptions.
+- Mention saved record IDs in the final summary. If automatic capture fails, disclose the failure and preserve the project work; do not pretend learning occurred.
+
 ## Output Contract by Maturity
 
 - `discovery package`: brief, contradictions, TBDs, user flow, constraints, and opportunities.
