@@ -38,12 +38,13 @@ Treat product design as the primary task and mechanical drafting as the engineer
 8. For a large local CAD/JPG corpus, read `references/local-cad-reference-library.md`. Generate a private manifest with `scripts/catalog_reference_library.py`; use `references/local-reference-library.example.json` as the portable schema and do not commit personal absolute paths.
 9. For concept selection, stage review, prototype review, or design audit, read `references/integrated-design-review.md`.
 10. After user rejection, a gate escape, repeated misalignment, unequal repeated features, impractical layout, or an unattractive result, read `references/failure-learning.md` and update the owning gate.
-11. For a new consumer product, enclosure, appliance, controls, ports, cables, moving parts, or mains-powered product, also read `references/consumer-product-concept.md`.
-12. For parametric parts, surfaces, assemblies, motion, or 3D delivery, read `references/cad-3d-modeling.md`; for evidence tiers and 2D/3D workflows, read `references/cad-workflows.md`.
-13. For complex mechanisms or multi-system assemblies, read `references/complex-assembly-drafting.md`; for physical-performance claims, read `references/engineering-analysis.md`.
-14. For DRC, DFM, fit, interference, tolerance, or release review, read `references/drc-review.md`; for GPS, GD&T, or inspection, read `references/gps-inspection.md`.
-15. Before GB/T engineering drawings, read `references/gbt-drafting.md`; for AutoCAD or AutoCAD MCP execution, also read `references/autocad-mcp-workflow.md`.
-16. For configurations, BOMs, revisions, MBD/PMI, dependencies, or formal packages, read `references/product-definition-release.md`.
+11. When importing outcomes or feedback from another task/window, or deciding whether a lesson should persist across projects, read `references/project-learning-loop.md`.
+12. For a new consumer product, enclosure, appliance, controls, ports, cables, moving parts, or mains-powered product, also read `references/consumer-product-concept.md`.
+13. For parametric parts, surfaces, assemblies, motion, or 3D delivery, read `references/cad-3d-modeling.md`; for evidence tiers and 2D/3D workflows, read `references/cad-workflows.md`.
+14. For complex mechanisms or multi-system assemblies, read `references/complex-assembly-drafting.md`; for physical-performance claims, read `references/engineering-analysis.md`.
+15. For DRC, DFM, fit, interference, tolerance, or release review, read `references/drc-review.md`; for GPS, GD&T, or inspection, read `references/gps-inspection.md`.
+16. Before GB/T engineering drawings, read `references/gbt-drafting.md`; for AutoCAD or AutoCAD MCP execution, also read `references/autocad-mcp-workflow.md`.
+17. For configurations, BOMs, revisions, MBD/PMI, dependencies, or formal packages, read `references/product-definition-release.md`.
 
 Load only the references required for the current task.
 
@@ -163,6 +164,8 @@ After feedback, update the brief, selection rationale, parameters, risks, aesthe
 
 When feedback reports poor appearance, poor practicality, misalignment, unequal repeated features, or another escaped defect, complete `failure-learning.md`. Record the escaped gate, root cause, containment, permanent process or Skill change, and next-version verification before claiming the issue closed.
 
+At meaningful milestones or project closure, capture cross-window feedback with `project-learning-loop.md`. Keep raw personal records under ignored `local-learning/`; do not commit project paths, proprietary geometry, private images, or user-specific preferences to a public repository without explicit authority.
+
 ## Output Contract by Maturity
 
 - `discovery package`: brief, contradictions, TBDs, user flow, constraints, and opportunities.
@@ -186,6 +189,7 @@ Use these scripts when their input contract is available:
 - `scripts/compare_render_viewset.py`: verify source identity, camera invariance, image dimensions, nonblank output, and expected visual change.
 - `scripts/check_model_manifest.py`: bind required native, table, render, evidence, drawing, and exchange roles to one revision and source hash.
 - `scripts/catalog_reference_library.py`: create a stable read-only inventory for large local CAD and image libraries.
+- `scripts/record_project_feedback.py`: validate and append a privacy-bounded cross-window project-learning record to ignored local storage.
 
 Treat every script as a narrow validator. A script pass never proves beauty, usability, physical performance, safety, manufacturability, or approval outside its declared fields.
 
@@ -196,4 +200,4 @@ Treat every script as a narrow validator. A script pass never proves beauty, usa
 - Extract repeated design logic across images and preserve counterexamples, context, and contradictions. One image does not create a permanent preference by itself.
 - Mark only explicit user likes and dislikes `user-confirmed`. Mark agent conclusions `inferred` with confidence.
 - Prefer transferring proportion, massing, line and surface logic, boundary strategy, detail rhythm, and CMF logic. Do not copy brand marks or distinctive trade identity unless the user explicitly requests it and has the right to use it.
-- After material aesthetic feedback, update `references/aesthetic-profile.md` and its revision log. Do not claim persistent learning when no durable profile update occurred.
+- After material aesthetic feedback, preserve the raw event with `scripts/record_project_feedback.py`. Store personal confirmed preferences in ignored `local-learning/aesthetic-profile.local.md`; update the public `references/aesthetic-profile.md` only when the user explicitly authorizes publication of a generalized, nonprivate rule. Do not claim persistent learning when no durable local record occurred.

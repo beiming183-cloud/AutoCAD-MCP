@@ -37,3 +37,7 @@ Separate the symptom from the root cause. “USB openings are unequal” is a sy
 - Preserve the failed artifact and disposition when it provides useful regression evidence.
 
 `FAILURE_LEARNING_GATE` passes only when root cause is evidence-backed, containment is bounded, the source correction is complete, recurrence prevention changed the owning process, and the next-version verification has a result. A promise to “pay more attention” does not pass.
+
+## Cross-Window Capture
+
+When the project runs in another task or window, preserve the failure record with the handoff fields in `project-learning-loop.md`. Append the structured record using `scripts/record_project_feedback.py`; do not rely on chat memory or a screenshot without project identity, revision, and final disposition.
