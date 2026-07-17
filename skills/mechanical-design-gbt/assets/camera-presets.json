@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "coordinate_convention": {
+    "x": "product right",
+    "y": "product rear",
+    "z": "product up",
+    "direction_definition": "unit vector from target toward camera"
+  },
+  "notes": [
+    "Map these normalized directions into the native scene; do not copy world coordinates blindly.",
+    "Fit orthographic scale to the same revision bounding box plus the declared margin.",
+    "Keep camera identity, crop, resolution, color pipeline, and configuration stable across comparisons."
+  ],
+  "presets": [
+    {"id": "front", "projection": "orthographic", "direction": [0, -1, 0], "up": [0, 0, 1], "fit_margin_ratio": 0.1},
+    {"id": "rear", "projection": "orthographic", "direction": [0, 1, 0], "up": [0, 0, 1], "fit_margin_ratio": 0.1},
+    {"id": "left", "projection": "orthographic", "direction": [-1, 0, 0], "up": [0, 0, 1], "fit_margin_ratio": 0.1},
+    {"id": "right", "projection": "orthographic", "direction": [1, 0, 0], "up": [0, 0, 1], "fit_margin_ratio": 0.1},
+    {"id": "top", "projection": "orthographic", "direction": [0, 0, 1], "up": [0, 1, 0], "fit_margin_ratio": 0.1},
+    {"id": "bottom", "projection": "orthographic", "direction": [0, 0, -1], "up": [0, -1, 0], "fit_margin_ratio": 0.1},
+    {"id": "three-quarter", "projection": "perspective", "direction": [1, -1, 0.75], "up": [0, 0, 1], "focal_length_mm": 60, "fit_margin_ratio": 0.1}
+  ]
+}

@@ -126,6 +126,8 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 
 [`skills/industrial-product-design`](skills/industrial-product-design/SKILL.md) is a client-neutral upstream workflow for briefs, concept gates, product architecture, configurations, motion, camera/render evidence, and honest CAD capability checks. Install or reference that folder in any `SKILL.md`-compatible client, then use `mechanical-drafting-gbt` downstream for GB/T manufacturing definition and release.
 
+[`skills/mechanical-design-gbt`](skills/mechanical-design-gbt/SKILL.md) is the comprehensive variant. It adds research-source authority, human-factors evidence, form and surface review, backend routing, local reference-library indexing, and deterministic checks for document identity, 2D/3D interfaces, motion states, render viewsets, and revision-bound handoff manifests. Its personal library manifest is intentionally ignored; generate one locally from the included portable schema.
+
 ## Tools
 
 ### `drawing` — File/drawing management
