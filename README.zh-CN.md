@@ -44,6 +44,7 @@ uv run python examples/generate_actuator_promo.py --record --pause 0.8
 ```
 
 命令会在 AutoCAD 中逐步显示建模过程，生成固定等轴测 PNG，并保留最终文档。它是概念级 3D 能力展示，不等价于制造授权模型。
+如果你先删除当前图形并希望绘制完成后全方位旋转展示，可以追加：`--reuse-active --rotate --rotation-seconds 12`。
 
 ## 后端选择
 

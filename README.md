@@ -47,6 +47,8 @@ uv run python examples/generate_actuator_promo.py --record --pause 0.8
 The command shows each modeling step in AutoCAD, renders a fixed isometric PNG,
 and leaves the final document open. It does not claim manufacturing authority;
 the model is a concept-level demonstration of checked native 3D operations.
+For a presentation after manually clearing the current drawing, add
+`--reuse-active --rotate --rotation-seconds 12`.
 
 ## Choose a Backend
 

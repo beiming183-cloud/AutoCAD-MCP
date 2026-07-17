@@ -8,7 +8,43 @@ import os
 from pathlib import Path
 
 
-async def main(output: Path, *, pause: float = 0.0, keep_open: bool = True) -> None:
+async def rotate_view(document, *, steps: int = 48, duration: float = 8.0) -> None:
+    """Rotate the active AutoCAD viewport smoothly without changing geometry."""
+    import math
+
+    import pythoncom
+    import win32com.client
+
+    application = win32com.client.GetActiveObject("AutoCAD.Application")
+    viewport = document.ActiveViewport
+    target = list(viewport.Target)
+    steps = max(12, int(steps))
+    interval = max(0.02, float(duration) / steps)
+    for index in range(steps + 1):
+        angle = 2.0 * math.pi * index / steps
+        direction = [math.cos(angle), math.sin(angle), 0.8]
+        viewport.Direction = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_R8, direction
+        )
+        viewport.Target = win32com.client.VARIANT(
+            pythoncom.VT_ARRAY | pythoncom.VT_R8, target
+        )
+        viewport.TwistAngle = 0.0
+        document.ActiveViewport = viewport
+        application.Update()
+        await asyncio.sleep(interval)
+
+
+async def main(
+    output: Path,
+    *,
+    pause: float = 0.0,
+    keep_open: bool = True,
+    reuse_active: bool = False,
+    rotate: bool = False,
+    rotation_steps: int = 48,
+    rotation_seconds: float = 8.0,
+) -> None:
     import pythoncom
     import win32com.client
 
@@ -20,9 +56,18 @@ async def main(output: Path, *, pause: float = 0.0, keep_open: bool = True) -> N
     if not ready.ok:
         raise RuntimeError(ready.to_dict())
 
-    created = await backend.drawing_create(None)
-    if not created.ok:
-        raise RuntimeError(created.to_dict())
+    if reuse_active:
+        count = await backend.entity_count()
+        if not count.ok:
+            raise RuntimeError(count.to_dict())
+        if int(count.payload.get("count", 0)) != 0:
+            raise RuntimeError(
+                "--reuse-active requires an empty active document; delete the previous promo geometry first"
+            )
+    else:
+        created = await backend.drawing_create(None)
+        if not created.ok:
+            raise RuntimeError(created.to_dict())
 
     document = win32com.client.GetActiveObject("AutoCAD.Application").ActiveDocument
 
@@ -164,6 +209,12 @@ async def main(output: Path, *, pause: float = 0.0, keep_open: bool = True) -> N
     )
     if not rendered.ok:
         raise RuntimeError(rendered.to_dict())
+    if rotate:
+        await rotate_view(
+            document,
+            steps=rotation_steps,
+            duration=rotation_seconds,
+        )
     print({"ok": True, "preview": str(output.resolve()), "document_left_open": keep_open})
 
     if not keep_open:
@@ -181,6 +232,18 @@ if __name__ == "__main__":
     parser.add_argument("--pause", type=float, default=0.0)
     parser.add_argument("--keep-open", action="store_true")
     parser.add_argument("--record", action="store_true")
+    parser.add_argument(
+        "--reuse-active",
+        action="store_true",
+        help="draw in the current empty document instead of creating a new document",
+    )
+    parser.add_argument(
+        "--rotate",
+        action="store_true",
+        help="slowly rotate the final 3D viewport for a full-angle presentation",
+    )
+    parser.add_argument("--rotation-steps", type=int, default=48)
+    parser.add_argument("--rotation-seconds", type=float, default=8.0)
     args = parser.parse_args()
     if args.record:
         os.environ["AUTOCAD_MCP_WINDOW_MODE"] = "foreground"
@@ -193,5 +256,9 @@ if __name__ == "__main__":
             Path(args.output),
             pause=max(0.0, args.pause),
             keep_open=args.keep_open or args.record,
+            reuse_active=args.reuse_active,
+            rotate=args.rotate,
+            rotation_steps=args.rotation_steps,
+            rotation_seconds=args.rotation_seconds,
         )
     )
