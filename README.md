@@ -2,7 +2,7 @@
 
 MCP server for full AutoCAD automation, AutoCAD LT automation, and headless DXF generation.
 
-Version 3.9 distinguishes AutoCAD crashes from missing documents, creates the first document through `Documents.Add`, keeps DXF audits fully offline, validates PDF mediabox/paper/orientation after plotting, and writes BOM-prefixed UTF-8 logs for Windows. The external Python/File IPC boundary contains dispatcher exceptions instead of introducing an in-process .NET plugin dependency.
+Version 3.10 adds bounded industrial-product contracts on top of the reliable document core: analytic native-B-rep rounded products, controlled supplier-module reservations, rotary motion semantics, sampled clearance screening, fixed-camera native views with pixel/framing evidence, richer semantic DRC, and independent product-design review verdicts.
 
 Structured entity creation remains a checked transaction: request fields are strict and immutable, the created handle is read back, geometry and layer are compared, and a mismatch is deleted with `E_POSTCONDITION_MISMATCH`. Atomic batches roll back when any semantic postcondition fails.
 
@@ -15,7 +15,7 @@ Two backends, one API:
 | **File IPC** | Windows Python | Yes - full AutoCAD or AutoCAD LT 2024+ | Topology audit + native PDF and direct PNG |
 | **ezdxf** | Any platform | No (headless) | Structured audit + deterministic PNG |
 
-The server exposes **10 consolidated tools** (`drawing`, `entity`, `solid`, `layer`, `block`, `annotation`, `pid`, `transaction`, `view`, `system`) over the standard MCP stdio transport. It is client-independent and works with Codex, Claude Code, Claude Desktop, Cursor, and other MCP-compatible clients.
+The server exposes **11 consolidated tools** (`drawing`, `entity`, `solid`, `product`, `layer`, `block`, `annotation`, `pid`, `transaction`, `view`, `system`) over the standard MCP stdio transport. It is client-independent and works with Codex, Claude Code, Claude Desktop, Cursor, and other MCP-compatible clients.
 
 ## Prerequisites (File IPC backend)
 
@@ -43,7 +43,7 @@ Open AutoCAD or AutoCAD LT and load `mcp_dispatch.lsp` using **APPLOAD**:
 1. Type `APPLOAD` in the AutoCAD command line
 2. Browse to `<repo>/lisp-code/mcp_dispatch.lsp`
 3. Click **Load**
-4. You should see: `=== MCP Dispatch v3.9.0 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
+4. You should see: `=== MCP Dispatch v3.10.0 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
 
 > **Tip:** Add the file to your AutoCAD Startup Suite (in the APPLOAD dialog) so it loads automatically with every drawing.
 
@@ -179,6 +179,22 @@ The `solid` tool is available on full AutoCAD through the native ActiveX object 
 
 `system.status` includes an `industrial_capabilities` matrix. It explicitly separates verified features from unavailable stable edge/face selection, shelling, parametric assemblies, motion sweeps, surface analysis, and offscreen material rendering. Clients must not infer those features from basic solid support.
 
+### `product` - Industrial product features and evidence
+
+`create_feature` supports `rounded_box`, `recessed_panel`, `module_reservation`, `port_cutout_usb_a`, `port_cutout_usb_c`, `rotary_layer`, `annular_gap`, and `detent_ring_placeholder`. The rounded box is a real analytic AutoCAD B-rep assembled from intersecting boxes, edge cylinders, and spherical corners; its radius can be queried from the registered feature definition.
+
+USB cutouts are deliberately gated. A production aperture requires `module_status: supplier_controlled|measured`, matching `authority: supplier_drawing|physical_measurement`, `do_not_dimension_apertures: false`, explicit dimensions, and a target solid. Unverified concepts must use `module_reservation`, which records that the envelope is not manufacturing authority.
+
+Motion operations are `set_motion`, `interference_sample`, and `clearance_sweep`. They report broad-phase AABB or sampled rotated-AABB evidence and always state `exact_brep_interference: false`; release work still requires an exact native continuous sweep.
+
+`render_view` accepts `front`, `right`, `top`, `bottom`, `iso`, `rotated_iso`, `section`, and `exploded`. Section/exploded views require caller-prepared geometry. The result includes fixed camera data, PNG hash, content bounds, non-background ratio, clipping, framing status, and optional pixel difference. It is a native plot view, not an offscreen material renderer.
+
+`set_review` and `review_summary` keep `appearance_review`, `ergonomics_review`, `adapter_clearance_review`, `cable_management_review`, `stability_review`, and `mains_rotation_safety_review` separate from geometry/STEP validity. Each is `PASS`, `FAIL`, or `NOT_EVALUATED`; `PASS` requires evidence.
+
+General `fillet_edges` and `chamfer_edges` reject volatile native edge indices with `E_STABLE_FEATURE_SELECTION_UNAVAILABLE`. Use analytic features now. A future OpenCascade/FreeCAD plugin may provide selector-based general edge operations without weakening the AutoCAD document and transaction contract.
+
+The 3D protocol borrows proven patterns from [build123d](https://github.com/gumyr/build123d), [build123d-mcp](https://pypi.org/project/build123d-mcp/), [FreeCAD MCP](https://github.com/neka-nat/freecad-mcp), and [Open CASCADE fillet/chamfer APIs](https://dev.opencascade.org/doc/refman/html/package_b_repfilletapi.html): explicit parameter sources, semantic/property selectors, measure-render-validate loops, and honest kernel capability boundaries.
+
 ### `layer` — Layer management
 
 `list`, `create`, `set_current`, `set_properties`, `freeze`, `thaw`, `lock`, `unlock`
@@ -275,8 +291,9 @@ The job contains `specs/request.json`, `manifest.json`, editable DWG and DXF fil
 
 - **v3.6 reliability (complete):** self-healing startup, dispatcher version handshake, machine-readable MCP failures, controlled variables, geometry DRC, DXF units/digests, and enforced plot configuration.
 - **v3.7 geometry control (complete):** topology DRC, atomic batches, safe trim/extend/break/join/constraints, native 3D solids, non-switching DXF export, and verified PNG previews.
-- **v3.8 specifications:** versioned JSON drawing specifications, template/title-block registry, assembly/component trees, drawing-number/revision rules, and spec-to-audit comparison.
-- **v3.9 orchestration:** idempotency keys, resumable job states, bounded retries, structured logs, and a local job queue.
+- **v3.8 entity truth (complete):** immutable entity contracts, semantic topology, no-focus desktop behavior, and postcondition rollback.
+- **v3.9 document/output reliability (complete):** document identity, transactions, crash classification, offline audits, atomic outputs, plot verification, and exact viewer suppression.
+- **v3.10 product 3D foundation (complete):** analytic rounded products, controlled module envelopes, motion screening, fixed-camera evidence, semantic DRC, and independent product reviews.
 - **v4.0 hybrid CAD:** FreeCAD CLI/MCP as the parameterized 3D and STEP executor, AutoCAD as the visible DWG/2D drafting and release executor, with shared specs and acceptance reports.
 
 ### `system` — Server management
@@ -355,7 +372,17 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 
 The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
 
-## What's New in v3.9
+## What's New in v3.10
+
+- **Analytic native rounded products** - `rounded_box` creates real radius geometry without relying on volatile native edge indices.
+- **Controlled module authority** - concept, supplier-controlled, and measured modules carry explicit dimension authority; unverified USB apertures are rejected.
+- **Motion evidence** - rotation axes, limits, static AABB screening, and sampled rotated-AABB clearance sweeps are machine-readable and explicitly non-exact.
+- **Fixed-camera review packets** - standard views return camera parameters, PNG hashes, content bounds, margins, clipping, framing status, and optional pixel differences.
+- **Semantic DRC** - component, design role, view, line class, intentional open end, permitted crossing, and source authority keep overlays out of geometry failures.
+- **Independent product review** - appearance, ergonomics, adapter clearance, cable management, stability, and mains/rotation safety cannot inherit a PASS from valid geometry.
+- **Honest edge capability** - general 3D fillet/chamfer calls return `E_STABLE_FEATURE_SELECTION_UNAVAILABLE`; analytic features remain measurable and safe.
+
+### v3.9
 
 - **Document identity and optimistic revisions** - create/open/activate/context responses carry document ID, requested/active paths, and monotonic revision; all modifications reject wrong or stale contexts.
 - **Public transactions** - explicit begin/commit/rollback joins atomic batch rollback and missing-layer preconditions.

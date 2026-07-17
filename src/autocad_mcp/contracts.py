@@ -7,7 +7,15 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 
-SEMANTIC_FIELDS = {"component_id", "line_class", "intentional_open_end"}
+SEMANTIC_FIELDS = {
+    "component_id",
+    "design_role",
+    "view_id",
+    "line_class",
+    "intentional_open_end",
+    "permitted_crossing",
+    "source_authority",
+}
 
 
 def _number(value: Any, name: str) -> float:
@@ -36,6 +44,15 @@ def _semantics(params: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
         if not component_id:
             raise ValueError("component_id must not be empty")
         result.append(("component_id", component_id))
+    for field in ("design_role", "view_id"):
+        value = params.get(field)
+        if value is not None:
+            normalized = str(value).strip()
+            if not normalized:
+                raise ValueError(f"{field} must not be empty")
+            if len(normalized) > 128:
+                raise ValueError(f"{field} must not exceed 128 characters")
+            result.append((field, normalized))
     line_class = params.get("line_class")
     if line_class is not None:
         normalized = str(line_class).strip().lower()
@@ -51,6 +68,26 @@ def _semantics(params: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
         if normalized not in {"start", "end", "both"}:
             raise ValueError("intentional_open_end must be false, start, end, or both")
         result.append(("intentional_open_end", normalized))
+    permitted_crossing = params.get("permitted_crossing")
+    if permitted_crossing is not None:
+        if not isinstance(permitted_crossing, bool):
+            raise ValueError("permitted_crossing must be a boolean")
+        result.append(("permitted_crossing", permitted_crossing))
+    source_authority = params.get("source_authority")
+    if source_authority is not None:
+        normalized = str(source_authority).strip()
+        allowed = {
+            "user_input",
+            "GB",
+            "supplier_drawing",
+            "physical_measurement",
+            "concept",
+            "derived",
+            "assumed",
+        }
+        if normalized not in allowed:
+            raise ValueError(f"source_authority must be one of {sorted(allowed)}")
+        result.append(("source_authority", normalized))
     return tuple(result)
 
 
@@ -270,4 +307,3 @@ def _compare_value(
 
 def semantic_fields(params: dict[str, Any]) -> dict[str, Any]:
     return dict(_semantics(dict(params)))
-

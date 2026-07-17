@@ -134,6 +134,19 @@
 59. When AutoCAD holds a plot source lock, publication copies to a second verified
     temporary file and atomically renames that copy; final outputs remain complete
     and locked destinations still return `E_OUTPUT_LOCKED`.
+60. Industrial-product entities add component, design-role, view, crossing, and
+    source-authority semantics; motion overlays and prepared review geometry no longer
+    contaminate ordinary topology failures.
+61. Full AutoCAD creates analytic native-B-rep rounded boxes and controlled module,
+    annular-gap, detent, rotary-layer, recess, and authoritative USB-cutout features.
+62. General edge fillet/chamfer operations reject volatile edge indices with
+    `E_STABLE_FEATURE_SELECTION_UNAVAILABLE`; registered analytic radii remain queryable.
+63. Fixed product views return camera and PNG composition evidence. Section and
+    exploded views require caller-prepared geometry and are never silently fabricated.
+64. Motion uses explicit axes, angles, and limits with broad-phase static and sampled
+    rotated-AABB screening clearly labeled as non-exact B-rep interference.
+65. Appearance, ergonomics, adapter clearance, cable management, stability, and
+    mains/rotation safety reviews use independent PASS/FAIL/NOT_EVALUATED verdicts.
 
 ## MCP client registration
 

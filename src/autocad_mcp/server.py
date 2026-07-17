@@ -1,6 +1,6 @@
 """AutoCAD MCP Server v3.1 — 8 consolidated tools with operation dispatch.
 
-Tools: drawing, entity, solid, layer, block, annotation, pid, transaction, view, system
+Tools: drawing, entity, solid, product, layer, block, annotation, pid, transaction, view, system
 """
 
 from __future__ import annotations
@@ -24,6 +24,22 @@ from autocad_mcp.contracts import build_entity_expectation
 from autocad_mcp.delivery import deliver_drawing
 from autocad_mcp.drafting import tangent_arc_from_start
 from autocad_mcp.offline import audit_dxf_offline
+from autocad_mcp.product_design import (
+    VIEW_NAMES,
+    clearance_sweep,
+    get_feature,
+    image_content_metrics,
+    image_difference,
+    interference_sample,
+    list_features,
+    measure_registered_feature,
+    product_state,
+    query_edges_by_semantic_role,
+    register_feature,
+    review_summary,
+    set_motion,
+    set_review,
+)
 from autocad_mcp.workspace import resolve_output_target, workspace_info
 
 # FastMCP validates return types via Pydantic. Tools that may return
@@ -80,6 +96,22 @@ async def _require_existing_layer(backend, layer_name: str | None) -> CommandRes
             payload={"layer": str(layer_name), "entity_created": False},
         )
     return result
+
+
+async def _guard_document_read(backend, doc_id: str | None) -> CommandResult:
+    context = await backend.document_context()
+    if not context.ok:
+        return context
+    if doc_id and str(doc_id) != str(context.payload.get("active_doc_id")):
+        return CommandResult(
+            ok=False,
+            error="Requested document is not the active document",
+            error_code="E_DOCUMENT_ID_MISMATCH",
+            recoverable=False,
+            recommended_action="activate_the_requested_document_and_retry",
+            payload={"requested_doc_id": doc_id, "actual": context.payload},
+        )
+    return context
 
 
 # ==========================================================================
@@ -648,9 +680,11 @@ async def solid(
       revolve         - {profile_id, axis_point, axis_direction, angle?, erase_profile?, layer?}
       sweep           - {profile_id, path_id, erase_profile?, layer?}
       boolean         - {primary_id, tool_id, operation: union|intersection|subtract}
+      fillet_edges    - returns capability error until stable semantic edge selection exists
+      chamfer_edges   - returns capability error until stable semantic edge selection exists
 
-    Edge fillets/chamfers and projected drawing views are intentionally not advertised
-    until their native AutoCAD workflows can be made deterministic.
+    General native edge edits never accept volatile edge indices. Use product.rounded_box
+    for analytic radius geometry or a future stable native feature plugin.
     """
     data = data or {}
     backend = await get_backend()
@@ -687,11 +721,198 @@ async def solid(
         )
     elif operation == "boolean":
         result = await backend.solid_boolean(data["primary_id"], data["tool_id"], data["operation"])
+    elif operation == "fillet_edges":
+        result = await backend.solid_fillet_edges(
+            data["entity_id"], data.get("semantic_roles", []), data["radius"]
+        )
+    elif operation == "chamfer_edges":
+        result = await backend.solid_chamfer_edges(
+            data["entity_id"], data.get("semantic_roles", []), data["distance"]
+        )
     else:
         return tool_error(f"Unknown solid operation: {operation}", code="E_UNSUPPORTED_OPERATION")
 
     result = await _attach_document_context(backend, result, doc_id=doc_id, mutated=True)
     return await add_screenshot_if_available(result, include_screenshot)
+
+
+@mcp.tool(annotations={"title": "Industrial Product Design", "readOnlyHint": False})
+@_safe("product")
+async def product(
+    operation: str,
+    doc_id: str | None = None,
+    expected_revision: int | None = None,
+    data: dict | None = None,
+) -> ToolResult:
+    """Parametric consumer-product features, motion screening, views, and reviews.
+
+    Operations:
+      capabilities              - honest verified/unsupported capability matrix
+      create_feature            - data: {kind, feature_id, component_id, ...}
+      list_features / get_feature
+      query_edges_by_semantic_role
+      measure_fillet_radius / measure_chamfer_distance
+      fillet_edges / chamfer_edges - structured capability error without stable selection
+      set_motion                - axis, angle, limits, clearance
+      interference_sample       - static broad-phase AABB screening
+      clearance_sweep           - sampled rotated-AABB motion screening
+      render_view               - front/right/top/bottom/iso/rotated_iso/section/exploded
+      set_review / review_summary
+
+    Product review verdicts are independent from geometry and STEP validity. USB cutouts
+    require supplier-controlled or physically measured authority; concept dimensions must
+    use module_reservation instead.
+    """
+    data = dict(data or {})
+    backend = await get_backend()
+    if operation == "capabilities":
+        status = await backend.status()
+        return await add_screenshot_if_available(status, False)
+
+    write_operations = {"create_feature", "set_motion", "set_review", "fillet_edges", "chamfer_edges"}
+    if operation in write_operations:
+        guard = await _guard_mutation(backend, doc_id, expected_revision)
+    else:
+        guard = await _guard_document_read(backend, doc_id)
+    if not guard.ok:
+        return await add_screenshot_if_available(guard, False)
+    active_doc_id = str(guard.payload["active_doc_id"])
+
+    try:
+        if operation == "create_feature":
+            layer_check = await _require_existing_layer(backend, data.get("layer"))
+            if not layer_check.ok:
+                return await add_screenshot_if_available(layer_check, False)
+            kind = str(data.pop("kind", ""))
+            result = await backend.product_create_feature(kind, data)
+            if result.ok:
+                registered = register_feature(
+                    backend, active_doc_id, result.payload
+                )
+                if registered.get("motion"):
+                    registered["motion"] = set_motion(
+                        backend, active_doc_id, registered["motion"]
+                    )
+                    registered["product_state_revision"] = registered["motion"][
+                        "product_state_revision"
+                    ]
+                result.payload = registered
+                result = await _attach_document_context(
+                    backend, result, doc_id=active_doc_id, mutated=True
+                )
+        elif operation == "list_features":
+            result = CommandResult(ok=True, payload=list_features(backend, active_doc_id))
+        elif operation == "get_feature":
+            feature = get_feature(backend, active_doc_id, data.get("feature_id", ""))
+            result = (
+                CommandResult(ok=True, payload=feature)
+                if feature
+                else CommandResult(
+                    ok=False,
+                    error=f"Unknown feature_id: {data.get('feature_id')}",
+                    error_code="E_FEATURE_NOT_FOUND",
+                )
+            )
+        elif operation == "query_edges_by_semantic_role":
+            result = CommandResult(
+                ok=True,
+                payload=query_edges_by_semantic_role(
+                    backend, active_doc_id, data["feature_id"], data.get("role")
+                ),
+            )
+        elif operation in {"measure_fillet_radius", "measure_chamfer_distance"}:
+            measurement = (
+                "fillet_radius" if operation == "measure_fillet_radius" else "chamfer_distance"
+            )
+            result = CommandResult(
+                ok=True,
+                payload=measure_registered_feature(
+                    backend, active_doc_id, data["feature_id"], measurement
+                ),
+            )
+        elif operation == "fillet_edges":
+            result = await backend.solid_fillet_edges(
+                data["entity_id"], data.get("semantic_roles", []), data["radius"]
+            )
+        elif operation == "chamfer_edges":
+            result = await backend.solid_chamfer_edges(
+                data["entity_id"], data.get("semantic_roles", []), data["distance"]
+            )
+        elif operation == "set_motion":
+            result = CommandResult(ok=True, payload=set_motion(backend, active_doc_id, data))
+        elif operation == "interference_sample":
+            result = CommandResult(
+                ok=True,
+                payload=interference_sample(
+                    backend,
+                    active_doc_id,
+                    data.get("component_ids"),
+                    float(data.get("clearance", 0.0)),
+                ),
+            )
+        elif operation == "clearance_sweep":
+            result = CommandResult(
+                ok=True,
+                payload=clearance_sweep(
+                    backend,
+                    active_doc_id,
+                    data["component_id"],
+                    sample_count=int(data.get("sample_count", 13)),
+                    clearance=data.get("clearance"),
+                ),
+            )
+        elif operation == "render_view":
+            view_name = str(data.get("view", "iso")).lower()
+            if view_name not in VIEW_NAMES:
+                raise ValueError(f"view must be one of {sorted(VIEW_NAMES)}")
+            target = resolve_output_target(
+                data.get("path"),
+                category="previews",
+                extension=".png",
+                default_stem=data.get("name", f"product-{view_name}"),
+            )
+            result = await backend.product_render_view(view_name, str(target.path), data)
+            if result.ok:
+                metrics = image_content_metrics(target.path)
+                comparison = None
+                if data.get("compare_to"):
+                    comparison = image_difference(data["compare_to"], target.path)
+                result.payload.update(
+                    image_metrics=metrics,
+                    comparison=comparison,
+                    framing_pass=metrics["framing_status"] == "PASS",
+                )
+                state = product_state(backend, active_doc_id)
+                state["views"][view_name] = dict(result.payload)
+                state["revision"] += 1
+                result.payload["product_state_revision"] = state["revision"]
+        elif operation == "set_review":
+            result = CommandResult(
+                ok=True,
+                payload=set_review(backend, active_doc_id, data["name"], data),
+            )
+        elif operation == "review_summary":
+            result = CommandResult(
+                ok=True, payload=review_summary(backend, active_doc_id)
+            )
+        else:
+            result = CommandResult(
+                ok=False,
+                error=f"Unknown product operation: {operation}",
+                error_code="E_UNSUPPORTED_OPERATION",
+            )
+    except (KeyError, TypeError, ValueError) as exc:
+        result = CommandResult(
+            ok=False,
+            error=str(exc),
+            error_code="E_PARAMETER_REJECTED",
+            recoverable=False,
+            recommended_action="correct_the_product_contract_and_retry",
+            payload={"operation": operation, "data": data},
+        )
+    if result.ok and operation in {"set_motion", "set_review"}:
+        result = await _attach_document_context(backend, result)
+    return await add_screenshot_if_available(result, False)
 
 
 @mcp.tool(annotations={"title": "P&ID Operations (CTO Library)", "readOnlyHint": False})

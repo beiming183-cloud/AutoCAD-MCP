@@ -291,8 +291,10 @@ def _entity_segments(entity: dict[str, Any]) -> list[dict[str, Any]]:
                 "entity": handle,
                 "segment": index,
                 "layer": layer,
-                "component_id": semantics.get("component_id"),
-                "line_class": semantics.get("line_class"),
+                **{key: semantics.get(key) for key in (
+                    "component_id", "design_role", "view_id", "line_class",
+                    "permitted_crossing", "source_authority",
+                )},
                 "start": points[index],
                 "end": points[(index + 1) % len(points)],
             }
@@ -321,9 +323,10 @@ def _entity_endpoints(entity: dict[str, Any]) -> list[dict[str, Any]]:
             "endpoint": name,
             "layer": layer,
             "point": point,
-            "component_id": semantics.get("component_id"),
-            "line_class": semantics.get("line_class"),
-            "intentional_open_end": semantics.get("intentional_open_end"),
+            **{key: semantics.get(key) for key in (
+                "component_id", "design_role", "view_id", "line_class",
+                "intentional_open_end", "permitted_crossing", "source_authority",
+            )},
         }
         for name, point in pairs
         if isinstance(point, list) and len(point) >= 2
@@ -384,6 +387,7 @@ def audit_geometry(
         "NEAR_MISS_ENDPOINT": [],
         "INTERIOR_CROSSING": [],
         "UNASSIGNED_ENTITY": [],
+        "MISSING_SEMANTIC_FIELD": [],
     }
     signature_handles: dict[str, list[str]] = {}
     duplicate_supported = {
@@ -465,11 +469,18 @@ def audit_geometry(
 
     def topology_entity(entity: dict[str, Any]) -> bool:
         layer = str(entity.get("layer", "0")).upper()
-        line_class = str((entity.get("semantics") or {}).get("line_class", "outline")).lower()
+        semantics = entity.get("semantics") or {}
+        line_class = str(semantics.get("line_class", "outline")).lower()
+        design_role = str(semantics.get("design_role", "geometry")).lower()
         ignored_classes = {"center", "hidden", "leader", "dimension", "table", "construction"}
+        ignored_roles = {
+            "motion_axis", "motion_envelope", "motion_overlay", "rotation_arrow",
+            "title_block", "annotation", "keepout", "construction",
+        }
         return (
             layer not in ignored_layers
             and line_class not in ignored_classes
+            and design_role not in ignored_roles
             and (selected_layers is None or layer in selected_layers)
         )
 
@@ -562,6 +573,8 @@ def audit_geometry(
                 _distance(intersection, second["start"]), _distance(intersection, second["end"])
             ) > connection_tolerance
             if first_interior and second_interior:
+                if first.get("permitted_crossing") or second.get("permitted_crossing"):
+                    continue
                 findings["INTERIOR_CROSSING"].append(
                     {
                         "entities": [first["entity"], second["entity"]],
@@ -569,6 +582,8 @@ def audit_geometry(
                         "point": [round(value, 6) for value in intersection],
                         "components": [first.get("component_id"), second.get("component_id")],
                         "line_classes": [first.get("line_class"), second.get("line_class")],
+                        "design_roles": [first.get("design_role"), second.get("design_role")],
+                        "view_ids": [first.get("view_id"), second.get("view_id")],
                     }
                 )
 
@@ -578,6 +593,21 @@ def audit_geometry(
             for entity in topology_entities
             if not (entity.get("semantics") or {}).get("component_id")
         ]
+
+    required_semantic_fields = [
+        str(field) for field in options.get("required_semantic_fields", [])
+    ]
+    for entity in topology_entities:
+        semantics = entity.get("semantics") or {}
+        missing = [field for field in required_semantic_fields if not semantics.get(field)]
+        if missing:
+            findings["MISSING_SEMANTIC_FIELD"].append(
+                {
+                    "entity": str(entity.get("handle", "")),
+                    "layer": entity.get("layer", "0"),
+                    "missing": missing,
+                }
+            )
 
     rule_results = []
     policy_by_rule = {

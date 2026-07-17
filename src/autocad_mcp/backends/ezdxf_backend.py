@@ -175,6 +175,9 @@ class EzdxfBackend(AutoCADBackend):
         dpi=150,
         force=True,
         background="white",
+        plot_type="extents",
+        normalize_framing=False,
+        framing_fill=0.82,
     ) -> CommandResult:
         output = Path(path).expanduser().resolve()
         if output.suffix.lower() != ".png":

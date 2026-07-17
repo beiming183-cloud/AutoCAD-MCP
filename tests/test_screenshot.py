@@ -160,7 +160,10 @@ async def test_file_ipc_preview_reports_png_not_pdf(monkeypatch, tmp_path):
     backend = FileIPCBackend()
     output = tmp_path / "autocad-preview.png"
 
-    def fake_plot(png_path, *, paper, orientation, plot_style, dpi):
+    def fake_plot(
+        png_path, *, paper, orientation, plot_style, dpi,
+        plot_type="extents", normalize_framing=False, framing_fill=0.82,
+    ):
         png_path.write_bytes(b"\x89PNG\r\n\x1a\npreview")
         return {
             "path": str(png_path), "format": "png", "dpi": dpi, "background": "white",

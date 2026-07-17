@@ -31,6 +31,7 @@ from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, Comma
 from autocad_mcp.config import DOCUMENT_TIMEOUT, IPC_DIR, IPC_TIMEOUT, LISP_DIR, _autostart_autocad
 from autocad_mcp.drafting import encode_autocad_text
 from autocad_mcp.errors import LayerNotFoundError, exception_context
+from autocad_mcp.product_design import feature_bounds, normalize_feature
 from autocad_mcp.variables import mechanical_variable_updates, validate_variable_updates
 
 log = structlog.get_logger()
@@ -404,6 +405,8 @@ class FileIPCBackend(AutoCADBackend):
             can_create_solids=True,
             can_boolean_solids=True,
             can_project_views=False,
+            can_product_features=True,
+            can_fixed_camera_views=True,
         )
 
     @staticmethod
@@ -420,6 +423,12 @@ class FileIPCBackend(AutoCADBackend):
                 "native_2d_entities",
                 "basic_native_solids",
                 "solid_boolean",
+                "analytic_rounded_box",
+                "controlled_module_reservations",
+                "rotary_product_placeholders",
+                "fixed_camera_native_plot_views",
+                "product_review_contracts",
+                "broad_phase_motion_interference_screening",
                 "offline_dxf_audit",
                 "native_pdf_plot",
                 "native_png_plot",
@@ -427,14 +436,14 @@ class FileIPCBackend(AutoCADBackend):
             ],
             "unsupported": {
                 "stable_feature_selection": "AutoCAD COM does not expose a proven persistent semantic edge/face identifier here",
-                "fillet_edges": "blocked until stable feature selection and rollback are verified",
-                "chamfer_edges": "blocked until stable feature selection and rollback are verified",
+                "fillet_edges": "general native edge edits return E_STABLE_FEATURE_SELECTION_UNAVAILABLE; analytic rounded_box is supported",
+                "chamfer_edges": "general native edge edits return E_STABLE_FEATURE_SELECTION_UNAVAILABLE",
                 "shell": "not implemented by the current safe backend",
                 "offset_face": "not implemented by the current safe backend",
                 "loft": "not implemented by the current safe backend",
                 "draft": "not implemented by the current safe backend",
                 "parametric_assembly": "component identity, mates, configurations, and DOF solving are not implemented",
-                "motion_sweep_interference": "requires a verified parametric assembly and motion solver",
+                "exact_motion_sweep_interference": "only broad-phase AABB screening is available; exact B-rep sweep remains unavailable",
                 "offscreen_3d_render": "current native PNG output is a deterministic plot, not a material 3D renderer",
                 "surface_continuity_g0_g1_g2": "not implemented",
                 "wall_thickness": "not implemented",
@@ -1503,13 +1512,34 @@ class FileIPCBackend(AutoCADBackend):
             )
     async def drawing_create(self, name: str | None = None) -> CommandResult:
         requested = str(name).strip() if name else None
+        foreground_before = None
+        focus_restored = False
         try:
             import pythoncom
             import win32com.client
 
+            if sys.platform == "win32":
+                try:
+                    import win32gui
+
+                    foreground_before = win32gui.GetForegroundWindow()
+                except Exception:
+                    pass
+
             pythoncom.CoInitialize()
             application = win32com.client.GetActiveObject("AutoCAD.Application")
             document = application.Documents.Add()
+            if sys.platform == "win32" and os.environ.get(
+                "AUTOCAD_MCP_WINDOW_MODE", "minimized"
+            ).strip().lower() == "minimized":
+                try:
+                    import win32con
+                    import win32gui
+
+                    self._hwnd = int(application.HWND) or self._hwnd
+                    win32gui.ShowWindow(self._hwnd, win32con.SW_SHOWMINNOACTIVE)
+                except Exception:
+                    pass
             if requested:
                 output = Path(requested).expanduser().resolve()
                 if output.suffix.lower() != ".dwg":
@@ -1530,6 +1560,16 @@ class FileIPCBackend(AutoCADBackend):
             self._audit_revision = 0
             self._audit_fingerprints = None
             self._semantic_store().clear()
+            if sys.platform == "win32" and foreground_before:
+                try:
+                    import win32gui
+
+                    current = win32gui.GetForegroundWindow()
+                    if current == self._hwnd and win32gui.IsWindow(foreground_before):
+                        win32gui.SetForegroundWindow(foreground_before)
+                        focus_restored = True
+                except Exception:
+                    pass
             return CommandResult(
                 ok=True,
                 payload={
@@ -1540,6 +1580,8 @@ class FileIPCBackend(AutoCADBackend):
                     "requested": {"path": requested, "format": "dwg"},
                     "actual": {"path": actual_path, "name": actual_name, "format": "dwg"},
                     "diff": [],
+                    "foreground_before": foreground_before,
+                    "focus_restored": focus_restored,
                     **context,
                 },
             )
@@ -2004,6 +2046,9 @@ class FileIPCBackend(AutoCADBackend):
         dpi=150,
         force=True,
         background="white",
+        plot_type="extents",
+        normalize_framing=False,
+        framing_fill=0.82,
     ) -> CommandResult:
         output = Path(path).expanduser().resolve()
         if output.suffix.lower() != ".png":
@@ -2022,7 +2067,9 @@ class FileIPCBackend(AutoCADBackend):
         staging = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.tmp.png")
         try:
             raster = self._plot_png_via_com(
-                staging, paper=paper, orientation=orientation, plot_style=plot_style, dpi=int(dpi)
+                staging, paper=paper, orientation=orientation, plot_style=plot_style,
+                dpi=int(dpi), plot_type=plot_type,
+                normalize_framing=normalize_framing, framing_fill=framing_fill,
             )
             try:
                 digest = geometry_digest(self._collect_entities_via_com())
@@ -2061,7 +2108,11 @@ class FileIPCBackend(AutoCADBackend):
             return self._exception_result(
                 exc,
                 operation="drawing.render_preview",
-                parameters={"path": str(output), "paper": paper, "orientation": orientation, "dpi": dpi},
+                parameters={
+                    "path": str(output), "paper": paper, "orientation": orientation,
+                    "dpi": dpi, "plot_type": plot_type,
+                    "normalize_framing": normalize_framing,
+                },
                 system_call="AutoCAD.Plot.PlotToFile",
                 file_path=str(output),
             )
@@ -2086,8 +2137,61 @@ class FileIPCBackend(AutoCADBackend):
             rotated.save(path, format="PNG")
             return rotated.width, rotated.height, True
 
+    @staticmethod
+    def _normalize_png_content_framing(path: Path, fill_ratio: float = 0.82) -> dict:
+        """Center and scale native plot pixels without capturing any desktop window."""
+        from PIL import Image, ImageChops
+
+        if fill_ratio <= 0.1 or fill_ratio >= 0.95:
+            raise ValueError("framing_fill must be between 0.1 and 0.95")
+        with Image.open(path) as source:
+            image = source.convert("RGB")
+        background = Image.new("RGB", image.size, "white")
+        difference = ImageChops.difference(image, background).convert("L")
+        mask = difference.point(lambda value: 255 if value > 7 else 0)
+        bounds = mask.getbbox()
+        if not bounds:
+            raise RuntimeError("Native product view contains no non-background pixels")
+        padding = 2
+        left = max(0, bounds[0] - padding)
+        top = max(0, bounds[1] - padding)
+        right = min(image.width, bounds[2] + padding)
+        bottom = min(image.height, bounds[3] + padding)
+        crop = image.crop((left, top, right, bottom))
+        target_width = max(1, int(round(image.width * fill_ratio)))
+        target_height = max(1, int(round(image.height * fill_ratio)))
+        scale = min(target_width / crop.width, target_height / crop.height)
+        resized = crop.resize(
+            (
+                max(1, int(round(crop.width * scale))),
+                max(1, int(round(crop.height * scale))),
+            ),
+            Image.Resampling.LANCZOS,
+        )
+        normalized = Image.new("RGB", image.size, "white")
+        paste = (
+            (image.width - resized.width) // 2,
+            (image.height - resized.height) // 2,
+        )
+        normalized.paste(resized, paste)
+        normalized.save(path, format="PNG")
+        return {
+            "applied": True,
+            "source_bbox_pixels": list(bounds),
+            "source_crop_pixels": [left, top, right, bottom],
+            "scale": round(scale, 6),
+            "fill_ratio": fill_ratio,
+            "output_bbox_pixels": [
+                paste[0], paste[1], paste[0] + resized.width, paste[1] + resized.height
+            ],
+            "desktop_capture_used": False,
+            "native_plot_pixels_preserved": True,
+        }
+
     def _plot_png_via_com(
-        self, output: Path, *, paper: str, orientation: str, plot_style: str, dpi: int
+        self, output: Path, *, paper: str, orientation: str, plot_style: str,
+        dpi: int, plot_type: str = "extents", normalize_framing: bool = False,
+        framing_fill: float = 0.82,
     ) -> dict:
         import pythoncom
         import win32com.client
@@ -2152,7 +2256,10 @@ class FileIPCBackend(AutoCADBackend):
                 raise RuntimeError("AutoCAD PNG plot device exposes no usable raster media")
             _, media, _, _ = min(candidates, key=lambda item: item[0])
             layout.CanonicalMediaName = media
-            layout.PlotType = 1
+            selected_plot_type = str(plot_type).lower()
+            if selected_plot_type not in {"extents", "display"}:
+                raise ValueError("plot_type must be extents or display")
+            layout.PlotType = 0 if selected_plot_type == "display" else 1
             layout.UseStandardScale = True
             layout.StandardScale = 0
             layout.CenterPlot = True
@@ -2176,6 +2283,10 @@ class FileIPCBackend(AutoCADBackend):
             width, height, orientation_corrected = self._correct_png_orientation(
                 output, selected_orientation
             )
+            framing_normalization = (
+                self._normalize_png_content_framing(output, framing_fill)
+                if normalize_framing else None
+            )
             return {
                 "path": str(output),
                 "document_path": str(document.FullName or document.Name),
@@ -2194,6 +2305,8 @@ class FileIPCBackend(AutoCADBackend):
                 "bytes": output.stat().st_size,
                 "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
                 "device": device,
+                "plot_type": selected_plot_type,
+                "framing_normalization": framing_normalization,
             }
         finally:
             for name, value in saved.items():
@@ -3192,14 +3305,20 @@ class FileIPCBackend(AutoCADBackend):
             if float(radius) <= 0 or float(height) == 0:
                 raise ValueError("Cylinder radius must be positive and height must be non-zero")
             pythoncom, win32com, _, modelspace = self._solid_context()
+            base = [float(item) for item in list(base_center)[:3]]
+            while len(base) < 3:
+                base.append(0.0)
+            center = [base[0], base[1], base[2] + float(height) / 2]
             solid = modelspace.AddCylinder(
-                self._solid_point(pythoncom, win32com, base_center), float(radius), float(height)
+                self._solid_point(pythoncom, win32com, center), float(radius), float(height)
             )
             if layer:
                 solid.Layer = layer
             solid.Update()
             self._auto_fit_view()
-            return CommandResult(ok=True, payload=self._solid_payload(solid, "cylinder"))
+            payload = self._solid_payload(solid, "cylinder")
+            payload.update(requested_base_center=base, actual_center=center)
+            return CommandResult(ok=True, payload=payload)
         except Exception as exc:
             return self._exception_result(
                 exc, operation="solid.create_cylinder",
@@ -3332,6 +3451,465 @@ class FileIPCBackend(AutoCADBackend):
                 parameters={"primary_id": primary_id, "tool_id": tool_id},
                 system_call="AutoCAD.3DSolid.Boolean", error_code="E_SOLID_OPERATION",
             )
+
+    @staticmethod
+    def _delete_com_entities(entities) -> None:
+        for entity in reversed(list(entities)):
+            try:
+                entity.Delete()
+            except Exception:
+                pass
+
+    def _union_com_solids(self, solids):
+        if not solids:
+            raise ValueError("At least one solid is required")
+        primary = solids[0]
+        for tool in solids[1:]:
+            primary.Boolean(0, tool)
+        primary.Update()
+        return primary
+
+    def _rounded_box_via_com(self, modelspace, pythoncom, win32com, feature):
+        center = [float(value) for value in feature["center"]]
+        length, width, height = [float(value) for value in feature["dimensions"]]
+        radius = float(feature.get("radius", 0.0))
+        layer = feature.get("layer")
+        solids = []
+
+        def point(value):
+            return self._solid_point(pythoncom, win32com, value)
+
+        def box(dimensions):
+            entity = modelspace.AddBox(point(center), *dimensions)
+            solids.append(entity)
+            return entity
+
+        def cylinder(cylinder_center, cylinder_radius, cylinder_height, axis="z"):
+            entity = modelspace.AddCylinder(
+                point(cylinder_center), cylinder_radius, cylinder_height
+            )
+            if axis == "x":
+                entity.Rotate3D(
+                    point(cylinder_center),
+                    point([cylinder_center[0], cylinder_center[1] + 1, cylinder_center[2]]),
+                    -math.pi / 2,
+                )
+            elif axis == "y":
+                entity.Rotate3D(
+                    point(cylinder_center),
+                    point([cylinder_center[0] + 1, cylinder_center[1], cylinder_center[2]]),
+                    math.pi / 2,
+                )
+            solids.append(entity)
+            return entity
+
+        try:
+            if radius <= 0:
+                primary = box((length, width, height))
+            else:
+                inner = [length - 2 * radius, width - 2 * radius, height - 2 * radius]
+                box((inner[0], width, inner[2]))
+                box((length, inner[1], inner[2]))
+                box((inner[0], inner[1], height))
+                x_positions = [center[0] - length / 2 + radius, center[0] + length / 2 - radius]
+                y_positions = [center[1] - width / 2 + radius, center[1] + width / 2 - radius]
+                z_positions = [center[2] - height / 2 + radius, center[2] + height / 2 - radius]
+                for y in y_positions:
+                    for z in z_positions:
+                        cylinder([center[0], y, z], radius, inner[0], "x")
+                for x in x_positions:
+                    for z in z_positions:
+                        cylinder([x, center[1], z], radius, inner[1], "y")
+                for x in x_positions:
+                    for y in y_positions:
+                        cylinder([x, y, center[2]], radius, inner[2], "z")
+                for x in x_positions:
+                    for y in y_positions:
+                        for z in z_positions:
+                            sphere = modelspace.AddSphere(point([x, y, z]), radius)
+                            solids.append(sphere)
+                primary = self._union_com_solids(solids)
+            if layer:
+                primary.Layer = str(layer)
+            primary.Update()
+            return primary
+        except Exception:
+            self._delete_com_entities(solids)
+            raise
+
+    @staticmethod
+    def _rounded_box_semantic_edges(feature: dict) -> list[dict]:
+        radius = float(feature.get("radius", 0.0))
+        if radius <= 0:
+            return []
+        edges = []
+        for axis in "xyz":
+            for first in (-1, 1):
+                for second in (-1, 1):
+                    edges.append(
+                        {
+                            "semantic_edge_id": f"{feature['feature_id']}:{axis}:{first}:{second}",
+                            "role": f"rounded_edge_{axis}",
+                            "axis": axis,
+                            "side_signs": [first, second],
+                            "fillet_radius": radius,
+                            "native_edge_index": None,
+                        }
+                    )
+        return edges
+
+    def _ring_via_com(self, modelspace, pythoncom, win32com, feature):
+        center = [float(value) for value in feature["center"]]
+        height = float(feature["height"])
+        outer = modelspace.AddCylinder(
+            self._solid_point(pythoncom, win32com, center),
+            float(feature["outer_radius"]),
+            height,
+        )
+        inner = None
+        try:
+            if float(feature.get("inner_radius", 0.0)) > 0:
+                inner = modelspace.AddCylinder(
+                    self._solid_point(pythoncom, win32com, center),
+                    float(feature["inner_radius"]),
+                    height,
+                )
+                outer.Boolean(2, inner)
+            if feature.get("layer"):
+                outer.Layer = str(feature["layer"])
+            outer.Update()
+            return outer
+        except Exception:
+            self._delete_com_entities([entity for entity in (inner, outer) if entity is not None])
+            raise
+
+    async def product_create_feature(self, kind: str, data: dict) -> CommandResult:
+        try:
+            feature = normalize_feature(kind, data)
+            pythoncom, win32com, document, modelspace = self._solid_context()
+            created = None
+            replaced_target = None
+            if feature["kind"] in {"rounded_box", "module_reservation"}:
+                created = self._rounded_box_via_com(modelspace, pythoncom, win32com, feature)
+            elif feature["kind"] in {"rotary_layer", "annular_gap", "detent_ring_placeholder"}:
+                created = self._ring_via_com(modelspace, pythoncom, win32com, feature)
+            elif feature["kind"] in {"recessed_panel", "port_cutout_usb_a", "port_cutout_usb_c"}:
+                target = document.HandleToObject(str(feature["target_id"]))
+                trial = target.Copy()
+                cutter_feature = dict(feature)
+                if feature["kind"] == "recessed_panel":
+                    cutter_feature["dimensions"] = [
+                        feature["dimensions"][0], feature["dimensions"][1], feature["depth"]
+                    ]
+                cutter = self._rounded_box_via_com(
+                    modelspace, pythoncom, win32com, cutter_feature
+                )
+                try:
+                    trial.Boolean(2, cutter)
+                    trial.Update()
+                    replaced_target = str(target.Handle)
+                    target.Delete()
+                    created = trial
+                except Exception:
+                    self._delete_com_entities([cutter, trial])
+                    raise
+            else:
+                raise ValueError(f"Unsupported product feature: {feature['kind']}")
+            payload = self._solid_payload(created, feature["kind"])
+            requested_bounds = feature_bounds(feature)
+            actual_bounds = payload.get("bounds")
+            bound_diff = []
+            if feature["kind"] not in {
+                "recessed_panel", "port_cutout_usb_a", "port_cutout_usb_c"
+            }:
+                if not actual_bounds:
+                    self._delete_com_entities([created])
+                    raise RuntimeError("Created product solid has no readable bounding box")
+                for side in ("min", "max"):
+                    for index, axis in enumerate("xyz"):
+                        delta = float(actual_bounds[side][index]) - float(
+                            requested_bounds[side][index]
+                        )
+                        if abs(delta) > 0.0001:
+                            bound_diff.append(
+                                {
+                                    "path": f"bounds.{side}.{axis}",
+                                    "requested": requested_bounds[side][index],
+                                    "actual": actual_bounds[side][index],
+                                    "delta": delta,
+                                }
+                            )
+                volume = payload.get("volume")
+                envelope_volume = math.prod(
+                    requested_bounds["max"][index] - requested_bounds["min"][index]
+                    for index in range(3)
+                )
+                if volume is None or float(volume) <= 0 or float(volume) > envelope_volume + 0.0001:
+                    bound_diff.append(
+                        {
+                            "path": "volume",
+                            "requested": f"0 < volume <= {envelope_volume}",
+                            "actual": volume,
+                        }
+                    )
+                if bound_diff:
+                    self._delete_com_entities([created])
+                    raise RuntimeError(
+                        f"Product feature postcondition mismatch: {bound_diff}"
+                    )
+            feature.update(
+                handle=payload.get("handle"),
+                bounds=actual_bounds or requested_bounds,
+                volume=payload.get("volume"),
+                semantic_edges=(
+                    self._rounded_box_semantic_edges(feature)
+                    if feature["kind"] in {"rounded_box", "recessed_panel", "module_reservation", "port_cutout_usb_a", "port_cutout_usb_c"}
+                    else []
+                ),
+                replaced_target_handle=replaced_target,
+                verified=True,
+                requested={"bounds": requested_bounds},
+                actual={"bounds": actual_bounds, "volume": payload.get("volume")},
+                diff=bound_diff,
+                modeling_authority="native_autocad_brep",
+            )
+            self._auto_fit_view()
+            return CommandResult(ok=True, payload=feature)
+        except Exception as exc:
+            postcondition = "postcondition mismatch" in str(exc).lower()
+            return self._exception_result(
+                exc,
+                operation=f"product.create_feature.{kind}",
+                parameters=data,
+                system_call="AutoCAD.ActiveX analytic solid construction",
+                error_code=(
+                    "E_POSTCONDITION_MISMATCH" if postcondition else "E_PRODUCT_FEATURE_FAILED"
+                ),
+                recommended_action=(
+                    "do_not_continue_modeling_switch_to_a_verified_backend"
+                    if postcondition
+                    else "verify_feature_parameters_layer_and_target_then_retry"
+                ),
+            )
+
+    @staticmethod
+    def _camera_direction(view_name: str) -> list[float]:
+        directions = {
+            "front": [0.0, -1.0, 0.0],
+            "right": [1.0, 0.0, 0.0],
+            "top": [0.0, 0.0, 1.0],
+            "bottom": [0.0, 0.0, -1.0],
+            "iso": [1.0, -1.0, 1.0],
+            "rotated_iso": [1.0, 1.0, 0.75],
+            "section": [1.0, -1.0, 1.0],
+            "exploded": [1.0, -1.0, 1.0],
+        }
+        if view_name not in directions:
+            raise ValueError(f"Unsupported fixed camera view: {view_name}")
+        return directions[view_name]
+
+    def _fit_fixed_camera_viewport(
+        self,
+        viewport,
+        direction: list[float],
+        target: list[float],
+        margin_scale: float,
+        output_aspect: float,
+    ) -> dict:
+        if margin_scale <= 0.1 or margin_scale >= 0.98:
+            raise ValueError("margin_scale must be between 0.1 and 0.98")
+        entities = self._collect_entities_via_com()
+        corners = []
+        for entity in entities:
+            bounds = entity.get("bounds")
+            if not bounds or not bounds.get("min") or not bounds.get("max"):
+                continue
+            corners.extend(
+                [x, y, z]
+                for x in (bounds["min"][0], bounds["max"][0])
+                for y in (bounds["min"][1], bounds["max"][1])
+                for z in (bounds["min"][2], bounds["max"][2])
+            )
+        if not corners:
+            raise ValueError("Fixed camera fitting requires readable entity bounds")
+
+        def normalize(vector):
+            magnitude = math.sqrt(sum(float(value) ** 2 for value in vector))
+            if magnitude <= 1e-9:
+                raise ValueError("Camera direction must be non-zero")
+            return [float(value) / magnitude for value in vector]
+
+        def cross(first, second):
+            return [
+                first[1] * second[2] - first[2] * second[1],
+                first[2] * second[0] - first[0] * second[2],
+                first[0] * second[1] - first[1] * second[0],
+            ]
+
+        camera_axis = normalize(direction)
+        up_reference = [0.0, 1.0, 0.0] if abs(camera_axis[2]) > 0.95 else [0.0, 0.0, 1.0]
+        horizontal = normalize(cross(up_reference, camera_axis))
+        vertical = normalize(cross(camera_axis, horizontal))
+        projected = []
+        for point in corners:
+            relative = [float(point[index]) - float(target[index]) for index in range(3)]
+            projected.append(
+                [
+                    sum(relative[index] * horizontal[index] for index in range(3)),
+                    sum(relative[index] * vertical[index] for index in range(3)),
+                ]
+            )
+        minimum = [min(point[index] for point in projected) for index in range(2)]
+        maximum = [max(point[index] for point in projected) for index in range(2)]
+        content_width = max(maximum[0] - minimum[0], 1e-6)
+        content_height = max(maximum[1] - minimum[1], 1e-6)
+        if output_aspect <= 0:
+            raise ValueError("output_aspect must be positive")
+        aspect = float(output_aspect)
+        view_height = max(
+            content_height / margin_scale,
+            content_width / (aspect * margin_scale),
+        )
+        view_width = view_height * aspect
+        viewport.Height = view_height
+        viewport.Width = view_width
+        try:
+            import pythoncom
+            import win32com.client
+
+            viewport.Center = win32com.client.VARIANT(
+                pythoncom.VT_ARRAY | pythoncom.VT_R8, [0.0, 0.0]
+            )
+        except Exception:
+            pass
+        return {
+            "projected_bounds": {"min": minimum, "max": maximum},
+            "content_size": [content_width, content_height],
+            "view_size": [view_width, view_height],
+            "margin_scale": margin_scale,
+            "output_aspect": aspect,
+            "horizontal_axis": horizontal,
+            "vertical_axis": vertical,
+            "entity_count": len(entities),
+        }
+
+    async def product_render_view(
+        self, view_name: str, path: str, options: dict | None = None
+    ) -> CommandResult:
+        options = dict(options or {})
+        if view_name in {"section", "exploded"} and not options.get("prepared_geometry", False):
+            return CommandResult(
+                ok=False,
+                error=f"{view_name} requires caller-prepared section or exploded geometry",
+                error_code="E_VIEW_GEOMETRY_NOT_PREPARED",
+                recoverable=True,
+                recommended_action="prepare_the_named_geometry_state_and_retry",
+            )
+        document = None
+        pythoncom = win32com = None
+        saved_direction = saved_target = saved_twist = saved_perspective = None
+        try:
+            pythoncom, win32com, document, _ = self._solid_context()
+            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            viewport = document.ActiveViewport
+            saved_direction = list(viewport.Direction)
+            saved_target = list(viewport.Target)
+            saved_twist = _com_value(viewport, "TwistAngle")
+            saved_perspective = document.GetVariable("PERSPECTIVE")
+            direction = self._camera_direction(view_name)
+            minimum = list(document.GetVariable("EXTMIN"))
+            maximum = list(document.GetVariable("EXTMAX"))
+            default_target = [
+                (float(minimum[index]) + float(maximum[index])) / 2
+                for index in range(3)
+            ]
+            target = options.get("target", default_target)
+            paper_dimensions = {
+                "A0": (841.0, 1189.0), "A1": (594.0, 841.0),
+                "A2": (420.0, 594.0), "A3": (297.0, 420.0),
+                "A4": (210.0, 297.0),
+            }
+            paper_size = paper_dimensions.get(
+                str(options.get("paper", "A4")).upper(), paper_dimensions["A4"]
+            )
+            selected_orientation = str(options.get("orientation", "landscape")).lower()
+            output_aspect = (
+                max(paper_size) / min(paper_size)
+                if selected_orientation != "portrait"
+                else min(paper_size) / max(paper_size)
+            )
+            document.SetVariable("PERSPECTIVE", 0)
+            viewport.Direction = self._solid_point(pythoncom, win32com, direction)
+            viewport.Target = self._solid_point(pythoncom, win32com, target)
+            if saved_twist is not None:
+                viewport.TwistAngle = 0.0
+            framing = self._fit_fixed_camera_viewport(
+                viewport,
+                direction,
+                target,
+                float(options.get("margin_scale", 0.82)),
+                output_aspect,
+            )
+            document.ActiveViewport = viewport
+            view_size_before = float(document.GetVariable("VIEWSIZE"))
+            desired_view_height = float(framing["view_size"][1])
+            zoom_magnification = view_size_before / desired_view_height
+            application.ZoomScaled(zoom_magnification, 1)
+            application.Update()
+            framing.update(
+                view_size_before=view_size_before,
+                desired_view_height=desired_view_height,
+                zoom_magnification=zoom_magnification,
+                view_size_after=float(document.GetVariable("VIEWSIZE")),
+            )
+            result = await self.drawing_render_preview(
+                path,
+                paper=options.get("paper", "A4"),
+                orientation=options.get("orientation", "landscape"),
+                plot_style=options.get("plot_style", "monochrome.ctb"),
+                dpi=int(options.get("dpi", 150)),
+                force=bool(options.get("force", True)),
+                plot_type="display",
+                normalize_framing=True,
+                framing_fill=float(options.get("framing_fill", 0.82)),
+            )
+            if result.ok:
+                result.payload.update(
+                    view_name=view_name,
+                    requested_camera={"direction": direction, "target": target},
+                    actual_camera={"direction": direction, "target": target},
+                    camera_framing=framing,
+                    projection="orthographic",
+                    prepared_geometry=bool(options.get("prepared_geometry", False)),
+                    material_render=False,
+                )
+            return result
+        except Exception as exc:
+            return self._exception_result(
+                exc,
+                operation=f"product.render_view.{view_name}",
+                parameters={"path": path, **options},
+                system_call="AutoCAD.ActiveViewport + PlotToFile",
+                file_path=path,
+                error_code="E_PRODUCT_VIEW_FAILED",
+            )
+        finally:
+            if document is not None and saved_direction is not None and saved_target is not None:
+                try:
+                    viewport = document.ActiveViewport
+                    viewport.Direction = self._solid_point(
+                        pythoncom, win32com, saved_direction
+                    )
+                    viewport.Target = self._solid_point(
+                        pythoncom, win32com, saved_target
+                    )
+                    if saved_twist is not None:
+                        viewport.TwistAngle = saved_twist
+                    document.ActiveViewport = viewport
+                    if saved_perspective is not None:
+                        document.SetVariable("PERSPECTIVE", saved_perspective)
+                except Exception:
+                    pass
 
     # --- Layer operations ---
 

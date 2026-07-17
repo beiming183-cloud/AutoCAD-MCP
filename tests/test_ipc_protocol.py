@@ -91,6 +91,8 @@ class TestBackendCapabilities:
             can_create_solids=True,
             can_boolean_solids=True,
             can_project_views=True,
+            can_product_features=True,
+            can_fixed_camera_views=True,
         )
         for field_name, value in caps.__dict__.items():
             assert value is True, f"{field_name} should be True"

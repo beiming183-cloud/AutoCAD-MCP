@@ -55,6 +55,8 @@ class BackendCapabilities:
     can_create_solids: bool = False
     can_boolean_solids: bool = False
     can_project_views: bool = False
+    can_product_features: bool = False
+    can_fixed_camera_views: bool = False
 
 
 class AutoCADBackend(ABC):
@@ -212,6 +214,9 @@ class AutoCADBackend(ABC):
         dpi: int = 150,
         force: bool = True,
         background: str = "white",
+        plot_type: str = "extents",
+        normalize_framing: bool = False,
+        framing_fill: float = 0.82,
     ) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
@@ -662,6 +667,48 @@ class AutoCADBackend(ABC):
         self, primary_id: str, tool_id: str, operation: str
     ) -> CommandResult:
         return CommandResult(ok=False, error="3D solid booleans are not supported on this backend")
+
+    # --- Industrial product features and evidence ---
+
+    async def product_create_feature(
+        self, kind: str, data: dict[str, Any]
+    ) -> CommandResult:
+        return CommandResult(
+            ok=False,
+            error="Parametric product features are not supported on this backend",
+            error_code="E_UNSUPPORTED_OPERATION",
+        )
+
+    async def product_render_view(
+        self, view_name: str, path: str, options: dict[str, Any] | None = None
+    ) -> CommandResult:
+        return CommandResult(
+            ok=False,
+            error="Fixed-camera product views are not supported on this backend",
+            error_code="E_UNSUPPORTED_OPERATION",
+        )
+
+    async def solid_fillet_edges(
+        self, entity_id: str, semantic_roles: list[str], radius: float
+    ) -> CommandResult:
+        return CommandResult(
+            ok=False,
+            error="Stable native B-rep edge selection is unavailable",
+            error_code="E_STABLE_FEATURE_SELECTION_UNAVAILABLE",
+            recoverable=False,
+            recommended_action="use_an_analytic_parametric_feature_or_a_native_feature_plugin",
+        )
+
+    async def solid_chamfer_edges(
+        self, entity_id: str, semantic_roles: list[str], distance: float
+    ) -> CommandResult:
+        return CommandResult(
+            ok=False,
+            error="Stable native B-rep edge selection is unavailable",
+            error_code="E_STABLE_FEATURE_SELECTION_UNAVAILABLE",
+            recoverable=False,
+            recommended_action="use_an_analytic_parametric_feature_or_a_native_feature_plugin",
+        )
 
     # --- Layer operations ---
 
