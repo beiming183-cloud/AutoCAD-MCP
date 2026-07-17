@@ -1090,6 +1090,7 @@ async def system(
 
     Operations:
       status        — Backend info, capabilities, health check.
+      preflight     — Check Python/pywin32, acad.exe processes, and Activity Insights without starting AutoCAD.
       ensure_ready  — Discover/start AutoCAD, open a document, load/version-check dispatcher, ping IPC.
       health        — Quick health check (ping backend).
       get_backend   — Return current backend name and capabilities.
@@ -1100,7 +1101,11 @@ async def system(
     """
     data = data or {}
 
-    if operation == "status":
+    if operation == "preflight":
+        from autocad_mcp.runtime_health import environment_preflight
+
+        return _json({"ok": True, "payload": environment_preflight()})
+    elif operation == "status":
         from autocad_mcp import client
 
         if client._backend is None:

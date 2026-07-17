@@ -56,6 +56,8 @@ async def test_file_ipc_ensure_ready_loads_and_version_checks_dispatcher(monkeyp
 
     backend = FileIPCBackend()
     backend._ipc_dir = tmp_path / "ipc"
+    monkeypatch.setattr(file_ipc, "win32_runtime_health", lambda: {"ok": True, "checks": {}})
+    monkeypatch.setattr(file_ipc, "list_autocad_processes", lambda: [])
     monkeypatch.setattr(file_ipc, "find_autocad_window", lambda: 123)
     monkeypatch.setattr(file_ipc, "_window_process_id", lambda hwnd: 456)
     monkeypatch.setattr(
@@ -81,7 +83,7 @@ async def test_file_ipc_ensure_ready_loads_and_version_checks_dispatcher(monkeyp
             side_effect=[
                 CommandResult(ok=False, error="AutoCAD COM is still registering"),
                 CommandResult(
-                    ok=True, payload={"pong": True, "dispatcher_version": "3.10.0"}
+                    ok=True, payload={"pong": True, "dispatcher_version": "3.10.1"}
                 ),
             ]
         ),
@@ -93,7 +95,7 @@ async def test_file_ipc_ensure_ready_loads_and_version_checks_dispatcher(monkeyp
     assert result.ok is True
     assert result.payload["ready"] is True
     assert result.payload["autocad"]["product"] == "AutoCAD 2025"
-    assert result.payload["dispatcher"]["version"] == "3.10.0"
+    assert result.payload["dispatcher"]["version"] == "3.10.1"
     assert result.payload["dispatcher"]["load_attempts"] == 2
     assert len(typed) == 2
     assert typed and "mcp_dispatch.lsp" in typed[0]

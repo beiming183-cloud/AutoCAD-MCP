@@ -11,6 +11,10 @@ ERROR_ACTIONS = {
     "E_AUTOCAD_NOT_INSTALLED": (False, "configure_autocad_executable"),
     "E_AUTOCAD_NOT_RUNNING": (True, "start_autocad"),
     "E_AUTOCAD_CRASHED": (True, "close_fatal_dialog_restart_autocad_and_retry"),
+    "E_AUTOCAD_GHOST_PROCESS": (True, "terminate_or_close_orphaned_acad_process_then_start_autocad_manually"),
+    "E_AUTOCAD_PROFILE_UNWRITABLE": (False, "fix_activity_insights_path_permissions_or_disable_activity_insights"),
+    "E_PYWIN32_BROKEN": (False, "repair_pywin32_in_the_same_python_used_by_the_mcp"),
+    "E_AUTOCAD_STARTUP_FAILED": (True, "start_autocad_manually_outside_the_mcp_and_retry"),
     "E_NO_ACTIVE_DOCUMENT": (True, "create_or_open_drawing"),
     "E_DOCUMENT_ID_MISMATCH": (False, "activate_the_requested_document_and_retry"),
     "E_DOCUMENT_REVISION_MISMATCH": (False, "read_latest_document_revision_and_retry"),
@@ -45,6 +49,12 @@ def infer_error_code(message: str | None) -> str:
     text = (message or "").lower()
     if "not installed" in text or "executable was not found" in text:
         return "E_AUTOCAD_NOT_INSTALLED"
+    if "pywin32" in text or "pythoncom" in text or "pywintypes" in text:
+        return "E_PYWIN32_BROKEN"
+    if "activity insights" in text or "profile" in text and "write" in text:
+        return "E_AUTOCAD_PROFILE_UNWRITABLE"
+    if "ghost" in text or "no usable main window" in text:
+        return "E_AUTOCAD_GHOST_PROCESS"
     if "fatal error" in text or "致命错误" in text or "autocad crashed" in text:
         return "E_AUTOCAD_CRASHED"
     if "window not found" in text or "no autocad" in text or "not running" in text:

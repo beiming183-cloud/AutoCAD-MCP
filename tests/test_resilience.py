@@ -20,12 +20,49 @@ from autocad_mcp.logging_setup import UTF8_BOM, TeeLogWriter
 from autocad_mcp.offline import audit_dxf_offline
 
 
+async def test_ensure_ready_reports_broken_pywin32_before_com_or_document_access(monkeypatch):
+    import autocad_mcp.backends.file_ipc as file_ipc
+
+    backend = FileIPCBackend()
+    monkeypatch.setattr(
+        file_ipc,
+        "win32_runtime_health",
+        lambda: {
+            "ok": False,
+            "python": "C:/Python/python.exe",
+            "checks": {"pythoncom": {"ok": False, "message": "No module named pywintypes"}},
+        },
+    )
+    monkeypatch.setattr(file_ipc, "find_autocad_window", lambda: (_ for _ in ()).throw(AssertionError()))
+
+    result = await backend.ensure_ready()
+
+    assert result.error_code == "E_PYWIN32_BROKEN"
+    assert result.payload["runtime"]["checks"]["pythoncom"]["ok"] is False
+
+
+async def test_ensure_ready_distinguishes_ghost_acad_process(monkeypatch):
+    import autocad_mcp.backends.file_ipc as file_ipc
+
+    backend = FileIPCBackend()
+    monkeypatch.setattr(file_ipc, "win32_runtime_health", lambda: {"ok": True, "checks": {}})
+    monkeypatch.setattr(file_ipc, "find_autocad_window", lambda: None)
+    monkeypatch.setattr(file_ipc, "list_autocad_processes", lambda: [{"process_id": 1234, "image": "acad.exe"}])
+
+    result = await backend.ensure_ready()
+
+    assert result.error_code == "E_AUTOCAD_GHOST_PROCESS"
+    assert result.payload["autocad_processes"][0]["process_id"] == 1234
+
+
 async def test_ensure_ready_reports_crash_instead_of_missing_document(monkeypatch):
     import autocad_mcp.backends.file_ipc as file_ipc
 
     backend = FileIPCBackend()
     backend._hwnd = 123
     backend._acad_process_id = 456
+    monkeypatch.setattr(file_ipc, "win32_runtime_health", lambda: {"ok": True, "checks": {}})
+    monkeypatch.setattr(file_ipc, "list_autocad_processes", lambda: [])
     monkeypatch.setattr(file_ipc, "find_autocad_window", lambda: None)
     monkeypatch.setattr(
         file_ipc,

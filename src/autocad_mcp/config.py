@@ -11,6 +11,13 @@ from typing import Callable
 
 import structlog
 
+from autocad_mcp.runtime_health import (
+    RuntimeHealthError,
+    activity_insights_write_preflight,
+    list_autocad_processes,
+    win32_runtime_health,
+)
+
 log = structlog.get_logger()
 
 # Paths
@@ -60,30 +67,72 @@ def _autostart_autocad(find_window: Callable[[], int | None]) -> int | None:
     if not executable_path.is_file():
         raise RuntimeError(f"Configured AutoCAD executable was not found: {executable_path}")
 
+    profile = activity_insights_write_preflight()
+    if not profile["ok"]:
+        raise RuntimeHealthError(
+            "AutoCAD Activity Insights directory is not writable before startup",
+            error_code="E_AUTOCAD_PROFILE_UNWRITABLE",
+            details=profile,
+            recommended_action=(
+                "Fix the directory ACL, set AUTOCAD_MCP_ACTIVITY_INSIGHTS_PATH to a writable D: path, "
+                "or set AUTOCAD_MCP_DISABLE_ACTIVITY_INSIGHTS=true before restarting AutoCAD."
+            ),
+        )
+
     startup_script = os.environ.get("AUTOCAD_MCP_ACAD_SCRIPT", "").strip()
+    startup_path = Path(startup_script).expanduser() if startup_script else None
+    if startup_path and not startup_path.is_file():
+        raise RuntimeError(f"Configured AutoCAD startup script was not found: {startup_path}")
+
+    generated_script = None
+    policy_lines = []
+    if os.environ.get("AUTOCAD_MCP_DISABLE_ACTIVITY_INSIGHTS", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    ):
+        policy_lines.extend(["_.SETVAR", "ACTIVITYINSIGHTSSUPPORT", "0"])
+    configured_activity_path = os.environ.get("AUTOCAD_MCP_ACTIVITY_INSIGHTS_PATH", "").strip()
+    if configured_activity_path:
+        activity_value = configured_activity_path.replace("\\", "/")
+        if any(character.isspace() for character in activity_value):
+            activity_value = f'"{activity_value}"'
+        policy_lines.extend(
+            ["_.SETVAR", "ACTIVITYINSIGHTSPATH", activity_value]
+        )
+    if policy_lines:
+        ipc_dir = Path(os.environ.get("AUTOCAD_MCP_IPC_DIR", "C:/temp"))
+        ipc_dir.mkdir(parents=True, exist_ok=True)
+        generated_script = ipc_dir / f"autocad_mcp_startup_{os.getpid()}.scr"
+        existing = startup_path.read_text(encoding="utf-8") if startup_path else ""
+        generated_script.write_text("\n".join(policy_lines) + "\n" + existing, encoding="utf-8")
+        startup_path = generated_script
+
     command = [str(executable_path), "/nologo"]
-    if startup_script:
-        script_path = Path(startup_script).expanduser()
-        if not script_path.is_file():
-            raise RuntimeError(f"Configured AutoCAD startup script was not found: {script_path}")
-        command.extend(["/b", str(script_path)])
+    if startup_path:
+        command.extend(["/b", str(startup_path)])
 
     log.info("autocad_autostart", executable=str(executable_path))
-    subprocess.Popen(command, cwd=str(executable_path.parent))
+    try:
+        subprocess.Popen(command, cwd=str(executable_path.parent))
 
-    timeout = max(
-        5.0,
-        min(180.0, float(os.environ.get("AUTOCAD_MCP_ACAD_STARTUP_TIMEOUT", "75"))),
-    )
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        hwnd = find_window()
-        if hwnd:
-            log.info("autocad_autostart_ready", hwnd=hwnd)
-            return hwnd
-        time.sleep(0.5)
+        timeout = max(
+            5.0,
+            min(180.0, float(os.environ.get("AUTOCAD_MCP_ACAD_STARTUP_TIMEOUT", "75"))),
+        )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            hwnd = find_window()
+            if hwnd:
+                log.info("autocad_autostart_ready", hwnd=hwnd)
+                return hwnd
+            time.sleep(0.5)
 
-    raise RuntimeError(f"AutoCAD did not expose a usable main window within {timeout:g} seconds.")
+        raise RuntimeError(f"AutoCAD did not expose a usable main window within {timeout:g} seconds.")
+    finally:
+        if generated_script is not None:
+            try:
+                generated_script.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _current_backend_env() -> str:
@@ -136,10 +185,29 @@ def detect_backend() -> str:
 
     if backend_env in ("auto", "file_ipc"):
         if WIN32_AVAILABLE:
+            runtime = win32_runtime_health()
+            processes = list_autocad_processes()
+            if not runtime["ok"]:
+                if backend_env == "file_ipc" or processes:
+                    raise RuntimeHealthError(
+                        "The pywin32 runtime required for AutoCAD COM is unhealthy",
+                        error_code="E_PYWIN32_BROKEN",
+                        details={"runtime": runtime, "autocad_processes": processes},
+                        recommended_action="repair_pywin32_in_the_same_python_used_by_the_mcp",
+                    )
+                log.info("win32_runtime_unhealthy_fallback_ezdxf", runtime=runtime)
+                return "ezdxf"
             try:
                 from autocad_mcp.backends.file_ipc import find_autocad_window
 
                 hwnd = find_autocad_window()
+                if not hwnd and processes:
+                    raise RuntimeHealthError(
+                        "acad.exe is alive but exposes no usable main window",
+                        error_code="E_AUTOCAD_GHOST_PROCESS",
+                        details={"autocad_processes": processes},
+                        recommended_action="terminate_or_close_orphaned_acad_process_then_start_autocad_manually",
+                    )
                 if not hwnd:
                     hwnd = _autostart_autocad(find_autocad_window)
                 if hwnd:

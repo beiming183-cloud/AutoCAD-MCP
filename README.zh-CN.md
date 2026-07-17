@@ -3,7 +3,7 @@
 **面向 AI Agent 的可靠 AutoCAD 自动化：可核验几何、原生 3D 与可追溯交付。**
 
 [![Tests](https://github.com/beiming183-cloud/AutoCAD-MCP/actions/workflows/tests.yml/badge.svg)](https://github.com/beiming183-cloud/AutoCAD-MCP/actions/workflows/tests.yml)
-[![Version](https://img.shields.io/badge/version-3.10.0-0B7285)](https://github.com/beiming183-cloud/AutoCAD-MCP/releases)
+[![Version](https://img.shields.io/badge/version-3.10.1-0B7285)](https://github.com/beiming183-cloud/AutoCAD-MCP/releases)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-2F855A)](LICENSE)
 
@@ -44,6 +44,8 @@ uv run python examples/headless_demo.py
 
 服务通过标准 MCP stdio 暴露 11 个整合工具：`drawing`、`entity`、`solid`、`product`、`layer`、`block`、`annotation`、`pid`、`transaction`、`view` 和 `system`。
 
+遇到 AutoCAD 进程残留、Python COM 环境损坏或 Activity Insights 权限错误时，先调用只读的 `system(operation="preflight")`，再调用 `system(operation="ensure_ready")`。完整处理步骤见 [Windows AutoCAD 恢复指南](docs/WINDOWS-AUTOCAD-RECOVERY.md)。
+
 ## 完整版 AutoCAD 快速安装
 
 ### 1. 安装依赖
@@ -78,11 +80,12 @@ lisp-code/mcp_dispatch.lsp
       "env": {
         "PYTHONPATH": "C:\\path\\to\\AutoCAD-MCP\\src",
         "AUTOCAD_MCP_BACKEND": "file_ipc",
-        "AUTOCAD_MCP_AUTOSTART": "true",
+        "AUTOCAD_MCP_AUTOSTART": "false",
         "AUTOCAD_MCP_VISIBLE": "true",
         "AUTOCAD_MCP_WINDOW_MODE": "minimized",
         "AUTOCAD_MCP_ACTIVATE_ON_DRAW": "false",
-        "AUTOCAD_MCP_OUTPUT_ROOT": "D:/CAD-Automation"
+        "AUTOCAD_MCP_OUTPUT_ROOT": "D:/CAD-Automation",
+        "AUTOCAD_MCP_ACTIVITY_INSIGHTS_PATH": "D:/CAD-Automation/activity-insights"
       }
     }
   }

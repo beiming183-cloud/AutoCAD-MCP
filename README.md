@@ -3,7 +3,7 @@
 **Reliable AutoCAD automation for AI agents, with checked geometry, native 3D, and delivery evidence.**
 
 [![Tests](https://github.com/beiming183-cloud/AutoCAD-MCP/actions/workflows/tests.yml/badge.svg)](https://github.com/beiming183-cloud/AutoCAD-MCP/actions/workflows/tests.yml)
-[![Version](https://img.shields.io/badge/version-3.10.0-0B7285)](https://github.com/beiming183-cloud/AutoCAD-MCP/releases)
+[![Version](https://img.shields.io/badge/version-3.10.1-0B7285)](https://github.com/beiming183-cloud/AutoCAD-MCP/releases)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-2F855A)](LICENSE)
 
@@ -46,6 +46,11 @@ The server exposes **11 consolidated tools** (`drawing`, `entity`, `solid`, `pro
 
 This edition is based on [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp) and retains its MIT license. Version 3.10 adds a reliable document core, checked transactions, industrial-product contracts, native B-rep features, motion semantics, fixed-camera evidence, semantic DRC, and independent product-design review verdicts.
 
+For startup failures caused by a damaged Python COM environment, an orphaned
+`acad.exe`, or Activity Insights permissions, use the [Windows AutoCAD recovery
+runbook](docs/WINDOWS-AUTOCAD-RECOVERY.md). `system(operation="preflight")` is
+read-only and does not start AutoCAD.
+
 ## Prerequisites (File IPC backend)
 
 - **Windows 10/11** (the File IPC backend uses Win32 APIs for focus-free window messaging)
@@ -72,7 +77,7 @@ Open AutoCAD or AutoCAD LT and load `mcp_dispatch.lsp` using **APPLOAD**:
 1. Type `APPLOAD` in the AutoCAD command line
 2. Browse to `<repo>/lisp-code/mcp_dispatch.lsp`
 3. Click **Load**
-4. You should see: `=== MCP Dispatch v3.10.0 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
+4. You should see: `=== MCP Dispatch v3.10.1 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
 
 > **Tip:** Add the file to your AutoCAD Startup Suite (in the APPLOAD dialog) so it loads automatically with every drawing.
 
@@ -107,10 +112,12 @@ The same server command can be used in Claude Code project-level `.mcp.json`:
       "env": {
         "PYTHONPATH": "C:\\path\\to\\autocad-mcp\\src",
         "AUTOCAD_MCP_BACKEND": "file_ipc",
-        "AUTOCAD_MCP_AUTOSTART": "true",
+        "AUTOCAD_MCP_AUTOSTART": "false",
         "AUTOCAD_MCP_VISIBLE": "true",
         "AUTOCAD_MCP_WINDOW_MODE": "minimized",
-        "AUTOCAD_MCP_ACTIVATE_ON_DRAW": "false"
+        "AUTOCAD_MCP_ACTIVATE_ON_DRAW": "false",
+        "AUTOCAD_MCP_OUTPUT_ROOT": "D:/CAD-Automation",
+        "AUTOCAD_MCP_ACTIVITY_INSIGHTS_PATH": "D:/CAD-Automation/activity-insights"
       }
     }
   }

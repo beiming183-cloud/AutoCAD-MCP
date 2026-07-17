@@ -154,12 +154,19 @@ def _error(
     else:
         hint = "Unexpected error. Check AutoCAD is responsive and retry."
 
-    code = "E_SYSTEM_CALL_FAILED" if getattr(e, "errno", None) is not None else None
+    code = getattr(e, "error_code", None)
+    custom_details = getattr(e, "details", None)
+    if code is None and getattr(e, "errno", None) is not None:
+        code = "E_SYSTEM_CALL_FAILED"
+    if code == "E_PYWIN32_BROKEN":
+        hint = "Repair pywin32 in the exact Windows Python used by this MCP, then restart the MCP process."
+    elif code == "E_AUTOCAD_PROFILE_UNWRITABLE":
+        hint = "Make the Activity Insights directory writable, set AUTOCAD_MCP_ACTIVITY_INSIGHTS_PATH, or disable Activity Insights before restarting AutoCAD."
     return tool_error(
         msg,
         code=code,
         recommended_action=hint,
-        details=details,
+        details=custom_details or details,
     )
 
 

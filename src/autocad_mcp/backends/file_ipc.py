@@ -32,6 +32,12 @@ from autocad_mcp.config import DOCUMENT_TIMEOUT, IPC_DIR, IPC_TIMEOUT, LISP_DIR,
 from autocad_mcp.drafting import encode_autocad_text
 from autocad_mcp.errors import LayerNotFoundError, exception_context
 from autocad_mcp.product_design import feature_bounds, normalize_feature
+from autocad_mcp.runtime_health import (
+    RuntimeHealthError,
+    activity_insights_write_preflight,
+    list_autocad_processes,
+    win32_runtime_health,
+)
 from autocad_mcp.variables import mechanical_variable_updates, validate_variable_updates
 
 log = structlog.get_logger()
@@ -457,13 +463,43 @@ class FileIPCBackend(AutoCADBackend):
 
     async def ensure_ready(self) -> CommandResult:
         """Discover, start, connect, load, handshake, and ping AutoCAD."""
+        runtime = win32_runtime_health()
+        if sys.platform == "win32" and not runtime["ok"]:
+            return CommandResult(
+                ok=False,
+                error="The pywin32 runtime required for AutoCAD COM is unhealthy",
+                error_code="E_PYWIN32_BROKEN",
+                recoverable=False,
+                recommended_action="repair_pywin32_in_the_same_python_used_by_the_mcp",
+                payload={"runtime": runtime},
+            )
+
+        processes = list_autocad_processes()
         self._hwnd = find_autocad_window()
         if not self._hwnd:
+            if processes:
+                return CommandResult(
+                    ok=False,
+                    error="acad.exe is alive but exposes no usable main window",
+                    error_code="E_AUTOCAD_GHOST_PROCESS",
+                    recoverable=True,
+                    recommended_action="terminate_or_close_orphaned_acad_process_then_start_autocad_manually",
+                    payload={"autocad_processes": processes},
+                )
             prior_crash = detect_autocad_crash_state(None, self._acad_process_id)
             if prior_crash.get("crashed"):
                 return self._autocad_crashed_result(prior_crash, "system.ensure_ready")
             try:
                 self._hwnd = _autostart_autocad(find_autocad_window)
+            except RuntimeHealthError as exc:
+                return CommandResult(
+                    ok=False,
+                    error=str(exc),
+                    error_code=exc.error_code,
+                    recoverable=False,
+                    recommended_action=exc.recommended_action,
+                    payload=exc.details,
+                )
             except Exception as exc:
                 crash = detect_autocad_crash_state(None, self._acad_process_id)
                 if crash.get("crashed"):
@@ -494,6 +530,7 @@ class FileIPCBackend(AutoCADBackend):
                 error_code=document.get("error_code", "E_NO_ACTIVE_DOCUMENT"),
                 payload=document.get("details"),
             )
+        activity_policy = self._apply_activity_insights_policy()
         self._product_info = self._discover_product()
 
         # Set up screenshot provider
@@ -580,6 +617,7 @@ class FileIPCBackend(AutoCADBackend):
                     "active_document": document["name"],
                     "active_document_path": document.get("path"),
                     "created_first_document": document.get("created_first_document", False),
+                    "activity_insights": activity_policy,
                 },
                 "dispatcher": {
                     "loaded": True,
@@ -593,6 +631,47 @@ class FileIPCBackend(AutoCADBackend):
                 "visibility": visibility,
             },
         )
+
+    def _apply_activity_insights_policy(self) -> dict:
+        """Persist an optional Activity Insights policy for the next restart."""
+        disable = os.environ.get("AUTOCAD_MCP_DISABLE_ACTIVITY_INSIGHTS", "").strip().lower() in (
+            "1", "true", "yes", "on"
+        )
+        configured_path = os.environ.get("AUTOCAD_MCP_ACTIVITY_INSIGHTS_PATH", "").strip()
+        if not disable and not configured_path:
+            return {"configured": False}
+        result = {
+            "configured": True,
+            "disable_requested": disable,
+            "path_requested": configured_path or None,
+            "restart_required": True,
+            "applied": {},
+            "errors": [],
+        }
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            document = win32com.client.GetActiveObject("AutoCAD.Application").ActiveDocument
+            if disable:
+                document.SetVariable("ACTIVITYINSIGHTSSUPPORT", 0)
+                result["applied"]["ACTIVITYINSIGHTSSUPPORT"] = document.GetVariable(
+                    "ACTIVITYINSIGHTSSUPPORT"
+                )
+            if configured_path:
+                document.SetVariable("ACTIVITYINSIGHTSPATH", configured_path)
+                result["applied"]["ACTIVITYINSIGHTSPATH"] = str(
+                    document.GetVariable("ACTIVITYINSIGHTSPATH")
+                )
+        except Exception as exc:
+            result["errors"].append(
+                {
+                    "exception_type": type(exc).__name__,
+                    "message": str(exc) or type(exc).__name__,
+                }
+            )
+        return result
 
     async def status(self) -> CommandResult:
         crash = detect_autocad_crash_state(self._hwnd, self._acad_process_id)
