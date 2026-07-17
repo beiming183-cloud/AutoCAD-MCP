@@ -15,6 +15,7 @@ Treat product design as the primary task and mechanical drafting as the engineer
 - Express aesthetics as testable form language: proportion, silhouette, mass hierarchy, geometry vocabulary, line and surface relationships, transitions, boundaries, detail density, CMF, and 360-degree coherence.
 - Keep editable parametric native CAD as engineering truth. Renders, meshes, images, plots, and exchange files are derived evidence.
 - Never infer manufacturing-critical dimensions, material performance, tolerances, safety distances, or compliance from appearance alone.
+- Lock the product's immutable design DNA before optimization. Do not solve usability, packaging, cost, or engineering pressure by silently deleting the defining innovation.
 - Label every output by maturity. A concept is not a manufacturable design, and automated checks do not grant release approval.
 - Never treat body count, entity count, dimension audit, geometry DRC, or save success as proof that proportion, form language, interface integration, motion logic, surface quality, or product realism is acceptable.
 
@@ -36,12 +37,13 @@ Treat product design as the primary task and mechanical drafting as the engineer
 7. For refined industrial-design 3D, ports, controls, rotating products, motion states, or presentation renders, read `references/industrial-design-3d-quality.md`.
 8. For a large local CAD/JPG corpus, read `references/local-cad-reference-library.md`. Generate a private manifest with `scripts/catalog_reference_library.py`; use `references/local-reference-library.example.json` as the portable schema and do not commit personal absolute paths.
 9. For concept selection, stage review, prototype review, or design audit, read `references/integrated-design-review.md`.
-10. For a new consumer product, enclosure, appliance, controls, ports, cables, moving parts, or mains-powered product, also read `references/consumer-product-concept.md`.
-11. For parametric parts, surfaces, assemblies, motion, or 3D delivery, read `references/cad-3d-modeling.md`; for evidence tiers and 2D/3D workflows, read `references/cad-workflows.md`.
-12. For complex mechanisms or multi-system assemblies, read `references/complex-assembly-drafting.md`; for physical-performance claims, read `references/engineering-analysis.md`.
-13. For DRC, DFM, fit, interference, tolerance, or release review, read `references/drc-review.md`; for GPS, GD&T, or inspection, read `references/gps-inspection.md`.
-14. Before GB/T engineering drawings, read `references/gbt-drafting.md`; for AutoCAD or AutoCAD MCP execution, also read `references/autocad-mcp-workflow.md`.
-15. For configurations, BOMs, revisions, MBD/PMI, dependencies, or formal packages, read `references/product-definition-release.md`.
+10. After user rejection, a gate escape, repeated misalignment, unequal repeated features, impractical layout, or an unattractive result, read `references/failure-learning.md` and update the owning gate.
+11. For a new consumer product, enclosure, appliance, controls, ports, cables, moving parts, or mains-powered product, also read `references/consumer-product-concept.md`.
+12. For parametric parts, surfaces, assemblies, motion, or 3D delivery, read `references/cad-3d-modeling.md`; for evidence tiers and 2D/3D workflows, read `references/cad-workflows.md`.
+13. For complex mechanisms or multi-system assemblies, read `references/complex-assembly-drafting.md`; for physical-performance claims, read `references/engineering-analysis.md`.
+14. For DRC, DFM, fit, interference, tolerance, or release review, read `references/drc-review.md`; for GPS, GD&T, or inspection, read `references/gps-inspection.md`.
+15. Before GB/T engineering drawings, read `references/gbt-drafting.md`; for AutoCAD or AutoCAD MCP execution, also read `references/autocad-mcp-workflow.md`.
+16. For configurations, BOMs, revisions, MBD/PMI, dependencies, or formal packages, read `references/product-definition-release.md`.
 
 Load only the references required for the current task.
 
@@ -86,6 +88,8 @@ Record users, scenarios, task flow, functions, interfaces, loads and environment
 
 When inputs are missing, complete low-cost work that does not depend on them and constrain the maturity. Do not fill gaps with false precision.
 
+Before detailed CAD, explicitly record user scenarios, interface types and counts, adapter or mating-object envelope assumptions, cable directions, motion actions and states, occupied footprint and context, tipping risks, product character, and immutable design DNA. Run `scripts/check_pre_cad_brief.py` when a structured brief is available. A failed `PRE_CAD_DESIGN_GATE` permits only research, sketches, provisional envelopes, and comparison massing.
+
 ### 3. Analyze references and existing product language
 
 Use `reference-image-learning.md`. Record visible facts before interpreting intent. Add only user-confirmed preferences to the confirmed section of `aesthetic-profile.md`; keep agent inference labeled with evidence and confidence.
@@ -93,6 +97,8 @@ Use `reference-image-learning.md`. Record visible facts before interpreting inte
 ### 4. Establish system architecture and envelopes
 
 Define functional blocks, energy, motion, signal and material flows, major components, purchased parts, interfaces, assembly direction, service paths, cables or hoses, thermal paths, motion sweeps, and hazard keep-outs. Create a named-parameter envelope skeleton before surface detail.
+
+Create a dimension-authority register using levels A, B, C, and D from `research-authority.md`. Treat regulated or certification-critical interface geometry as confirmed only with level A controlled authority or level C controlled measurement. Public brand parameters and concept assumptions may guide exploration but cannot authorize detailed openings, terminals, protective devices, or moving electrical contacts. Run `scripts/check_dimension_authority.py` when the register is structured.
 
 ### 5. Generate and compare concepts
 
@@ -127,6 +133,8 @@ Model only overall dimensions, support footprint, primary and secondary masses, 
 
 Stop after the first massing preview. If the product still reads as stacked boxes, trays, exposed slabs, or unrelated primitives, return to architecture and form exploration. Do not continue by adding dimensions, labels, colors, or tertiary detail.
 
+For consumer-product 3D, plan the complete review set before refinement: front, side, top, controlled three-quarter, key motion state, interface close-up, section, and exploded or hierarchy view. Mark a genuinely inapplicable view `NOT_APPLICABLE` with a reason; never omit it silently.
+
 ### 9. Co-develop structure, form, and process
 
 Add one logical feature or subsystem at a time. Integrate wall strategy, stiffness, locating, fastening, sealing, clearances, motion, assembly sequence, tool access, service, routing, heat, and manufacturing direction. Add only enough detail to answer the current risk.
@@ -153,6 +161,8 @@ Create GB/T drawings only after the design reaches the maturity the drawing clai
 
 After feedback, update the brief, selection rationale, parameters, risks, aesthetic profile, and affected validation. Repair the smallest responsible source operation; never hide a source problem in a render or drawing.
 
+When feedback reports poor appearance, poor practicality, misalignment, unequal repeated features, or another escaped defect, complete `failure-learning.md`. Record the escaped gate, root cause, containment, permanent process or Skill change, and next-version verification before claiming the issue closed.
+
 ## Output Contract by Maturity
 
 - `discovery package`: brief, contradictions, TBDs, user flow, constraints, and opportunities.
@@ -169,6 +179,8 @@ In the final response, state the design decisions, their evidence, what the user
 Use these scripts when their input contract is available:
 
 - `scripts/check_document_identity.py`: compare requested and actual document, revision, configuration, units, and source identity.
+- `scripts/check_pre_cad_brief.py`: require the design-specific brief fields and immutable design DNA before detailed CAD.
+- `scripts/check_dimension_authority.py`: enforce A/B/C/D source grades and TBD behavior for critical interface geometry.
 - `scripts/check_interface_alignment.py`: compare 2D and 3D interface types, centers, sizes, orientations, and shared parameter source.
 - `scripts/validate_motion_states.py`: verify joint definitions, required named states, limits, collision, cable, and interface dispositions.
 - `scripts/compare_render_viewset.py`: verify source identity, camera invariance, image dimensions, nonblank output, and expected visual change.

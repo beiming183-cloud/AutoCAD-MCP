@@ -85,6 +85,20 @@ Instantiate these semantic topology rules when applicable:
 
 Concept and schematic drawings must still have zero unexplained findings for these rules. Reduced detail is not reduced topology integrity.
 
+### Semantic intent and graphical exceptions
+
+Geometry DRC does not automatically understand design semantics. Before classifying open ends or crossings, create an intent manifest that assigns each relevant entity a component, view, configuration or motion state, line class, graphical role, and owning region. Include explicit flags for arrowheads, motion ghosts, break lines, leaders, hatches, construction geometry, title blocks, tables, and permitted visual crossings.
+
+Use these per-finding dispositions:
+
+- `DEFECT`: unintended geometry or presentation error that must be repaired at the owning source.
+- `INTENTIONAL_GRAPHIC`: an individually identified graphical element whose open end or crossing is required by the declared drawing semantics.
+- `VALIDATOR_LIMITATION`: the checker cannot resolve the declared view, state, clipping, or annotation semantics; preserve the raw finding and require bounded human review.
+- `WAIVED`: an authorized, revision-bound exception with justification and revalidation condition.
+- `UNRESOLVED`: insufficient evidence; release-blocking.
+
+Do not delete or globally suppress raw findings to obtain a clean count. A motion arrow, ghosted state, or title-block crossing may be intentional only when its exact handles/entities, role, view, and location match the manifest. If the checker cannot distinguish them, report the raw count, the individually reviewed dispositions, and the residual unresolved count; do not claim that geometry DRC is fully clean.
+
 ### Gate 3: drawing DRC
 
 - Projection method, view identity/alignment, 2D/3D and cross-view consistency, section truth, hidden/center lines, and feature multiplicity.
@@ -200,6 +214,7 @@ consumer_product_gate_status:
 product_design_review_status:
 component_id_and_line_class:
 intentional_open_end_or_crossing_basis:
+finding_disposition: DEFECT | INTENTIONAL_GRAPHIC | VALIDATOR_LIMITATION | WAIVED | UNRESOLVED
 status: PASS | FAIL | WARNING | NOT_EVALUATED | ERROR
 severity:
 requirement_source:

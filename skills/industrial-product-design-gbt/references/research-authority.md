@@ -46,6 +46,37 @@ Never cite a search-result title as evidence. Open the source, verify identity a
 - Check national adoption, amendments, product-family standards, market, and transition dates.
 - Mark a rule `NOT_EVALUATED` when the applicable edition or licensed content is unavailable.
 
+## Dimension Authority Levels
+
+Assign every decision-driving dimension one authority level and preserve the exact source identity:
+
+- `A`: authorized normative text, current supplier-controlled drawing or CAD, or an approved project-controlled drawing. Record edition/revision, applicability, and access boundary.
+- `B`: official catalog, official brand page, or public manufacturer parameter. Use for product identity, rating, configuration, and search direction only within the published claim.
+- `C`: controlled measurement of an identified physical sample using a stated datum, method, instrument, resolution, repeatability, sample count, and condition.
+- `D`: concept assumption, visual estimate, generic library geometry, remembered value, or exploratory envelope.
+
+The letters identify source classes; they are not a simple quality ranking. For manufacturing-critical, regulated, mating, mounting, protective, terminal, or moving electrical-contact geometry, only `A` or applicable `C` may support `CONFIRMED`. If the available evidence is `B` or `D`, set the dimension status to `TBD` and restrict it to provisional concept work.
+
+Standard identity, edition, and applicability do not expose hidden normative dimensions. A public catalog entry can confirm that a standard exists without authorizing remembered or image-derived values. Likewise, a brand page may support a published rating, form factor, or feature direction but not unpublished socket holes, protective shutters, terminals, installation holes, USB cutouts, or internal copper geometry.
+
+When a regulated interface lacks A or C evidence, model a named certified-module reservation envelope with installation data `TBD`; do not hand-draw a plausible interface pattern. Run `scripts/check_dimension_authority.py` on a structured register.
+
+Use this record for each dimension:
+
+```text
+dimension_id:
+dimension_kind:
+category:
+value_and_units:
+status: CONFIRMED | TBD
+authority_level: A | B | C | D
+authority_basis:
+source_id_and_revision:
+datum_and_method:
+applicability_and_limitations:
+owning_parameter:
+```
+
 ## Open-Source Tool Use
 
 - Verify the repository owner, archived status, current maintenance, documentation, license, default branch, and release or commit used.

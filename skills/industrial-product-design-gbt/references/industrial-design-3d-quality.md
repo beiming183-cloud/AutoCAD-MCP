@@ -54,6 +54,8 @@ For an `industrial-design candidate`, additionally require as applicable:
 
 If the backend exposes only boxes, cylinders, extrude, and basic boolean, limit output to `massing`. Do not simulate refined authority with 2D polygons, Pillow pseudo-3D, manual perspective linework, or painted highlights.
 
+If native fillet/chamfer, true projected views, sectioning, component-state transforms, material boundaries, or exploded hierarchy are absent or unreliable, state each missing capability and downgrade the corresponding evidence. Primitive solids can communicate packaging and motion envelopes, but they must not be presented as a finished consumer-product model.
+
 Record missing operations as blockers or `NOT_EVALUATED`. Switch to a capable backend when refined 3D is required.
 
 ## Gate 2 - DOCUMENT_IDENTITY_GATE
@@ -192,6 +194,19 @@ Run `scripts/compare_render_viewset.py` for revision-bound review sets. Preserve
 Use `assets/camera-presets.json` as a normalized starting convention when the active backend has no approved project preset. Map directions into the product coordinate frame and record the actual native cameras.
 
 ## Gate 10 - DESIGN_REVIEW_GATE
+
+Require this view set for every consumer-product 3D review:
+
+- front, side, and top orthographic views at controlled scale;
+- one controlled three-quarter view;
+- every key motion or rotated state needed to understand use;
+- a local interface/detail close-up;
+- a section view proving recess, wall, module, and internal hierarchy;
+- an exploded view or component-hierarchy view proving part ownership and assembly logic.
+
+Mark a genuinely inapplicable motion, section, or exploded view `NOT_APPLICABLE` with a reason and reviewer. Do not silently omit a difficult view or substitute an unrelated diagram.
+
+Across the set, check that interfaces are centered to the intended datum, repeated USB or similar openings are equal and share one parameter source, fillets and chamfers are actual model geometry, rotation gaps and shadow reveals remain visible, component levels are understandable, projection and occlusion are correct, and the proportions read as a resolved product rather than a decorated box.
 
 Give separate dispositions for:
 

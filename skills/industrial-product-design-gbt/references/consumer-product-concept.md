@@ -40,6 +40,9 @@ Create a decision brief containing at least:
 - `actions`: ordered user tasks, grip/contact areas, viewing direction, actuation direction, expected force/torque source, feedback, recovery from error, and maintenance actions.
 - `cables`: entry/exit direction, connector orientation, bend direction/radius source, strain relief, pull/trip exposure, slack storage, separation, and routing through every relevant product state.
 - `product_intent`: desired product character, brand or family cues, environment, cost/size targets, visual priorities, and unacceptable forms.
+- `adapter_and_mating_envelopes`: explicit dimensions or TBD assumptions for large plugs, adapters, connectors, hands, tools, and simultaneous use.
+- `footprint_and_stability`: occupied desk or installation area, support polygon, mass uncertainty, cable/user forces, moving masses, and tipping test needs.
+- `design_dna`: immutable innovation, adjustable variables, prohibited substitutions, authority, and regression views.
 
 `CONSUMER_CONCEPT_GATE` fails while any scope-defining field is absent or contradictory. Before it passes, create only research sketches, block envelopes, and explicitly provisional concept dimensions. Do not create a detailed dimension drawing or describe the result as manufacturing-ready.
 
@@ -73,6 +76,8 @@ For each part, record manufacturer, part number, datasheet/drawing/CAD revision,
 
 `PURCHASED_PART_ENVELOPE` passes only when the dimensions used by detailed CAD are traceable to a current supplier source or a controlled physical measurement. A web thumbnail, approximate marketplace listing, or visually estimated model is not evidence. Keep unverified mounting dimensions as `TBD`; a provisional bounding envelope may support concept comparison but must be labeled and cannot authorize manufacturing geometry.
 
+Apply the A/B/C/D dimension authority levels from `research-authority.md`. Do not draw regulated socket holes, protective shutters, terminals, USB module cutouts, installation holes, or rotating electrical contacts from memory, product photography, a public brand page, or a generic CAD block. Without level A controlled data or level C controlled measurement, reserve a named certified-module envelope and keep installation geometry `TBD`.
+
 ## Gate 3: Mains and Moving-Part Safety Architecture
 
 Trigger `MAINS_SAFETY_GATE` when the product connects to mains, contains or switches mains, uses a mains-powered motor/heater, routes power through a moving or rotating interface, exposes hazardous energy, or has moving parts that can pinch, entangle, cut, eject, or destabilize the product.
@@ -90,6 +95,20 @@ Before detailed mechanical design, identify at least:
 - Preliminary hazard log, verification plan, unresolved decisions, and the evidence needed from a qualified safety/compliance review.
 
 Until this architecture is defined, limit output to an exterior concept and clearly separated hazard/keep-out envelopes. Do not release internal mounting geometry, claim manufacturability, or represent the design as safe, compliant, or certifiable.
+
+### Rotating mains-power interface
+
+When rotation crosses L, N, PE, or another hazardous-energy path, do not treat the joint as an appearance seam. Define and assign evidence owners for:
+
+- conductor topology through every state and protective-earth continuity where applicable;
+- contact technology, current path, contact resistance, voltage drop, temperature rise, and abnormal-current behavior;
+- bearing and conductor separation, insulation, creepage/clearance source, touch protection, barriers, and debris containment;
+- wear, oxidation, fretting, arcing, contamination, dust, lubrication compatibility, life cycles, and end-of-life failure mode;
+- detents, stops, torque, misuse, over-rotation, cable twist, pinching, loose parts, service access, and assembly error;
+- single-fault behavior, loss of PE, stuck or intermittent contact, conductive wear debris, overheating, and fire containment;
+- prototype sequence and qualified electrical, thermal, endurance, abnormal-operation, and compliance review.
+
+Until this architecture and its evidence plan exist, show only exterior form, rotation envelopes, and a clearly labeled hazardous-interface reservation. Do not imply that a visually plausible bearing ring or rotary contact is electrically viable.
 
 Passing this gate means only that the mechanical concept has a traceable preliminary safety architecture. It is not product certification and does not replace applicable laboratory tests, risk assessment, electrical design review, or authorized approval.
 

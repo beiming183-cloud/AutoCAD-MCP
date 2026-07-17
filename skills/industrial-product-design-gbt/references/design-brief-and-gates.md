@@ -20,6 +20,28 @@ Create a concise, revision-controlled decision brief:
 
 Mark each item `supplied`, `derived`, `assumed-for-exploration`, `TBD`, or `conflict`, with its source.
 
+## PRE_CAD_DESIGN_GATE
+
+Before detailed CAD, output a compact, reviewable record containing all of these fields:
+
+- `user_scenarios`: who uses the product, where, for what tasks, and in which normal, abnormal, cleaning, transport, storage, and service states.
+- `interface_inventory`: every interface type, count, orientation, access direction, and simultaneous-use assumption.
+- `adapter_and_mating_envelopes`: plug, adapter, hand, tool, cable, connector, accessory, or mating-product dimensions; label every unverified value as an assumption or `TBD`.
+- `cable_directions`: entry, exit, bend, strain-relief, pull, storage, snag, and motion-state routing.
+- `motion_actions`: user action, axis, range, intermediate states, stops, locks, feedback, pinch zones, and state-dependent access. Use a justified `NOT_APPLICABLE` record for fixed products.
+- `footprint_and_context`: occupied desk, floor, wall, appliance, or installation envelope, including surrounding use and service space.
+- `stability_and_tip_risks`: support polygon, mass uncertainty, cable and user forces, moving masses, friction assumptions, edge loading, and the test still required.
+- `product_character`: intended personality, brand or family relationship, visual priorities, unwanted expressions, and expected level of product realism.
+- `design_dna`: immutable features, adjustable variables, prohibited substitutions, rationale, authority, and regression views.
+
+Run `scripts/check_pre_cad_brief.py` when these fields are serialized. Presence is only the first gate: contradictory, unsupported, or unusable content still fails human review. Until this gate passes, permit only research, sketches, provisional envelopes, and concept massing; do not create detailed openings, fillets, production dimensions, or manufacturing claims.
+
+## Immutable Design DNA
+
+Record the defining innovation before optimization. Examples include equal-section column geometry, identical upper and lower footprints, non-tower posture, layered rotation, required interface families, or vertical use. Treat each item as pass/fail in concept comparison, massing review, and every later regression view.
+
+Change an immutable item only when the recorded decision authority explicitly approves the change and the brief revision explains why. Do not trade away design DNA merely because a conventional architecture is easier to package, render, dimension, or manufacture.
+
 ## Conflict Priority
 
 Use this order to expose conflicts, not to excuse weak design:
@@ -37,7 +59,7 @@ Seek a new architecture when goals conflict. When no architecture resolves them,
 
 ### G0 - Brief Ready
 
-The brief can distinguish success from failure, and major conflicts and unknowns are visible. Before this gate, limit work to research, sketches, and provisional envelopes.
+The brief passes `PRE_CAD_DESIGN_GATE`, can distinguish success from failure, protects immutable design DNA, and exposes major conflicts and unknowns. Before this gate, limit work to research, sketches, provisional envelopes, and comparison massing.
 
 ### G1 - Architecture Plausible
 
