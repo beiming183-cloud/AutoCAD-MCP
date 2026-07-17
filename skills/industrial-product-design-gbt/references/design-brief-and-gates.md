@@ -1,6 +1,6 @@
-# Mechanical Product Design Brief and Gates
+# Industrial Product Design Brief and Gates
 
-Read this file for a new mechanical product, major redesign, or any task that must develop an ambiguous goal into a defensible design.
+Read this file for a new physical product, major redesign, or any task that must develop an ambiguous goal into a defensible industrial-design direction.
 
 ## Design Brief
 

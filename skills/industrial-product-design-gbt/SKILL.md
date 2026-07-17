@@ -1,9 +1,9 @@
 ---
-name: mechanical-design-gbt
-description: Develop industrial and mechanical products from design intent through concept selection, proportion, form language, interfaces, motion states, CMF, refined native 3D, product rendering, engineering validation, DFM, and GB/T drawing handoff. Use for consumer products, appliances, enclosures, controls, ports, rotating mechanisms, equipment, assemblies, redesign from reference images, aesthetic direction, 3D product-quality review, prototype planning, or any task where Codex must create or improve the product rather than only document existing geometry.
+name: industrial-product-design-gbt
+description: Create and review industrial design and physical product design from brief through concept selection, product architecture, proportion, form language, ergonomics, human factors, controls, interfaces, CMF, parametric CAD, refined native 3D, surface quality, product rendering, motion states, engineering validation, DFM, and revision-bound GB/T handoff. Use for consumer products, consumer electronics, appliances, smart-home hardware, enclosures, tools, equipment, rotating mechanisms, reference-image redesign, aesthetic direction, prototype planning, 3D product-quality review, or any task where Codex must design or improve a physical product before mechanical drafting and manufacturing release.
 ---
 
-# Mechanical Product Design with GB/T Handoff
+# Industrial Product Design with GB/T Handoff
 
 Treat product design as the primary task and mechanical drafting as the engineering expression of a sufficiently resolved design. Decide who the product serves, what it must do, how it is used, why it has its form, and how it will be made and verified before detailed CAD and drawings.
 

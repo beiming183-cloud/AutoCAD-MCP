@@ -1,4 +1,4 @@
-# Integrated Mechanical Product Design Review
+# Integrated Industrial Product Design Review
 
 Read this file for concept comparison, direction freeze, skeleton review, detailed design review, prototype review, or release-candidate review.
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Industrial Product Design with GB/T Handoff"
+  short_description: "Industrial form, refined 3D, review, and GB/T handoff"
+  default_prompt: "Use $industrial-product-design-gbt to develop and review this physical product from concept and refined native 3D through a revision-bound GB/T engineering handoff."
