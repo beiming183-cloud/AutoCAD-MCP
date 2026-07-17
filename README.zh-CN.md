@@ -9,7 +9,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-![由 AutoCAD-MCP 生成并通过 AutoCAD 原生渲染的 3D 轴承座板](docs/assets/autocad-mcp-showcase.png)
+![由 AutoCAD-MCP 生成并通过 AutoCAD 原生渲染的 3D 旋转执行器](docs/assets/autocad-mcp-actuator-promo.png)
 
 AutoCAD-MCP 可以把 Codex、Claude Code、Claude Desktop、Cursor 及其他标准 MCP 客户端连接到完整版 AutoCAD、AutoCAD LT 或无界面的 DXF 后端。它的重点不是“脚本没有报错”，而是让 Agent 能证明自己画了什么、保存了什么、交付文件是否与源图一致。
 
@@ -34,6 +34,16 @@ uv run python examples/headless_demo.py
 ```
 
 正常结果包含 `ok: true`、6 个实体和 `drc_status: PASS`。默认文件位于 `demo-output/`，也可通过 `AUTOCAD_MCP_OUTPUT_ROOT` 指定统一输出目录，例如 `D:/CAD-Automation`。
+
+## AutoCAD 原生 3D 宣传图
+
+在 AutoCAD 已由用户正常打开、MCP preflight 通过后，可以重现这张可编辑的旋转执行器宣传图：
+
+```powershell
+uv run python examples/generate_actuator_promo.py --record --pause 0.8
+```
+
+命令会在 AutoCAD 中逐步显示建模过程，生成固定等轴测 PNG，并保留最终文档。它是概念级 3D 能力展示，不等价于制造授权模型。
 
 ## 后端选择
 

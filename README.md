@@ -9,7 +9,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-![Native AutoCAD 3D bearing plate generated and rendered by AutoCAD-MCP](docs/assets/autocad-mcp-showcase.png)
+![Native AutoCAD 3D rotary actuator generated and rendered by AutoCAD-MCP](docs/assets/autocad-mcp-actuator-promo.png)
 
 AutoCAD-MCP connects Codex, Claude Code, Claude Desktop, Cursor, and any standard MCP client to full AutoCAD, AutoCAD LT, or a headless DXF backend. It is built for agents that must prove what they drew, not merely report that a script ran.
 
@@ -34,6 +34,19 @@ uv run python examples/headless_demo.py
 ```
 
 Expected result: `ok: true`, six entities, and `drc_status: PASS`. Outputs are written to `demo-output/` unless `AUTOCAD_MCP_OUTPUT_ROOT` is set.
+
+## Native AutoCAD Showcase
+
+With a healthy, manually opened AutoCAD session, reproduce the promotional
+rotary actuator as editable native solids:
+
+```powershell
+uv run python examples/generate_actuator_promo.py --record --pause 0.8
+```
+
+The command shows each modeling step in AutoCAD, renders a fixed isometric PNG,
+and leaves the final document open. It does not claim manufacturing authority;
+the model is a concept-level demonstration of checked native 3D operations.
 
 ## Choose a Backend
 
