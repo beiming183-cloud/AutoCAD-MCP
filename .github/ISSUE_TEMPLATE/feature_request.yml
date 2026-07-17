@@ -1,0 +1,26 @@
+name: Feature request
+description: Propose a bounded CAD capability or workflow improvement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What CAD task is currently difficult or unreliable?
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Proposed MCP contract
+      description: Suggested inputs, outputs, errors, readback, and rollback behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Acceptance evidence
+      description: How should the feature be tested and visually or geometrically verified?
+    validations:
+      required: true

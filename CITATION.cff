@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If AutoCAD-MCP supports your work, please cite the software repository."
+type: software
+title: "AutoCAD-MCP"
+version: 3.10.0
+date-released: 2026-07-17
+authors:
+  - family-names: "beiming183-cloud"
+repository-code: "https://github.com/beiming183-cloud/AutoCAD-MCP"
+url: "https://github.com/beiming183-cloud/AutoCAD-MCP"
+license: MIT
+keywords:
+  - AutoCAD
+  - CAD automation
+  - Model Context Protocol
+  - engineering drawing
+  - ezdxf

@@ -1,0 +1,16 @@
+changelog:
+  categories:
+    - title: New capabilities
+      labels:
+        - enhancement
+        - feature
+    - title: Reliability fixes
+      labels:
+        - bug
+        - reliability
+    - title: Documentation
+      labels:
+        - documentation
+    - title: Other changes
+      labels:
+        - "*"

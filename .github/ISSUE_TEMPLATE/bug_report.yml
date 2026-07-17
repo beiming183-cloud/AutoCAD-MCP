@@ -1,0 +1,49 @@
+name: Bug report
+description: Report a reproducible AutoCAD MCP defect
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend
+      options:
+        - Full AutoCAD / File IPC
+        - AutoCAD LT / File IPC
+        - ezdxf headless
+        - Unknown
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: AutoCAD MCP version
+      placeholder: 3.10.0
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include the MCP operation, parameters, and document context without secrets.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and structured error
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed private drawings, credentials, and personal paths from this report.
+          required: true

@@ -1,21 +1,50 @@
-# AutoCAD MCP Server
+# AutoCAD-MCP
 
-MCP server for full AutoCAD automation, AutoCAD LT automation, and headless DXF generation.
+**Reliable AutoCAD automation for AI agents, with checked geometry, native 3D, and delivery evidence.**
 
-Version 3.10 adds bounded industrial-product contracts on top of the reliable document core: analytic native-B-rep rounded products, controlled supplier-module reservations, rotary motion semantics, sampled clearance screening, fixed-camera native views with pixel/framing evidence, richer semantic DRC, and independent product-design review verdicts.
+[![Tests](https://github.com/beiming183-cloud/AutoCAD-MCP/actions/workflows/tests.yml/badge.svg)](https://github.com/beiming183-cloud/AutoCAD-MCP/actions/workflows/tests.yml)
+[![Version](https://img.shields.io/badge/version-3.10.0-0B7285)](https://github.com/beiming183-cloud/AutoCAD-MCP/releases)
+[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-2F855A)](LICENSE)
 
-Structured entity creation remains a checked transaction: request fields are strict and immutable, the created handle is read back, geometry and layer are compared, and a mismatch is deleted with `E_POSTCONDITION_MISMATCH`. Atomic batches roll back when any semantic postcondition fails.
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-This edition is based on [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp) and keeps its MIT license. It adds full AutoCAD COM command delivery, process-based window detection, optional AutoCAD startup, and session-scoped dispatcher loading.
+![Native AutoCAD 3D bearing plate generated and rendered by AutoCAD-MCP](docs/assets/autocad-mcp-showcase.png)
 
-Two backends, one API:
+AutoCAD-MCP connects Codex, Claude Code, Claude Desktop, Cursor, and any standard MCP client to full AutoCAD, AutoCAD LT, or a headless DXF backend. It is built for agents that must prove what they drew, not merely report that a script ran.
+
+## Why AutoCAD-MCP
+
+- **Checked writes:** strict inputs, handle readback, requested/actual diffs, document revisions, and rollback on failed postconditions.
+- **Useful CAD coverage:** structured 2D drawing, layers, dimensions, topology DRC, native AutoCAD solids and booleans, bounded product features, motion screening, and fixed-camera review views.
+- **Delivery evidence:** DWG/DXF/PDF/PNG outputs, exported-DXF re-audit, paper and scale verification, geometry digests, manifests, and SHA-256 hashes.
+- **Desktop friendly:** AutoCAD stays taskbar-visible but minimized by default, drawing does not steal focus, and preview/PDF viewers are not launched.
+- **Client neutral:** one stdio server for MCP clients; no Codex-only or Claude-only protocol.
+- **Honest limits:** unsupported edge selection, shelling, exact continuous motion, and material rendering are reported explicitly instead of being simulated.
+
+## Try It Without AutoCAD
+
+The headless demo creates a mechanical DXF, runs semantic DRC, renders a deterministic PNG, and prints the evidence:
+
+```powershell
+git clone https://github.com/beiming183-cloud/AutoCAD-MCP.git
+cd AutoCAD-MCP
+uv sync
+uv run python examples/headless_demo.py
+```
+
+Expected result: `ok: true`, six entities, and `drc_status: PASS`. Outputs are written to `demo-output/` unless `AUTOCAD_MCP_OUTPUT_ROOT` is set.
+
+## Choose a Backend
 
 | Backend | Runtime | Requires AutoCAD? | Validation feedback |
 |---------|---------|-------------------|------------|
 | **File IPC** | Windows Python | Yes - full AutoCAD or AutoCAD LT 2024+ | Topology audit + native PDF and direct PNG |
 | **ezdxf** | Any platform | No (headless) | Structured audit + deterministic PNG |
 
-The server exposes **11 consolidated tools** (`drawing`, `entity`, `solid`, `product`, `layer`, `block`, `annotation`, `pid`, `transaction`, `view`, `system`) over the standard MCP stdio transport. It is client-independent and works with Codex, Claude Code, Claude Desktop, Cursor, and other MCP-compatible clients.
+The server exposes **11 consolidated tools** (`drawing`, `entity`, `solid`, `product`, `layer`, `block`, `annotation`, `pid`, `transaction`, `view`, `system`) over standard MCP stdio.
+
+This edition is based on [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp) and retains its MIT license. Version 3.10 adds a reliable document core, checked transactions, industrial-product contracts, native B-rep features, motion semantics, fixed-camera evidence, semantic DRC, and independent product-design review verdicts.
 
 ## Prerequisites (File IPC backend)
 
@@ -126,7 +155,7 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 
 [`skills/industrial-product-design`](skills/industrial-product-design/SKILL.md) is a client-neutral upstream workflow for briefs, concept gates, product architecture, configurations, motion, camera/render evidence, and honest CAD capability checks. Install or reference that folder in any `SKILL.md`-compatible client, then use `mechanical-drafting-gbt` downstream for GB/T manufacturing definition and release.
 
-[`skills/mechanical-design-gbt`](skills/mechanical-design-gbt/SKILL.md) is the comprehensive variant. It adds research-source authority, human-factors evidence, form and surface review, backend routing, local reference-library indexing, and deterministic checks for document identity, 2D/3D interfaces, motion states, render viewsets, and revision-bound handoff manifests. Its personal library manifest is intentionally ignored; generate one locally from the included portable schema.
+[`skills/industrial-product-design-gbt`](skills/industrial-product-design-gbt/SKILL.md) is the comprehensive variant. It adds research-source authority, human-factors evidence, form and surface review, backend routing, local reference-library indexing, and deterministic checks for document identity, 2D/3D interfaces, motion states, render viewsets, and revision-bound handoff manifests. Its personal library manifest is intentionally ignored; generate one locally from the included portable schema.
 
 ## Tools
 

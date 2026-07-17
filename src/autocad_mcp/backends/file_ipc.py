@@ -2270,6 +2270,8 @@ class FileIPCBackend(AutoCADBackend):
                     layout.PlotWithPlotStyles = True
                 except Exception:
                     pass
+            else:
+                layout.PlotWithPlotStyles = False
 
             output.unlink(missing_ok=True)
             plotted = bool(document.Plot.PlotToFile(str(output), device))
