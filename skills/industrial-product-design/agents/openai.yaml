@@ -1,0 +1,5 @@
+interface:
+  display_name: "Industrial Product Design"
+  short_description: "Gate product concepts into credible industrial CAD"
+  default_prompt: "Use $industrial-product-design to define and validate an industrial product before drafting its release package."
+

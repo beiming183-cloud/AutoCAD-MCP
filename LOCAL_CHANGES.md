@@ -96,6 +96,44 @@
     actual fit/fixed plotting mode, and PDF generation never launches a viewer.
 42. `drawing.create` reports and verifies its requested and actual managed file
     name instead of silently returning `Drawing1.dwg`.
+43. AutoCAD process exit and fatal-error dialogs are classified as
+    `E_AUTOCAD_CRASHED`; they no longer fall through to `E_NO_ACTIVE_DOCUMENT`.
+44. First-document startup uses `Documents.Add` before reading `ActiveDocument`,
+    and dispatcher execution remains isolated in the external Python/File IPC process.
+45. `drawing.audit_dxf` bypasses backend initialization and parses DXF files fully
+    offline, including when AutoCAD is stopped or has no document.
+46. File and system-call errors carry operation, parameter fields, system call,
+    path, exception type, errno/winerror, system message, and recovery action.
+47. PDF plotting defaults to A3 landscape FIT and verifies the generated PDF
+    mediabox, detected paper, orientation, scale mode, document path, and output path.
+48. Runtime logs are mirrored to a BOM-prefixed UTF-8 file so Chinese Windows
+    PowerShell and text editors display diagnostic messages correctly.
+49. Active document identity is explicit and revision guarded. Mutating MCP calls
+    require `doc_id` plus `expected_revision` and reject wrong or stale contexts.
+50. Public `transaction.begin`, `transaction.commit`, and `transaction.rollback`
+    wrap AutoCAD undo marks; atomic batches retain all-or-nothing behavior.
+51. Missing layers fail before entity creation with `E_LAYER_NOT_FOUND` instead
+    of being auto-created or falling back to layer `0`.
+52. Validated delivery uses a read-only `Wblock` copy and verifies that document
+    ID and active path remain unchanged through DWG/DXF/PDF packaging.
+53. PDF and PNG outputs publish by same-directory temporary file plus atomic
+    rename. Locked targets return `E_OUTPUT_LOCKED` and leave no partial output.
+54. Native PNG output corrects device-specific portrait/landscape rotation and
+    reports the actual pixel orientation and whether correction occurred.
+55. `system.status` publishes an honest industrial capability matrix that keeps
+    unverified edge/face selection, shelling, assemblies, motion, analysis, and
+    offscreen material rendering out of the supported feature set.
+56. Regression coverage alternates two documents 100 times, checks independent
+    revisions, transaction state, batch rollback, missing-layer invariance,
+    delivery document isolation, locked output cleanup, and PNG orientation.
+57. Cold startup requires three consecutive reads of the same active document,
+    and dispatcher load/ping uses a bounded retry to absorb COM registration delay.
+58. PDF plotting guards the exact generated temporary filename, hides and closes
+    only its external viewer window, restores the last non-AutoCAD foreground
+    window, and records viewer suppression and focus-recovery evidence.
+59. When AutoCAD holds a plot source lock, publication copies to a second verified
+    temporary file and atomically renames that copy; final outputs remain complete
+    and locked destinations still return `E_OUTPUT_LOCKED`.
 
 ## MCP client registration
 

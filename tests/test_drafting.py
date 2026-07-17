@@ -32,6 +32,7 @@ def test_tangent_arc_is_solved_from_shared_geometry():
 async def test_mechanical_profile_creates_required_layers():
     backend = EzdxfBackend()
     await backend.initialize()
+    await backend.layer_create("OUTLINE")
 
     result = await backend.drawing_setup_mechanical()
 
@@ -44,6 +45,7 @@ async def test_mechanical_profile_creates_required_layers():
 async def test_structured_batch_creates_entities_and_resolves_last_handle():
     backend = EzdxfBackend()
     await backend.initialize()
+    await backend.layer_create("OUTLINE")
 
     result = await backend.create_batch(
         [

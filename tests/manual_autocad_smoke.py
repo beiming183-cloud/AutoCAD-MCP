@@ -1,4 +1,4 @@
-"""Manual minimized-AutoCAD smoke test for native v3.8 workflows."""
+"""Manual minimized-AutoCAD smoke test for native v3.9 workflows."""
 
 from __future__ import annotations
 
@@ -18,7 +18,6 @@ def _new_visible_document() -> str:
 
     pythoncom.CoInitialize()
     application = win32com.client.GetActiveObject("AutoCAD.Application")
-    application.Visible = True
     application.Documents.Add()
     deadline = time.monotonic() + 15.0
     last_error = None
@@ -173,12 +172,21 @@ async def run(output_root: Path, *, keep_artifacts: bool = False) -> dict:
     if audit.payload["geometry_drc"]["status"] != "PASS":
         raise RuntimeError({"message": "Smoke geometry DRC did not pass", "audit": audit.payload})
 
-    dwg_path = output_root / "v380-minimized-validation.dwg"
-    dxf_path = output_root / "v380-minimized-validation.dxf"
-    png_path = output_root / "v380-minimized-validation.png"
+    dwg_path = output_root / "v390-minimized-validation.dwg"
+    dxf_path = output_root / "v390-minimized-validation.dxf"
+    pdf_path = output_root / "v390-minimized-validation.pdf"
+    png_path = output_root / "v390-minimized-validation.png"
     saved = await backend.drawing_save(str(dwg_path))
     if not saved.ok:
         raise RuntimeError(saved.to_dict())
+    plotted = await backend.drawing_plot_pdf(
+        str(pdf_path), paper="A3", orientation="landscape", scale_mode="fit"
+    )
+    if not plotted.ok:
+        raise RuntimeError(plotted.to_dict())
+    viewer_guard = plotted.payload.get("viewer_guard") or {}
+    if viewer_guard.get("viewer_detected") and not viewer_guard.get("viewer_suppressed"):
+        raise RuntimeError({"message": "PDF viewer was detected but not suppressed", "viewer_guard": viewer_guard})
     exported = await backend.drawing_save_as_dxf(str(dxf_path))
     if not exported.ok or not exported.payload.get("active_document_preserved"):
         raise RuntimeError(exported.to_dict())
@@ -225,19 +233,22 @@ async def run(output_root: Path, *, keep_artifacts: bool = False) -> dict:
             "topology": audit.payload["geometry_drc"]["topology_graph"],
         },
         "dxf": exported.payload,
+        "pdf": plotted.payload,
         "preview": preview.payload,
         "artifacts": {
             "dwg": _artifact(dwg_path),
             "dxf": _artifact(dxf_path),
+            "pdf": _artifact(pdf_path),
             "png": _artifact(png_path),
         },
     }
-    record_path = output_root / "v380-minimized-validation.json"
+    record_path = output_root / "v390-minimized-validation.json"
     record_path.write_text(
         json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     if not keep_artifacts:
         _close_active_document()
+        deferred_removed = backend._cleanup_deferred_outputs(timeout=2.0)
         deleted = []
         cleanup_errors = []
         for path in output_root.iterdir():
@@ -250,12 +261,17 @@ async def run(output_root: Path, *, keep_artifacts: bool = False) -> dict:
                 cleanup_errors.append({"path": str(path), "error": str(exc)})
         summary["cleanup"] = {
             "test_document_closed": True,
+            "deferred_outputs_removed": deferred_removed,
             "artifacts_deleted": deleted,
             "errors": cleanup_errors,
         }
         record_path.write_text(
             json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8"
         )
+        if cleanup_errors:
+            raise RuntimeError(
+                {"message": "Smoke artifacts were not fully deleted", "cleanup": summary["cleanup"]}
+            )
     return summary
 
 

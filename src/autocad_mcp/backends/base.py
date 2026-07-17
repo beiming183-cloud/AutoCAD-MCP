@@ -5,8 +5,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
+import uuid
 
-from autocad_mcp.errors import error_payload
+from autocad_mcp.errors import LayerNotFoundError, error_payload
 from autocad_mcp.contracts import EntityExpectation, build_entity_expectation, compare_entity
 
 
@@ -77,6 +78,99 @@ class AutoCADBackend(ABC):
     async def status(self) -> CommandResult:
         """Return backend health/status info."""
 
+    def _local_document_state(self) -> dict[str, Any]:
+        state = getattr(self, "_document_state", None)
+        if state is None:
+            state = {
+                "doc_id": f"{self.name}-{uuid.uuid4().hex}",
+                "revision": 0,
+                "path": getattr(self, "_save_path", None),
+            }
+            setattr(self, "_document_state", state)
+        state["path"] = getattr(self, "_save_path", None) or state.get("path")
+        return state
+
+    async def document_context(self) -> CommandResult:
+        state = self._local_document_state()
+        return CommandResult(
+            ok=True,
+            payload={
+                "doc_id": state["doc_id"],
+                "active_doc_id": state["doc_id"],
+                "requested_path": state.get("path"),
+                "active_path": state.get("path"),
+                "revision": int(state["revision"]),
+                "backend": self.name,
+            },
+        )
+
+    async def require_document_context(
+        self, doc_id: str | None, expected_revision: int | None
+    ) -> CommandResult:
+        context = await self.document_context()
+        if not context.ok:
+            return context
+        actual = context.payload
+        if not doc_id:
+            return CommandResult(
+                ok=False,
+                error="A modifying operation requires doc_id",
+                error_code="E_PARAMETER_REJECTED",
+                recommended_action="read_document_context_and_retry",
+                payload={"required": ["doc_id", "expected_revision"], "actual": actual},
+            )
+        if str(doc_id) != str(actual["active_doc_id"]):
+            return CommandResult(
+                ok=False,
+                error="Requested document is not the active document",
+                error_code="E_DOCUMENT_ID_MISMATCH",
+                recoverable=False,
+                recommended_action="activate_the_requested_document_and_retry",
+                payload={"requested_doc_id": doc_id, "actual": actual},
+            )
+        if expected_revision is None or int(expected_revision) != int(actual["revision"]):
+            return CommandResult(
+                ok=False,
+                error="Requested document revision is stale or missing",
+                error_code="E_DOCUMENT_REVISION_MISMATCH",
+                recoverable=False,
+                recommended_action="read_latest_document_revision_and_retry",
+                payload={"expected_revision": expected_revision, "actual": actual},
+            )
+        return CommandResult(ok=True, payload=actual)
+
+    async def record_document_mutation(self, doc_id: str) -> CommandResult:
+        state = self._local_document_state()
+        if str(doc_id) != str(state["doc_id"]):
+            return CommandResult(
+                ok=False,
+                error="Cannot advance revision for a non-active document",
+                error_code="E_DOCUMENT_ID_MISMATCH",
+            )
+        state["revision"] = int(state["revision"]) + 1
+        return await self.document_context()
+
+    async def drawing_activate(self, doc_id: str) -> CommandResult:
+        context = await self.document_context()
+        if context.ok and context.payload["doc_id"] == doc_id:
+            return context
+        return CommandResult(ok=False, error="Document activation is not supported on this backend")
+
+    async def transaction_begin(
+        self, doc_id: str, expected_revision: int
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Transactions are not supported on this backend")
+
+    async def transaction_commit(
+        self, transaction_id: str, doc_id: str, expected_revision: int
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Transactions are not supported on this backend")
+
+    async def transaction_rollback(
+        self, transaction_id: str, doc_id: str, expected_revision: int
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Transactions are not supported on this backend")
+
     # --- Drawing management ---
 
     async def drawing_info(self) -> CommandResult:
@@ -84,6 +178,9 @@ class AutoCADBackend(ABC):
 
     async def drawing_save(self, path: str | None = None) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def drawing_copy_dwg(self, path: str) -> CommandResult:
+        return CommandResult(ok=False, error="Read-only DWG copy is not supported on this backend")
 
     async def drawing_save_as_dxf(self, path: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
@@ -97,8 +194,8 @@ class AutoCADBackend(ABC):
     async def drawing_plot_pdf(
         self,
         path: str,
-        paper: str = "A4",
-        orientation: str = "auto",
+        paper: str = "A3",
+        orientation: str = "landscape",
         plot_style: str = "monochrome.ctb",
         scale_mode: str = "fit",
         scale: str = "1:1",
@@ -320,6 +417,15 @@ class AutoCADBackend(ABC):
                     result = CommandResult(ok=False, error=f"Unsupported batch type: {kind}")
                 if expectation is not None:
                     result = await self.verify_created_entity(expectation, result)
+            except LayerNotFoundError as exc:
+                result = CommandResult(
+                    ok=False,
+                    error=str(exc),
+                    error_code="E_LAYER_NOT_FOUND",
+                    recoverable=False,
+                    recommended_action="create_or_select_an_existing_layer",
+                    payload={"layer": layer, "entity_created": False},
+                )
             except (KeyError, TypeError, ValueError) as exc:
                 result = CommandResult(
                     ok=False,
@@ -428,6 +534,9 @@ class AutoCADBackend(ABC):
             payload={
                 **result.payload,
                 "verified": True,
+                "layer": actual.get("layer"),
+                "bounds": actual.get("bounds"),
+                "volume": actual.get("volume"),
                 "requested": expectation.requested(),
                 "actual": actual,
                 "diff": [],
@@ -558,6 +667,17 @@ class AutoCADBackend(ABC):
 
     async def layer_list(self) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def layer_exists(self, name: str) -> CommandResult:
+        listing = await self.layer_list()
+        if not listing.ok:
+            return listing
+        layers = listing.payload.get("layers", []) if isinstance(listing.payload, dict) else []
+        names = {
+            str(layer.get("name") if isinstance(layer, dict) else layer).casefold()
+            for layer in layers
+        }
+        return CommandResult(ok=True, payload={"name": name, "exists": name.casefold() in names})
 
     async def layer_create(
         self,

@@ -95,6 +95,7 @@ class TestEntityCreation:
         assert r.payload["handle"]
 
     async def test_create_line_on_layer(self, backend):
+        await backend.layer_create("TEST")
         r = await backend.create_line(0, 0, 50, 50, layer="TEST")
         assert r.ok
         # Verify layer was auto-created
@@ -157,6 +158,8 @@ class TestEntityQuery:
         assert r.payload["count"] == 2
 
     async def test_entity_list_by_layer(self, backend):
+        await backend.layer_create("A")
+        await backend.layer_create("B")
         await backend.create_line(0, 0, 10, 10, layer="A")
         await backend.create_line(0, 0, 20, 20, layer="B")
         await backend.create_circle(5, 5, 3, layer="A")
@@ -172,6 +175,8 @@ class TestEntityQuery:
         assert r.payload["count"] == 2
 
     async def test_entity_count_by_layer(self, backend):
+        await backend.layer_create("X")
+        await backend.layer_create("Y")
         await backend.create_line(0, 0, 10, 10, layer="X")
         await backend.create_line(0, 0, 20, 20, layer="Y")
         r = await backend.entity_count(layer="X")
@@ -613,6 +618,8 @@ class TestColorToInt:
 class TestSaveRoundTrip:
     async def test_save_and_reload(self, backend):
         """Create entities, save, reload, verify structure."""
+        await backend.layer_create("BORDER")
+        await backend.layer_create("SHAPES")
         await backend.create_line(0, 0, 100, 0, layer="BORDER")
         await backend.create_line(100, 0, 100, 50, layer="BORDER")
         await backend.create_circle(50, 25, 15, layer="SHAPES")

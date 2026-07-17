@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 
+class LayerNotFoundError(ValueError):
+    """Raised before mutation when a requested CAD layer does not exist."""
+
+
 ERROR_ACTIONS = {
     "E_AUTOCAD_NOT_INSTALLED": (False, "configure_autocad_executable"),
     "E_AUTOCAD_NOT_RUNNING": (True, "start_autocad"),
+    "E_AUTOCAD_CRASHED": (True, "close_fatal_dialog_restart_autocad_and_retry"),
     "E_NO_ACTIVE_DOCUMENT": (True, "create_or_open_drawing"),
+    "E_DOCUMENT_ID_MISMATCH": (False, "activate_the_requested_document_and_retry"),
+    "E_DOCUMENT_REVISION_MISMATCH": (False, "read_latest_document_revision_and_retry"),
+    "E_LAYER_NOT_FOUND": (False, "create_or_select_an_existing_layer"),
+    "E_OUTPUT_LOCKED": (True, "close_the_file_owner_and_retry"),
     "E_DISPATCHER_NOT_LOADED": (True, "autoload_dispatcher"),
     "E_DISPATCHER_VERSION_MISMATCH": (True, "reload_dispatcher"),
     "E_IPC_TIMEOUT": (True, "recover_and_retry"),
@@ -16,11 +25,14 @@ ERROR_ACTIONS = {
     "E_PARAMETER_REJECTED": (False, "correct_request_fields"),
     "E_POSTCONDITION_MISMATCH": (False, "stop_and_inspect_backend_state"),
     "E_PLOT_SCALE_MISMATCH": (False, "make_declared_and_actual_plot_scale_consistent"),
+    "E_PLOT_PAGE_MISMATCH": (False, "inspect_plot_device_media_and_retry"),
+    "E_SYSTEM_CALL_FAILED": (True, "inspect_path_parameters_and_system_error"),
     "E_VALIDATION_FAILED": (False, "inspect_validation_report"),
     "E_BATCH_FAILED": (True, "inspect_batch_results"),
     "E_BATCH_ROLLED_BACK": (True, "correct_batch_and_retry"),
     "E_TRANSACTION_BEGIN": (True, "recover_and_retry"),
     "E_TRANSACTION_FINALIZE": (False, "inspect_drawing_undo_state"),
+    "E_TRANSACTION_NOT_FOUND": (False, "begin_a_new_transaction"),
     "E_SOLID_OPERATION": (False, "inspect_profile_and_solid_inputs"),
     "E_DXF_EXPORT": (True, "inspect_export_settings_and_retry"),
     "E_OUTPUT_EXISTS": (False, "set_force_true_or_choose_new_path"),
@@ -33,6 +45,8 @@ def infer_error_code(message: str | None) -> str:
     text = (message or "").lower()
     if "not installed" in text or "executable was not found" in text:
         return "E_AUTOCAD_NOT_INSTALLED"
+    if "fatal error" in text or "致命错误" in text or "autocad crashed" in text:
+        return "E_AUTOCAD_CRASHED"
     if "window not found" in text or "no autocad" in text or "not running" in text:
         return "E_AUTOCAD_NOT_RUNNING"
     if "no active document" in text or "no document open" in text:
@@ -56,6 +70,36 @@ def infer_error_code(message: str | None) -> str:
     if "not supported" in text or "unknown" in text:
         return "E_UNSUPPORTED_OPERATION"
     return "E_INTERNAL"
+
+
+def exception_context(
+    exc: Exception,
+    *,
+    operation: str,
+    parameters: dict | None = None,
+    system_call: str | None = None,
+    file_path: str | None = None,
+) -> tuple[str, dict]:
+    """Describe an exception without reducing it to an opaque ``[Errno N]`` string."""
+    errno = getattr(exc, "errno", None)
+    winerror = getattr(exc, "winerror", None)
+    strerror = getattr(exc, "strerror", None)
+    if not strerror:
+        strerror = str(exc) or exc.__class__.__name__
+    call = system_call or "python-operation"
+    location = f" for {file_path}" if file_path else ""
+    message = f"{operation} failed during {call}{location}: {strerror}"
+    details = {
+        "operation": operation,
+        "parameter_fields": sorted(str(key) for key in (parameters or {})),
+        "system_call": call,
+        "file_path": file_path,
+        "exception_type": exc.__class__.__name__,
+        "errno": errno,
+        "winerror": winerror,
+        "system_message": strerror,
+    }
+    return message, {key: value for key, value in details.items() if value is not None}
 
 
 def error_payload(

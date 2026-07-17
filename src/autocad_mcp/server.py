@@ -1,6 +1,6 @@
 """AutoCAD MCP Server v3.1 — 8 consolidated tools with operation dispatch.
 
-Tools: drawing, entity, solid, layer, block, annotation, pid, view, system
+Tools: drawing, entity, solid, layer, block, annotation, pid, transaction, view, system
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from typing import Any
 import structlog
 from mcp.server.fastmcp import FastMCP
 
+from autocad_mcp.backends.base import CommandResult
 from autocad_mcp.client import (
     _error,
     _json,
@@ -22,6 +23,7 @@ from autocad_mcp.client import (
 from autocad_mcp.contracts import build_entity_expectation
 from autocad_mcp.delivery import deliver_drawing
 from autocad_mcp.drafting import tangent_arc_from_start
+from autocad_mcp.offline import audit_dxf_offline
 from autocad_mcp.workspace import resolve_output_target, workspace_info
 
 # FastMCP validates return types via Pydantic. Tools that may return
@@ -31,6 +33,53 @@ ToolResult = Any
 log = structlog.get_logger()
 
 mcp = FastMCP("autocad-mcp")
+
+
+async def _guard_mutation(backend, doc_id, expected_revision) -> CommandResult:
+    return await backend.require_document_context(doc_id, expected_revision)
+
+
+async def _attach_document_context(
+    backend, result: CommandResult, *, doc_id: str | None = None, mutated: bool = False
+) -> CommandResult:
+    if not result.ok:
+        return result
+    context = (
+        await backend.record_document_mutation(doc_id)
+        if mutated and doc_id
+        else await backend.document_context()
+    )
+    if not context.ok:
+        return context
+    payload = result.payload if isinstance(result.payload, dict) else {"result": result.payload}
+    payload.update(
+        {
+            "doc_id": context.payload["doc_id"],
+            "active_doc_id": context.payload["active_doc_id"],
+            "active_path": context.payload.get("active_path"),
+            "revision": context.payload["revision"],
+        }
+    )
+    result.payload = payload
+    return result
+
+
+async def _require_existing_layer(backend, layer_name: str | None) -> CommandResult:
+    if not layer_name:
+        return CommandResult(ok=True, payload={"exists": True, "name": "0"})
+    result = await backend.layer_exists(str(layer_name))
+    if not result.ok:
+        return result
+    if not result.payload.get("exists"):
+        return CommandResult(
+            ok=False,
+            error=f"Layer does not exist: {layer_name}",
+            error_code="E_LAYER_NOT_FOUND",
+            recoverable=False,
+            recommended_action="create_or_select_an_existing_layer",
+            payload={"layer": str(layer_name), "entity_created": False},
+        )
+    return result
 
 
 # ==========================================================================
@@ -70,8 +119,24 @@ async def drawing(
     data = data or {}
     if operation == "workspace":
         return _json({"ok": True, "payload": workspace_info()})
+    if operation == "audit_dxf":
+        return await add_screenshot_if_available(audit_dxf_offline(data), False)
 
     backend = await get_backend()
+
+    context_required = {
+        "save", "save_as_dxf", "plot_pdf", "render_preview", "deliver",
+        "setup_mechanical", "purge", "set_variables", "undo", "redo",
+    }
+    mutation_operations = {
+        "setup_mechanical", "purge", "set_variables", "undo", "redo",
+    }
+    if operation in context_required:
+        guard = await _guard_mutation(
+            backend, data.get("doc_id"), data.get("expected_revision")
+        )
+        if not guard.ok:
+            return await add_screenshot_if_available(guard, False)
 
     if operation == "create":
         requested_name = data.get("name")
@@ -89,6 +154,10 @@ async def drawing(
             result = await backend.drawing_create(None)
     elif operation == "info":
         result = await backend.drawing_info()
+    elif operation == "context":
+        result = await backend.document_context()
+    elif operation == "activate":
+        result = await backend.drawing_activate(data.get("doc_id"))
     elif operation == "save":
         category = "drawings" if backend.name == "file_ipc" else "dxf"
         extension = ".dwg" if backend.name == "file_ipc" else ".dxf"
@@ -124,8 +193,8 @@ async def drawing(
         )
         result = await backend.drawing_plot_pdf(
             str(target.path),
-            data.get("paper", "A4"),
-            data.get("orientation", "auto"),
+            data.get("paper", "A3"),
+            data.get("orientation", "landscape"),
             data.get("plot_style", "monochrome.ctb"),
             scale_mode,
             data.get("scale", "1:1"),
@@ -158,10 +227,6 @@ async def drawing(
             data.get("space", "model"),
             data.get("rules"),
         )
-    elif operation == "audit_dxf":
-        result = await backend.drawing_audit_dxf(
-            data["path"], data.get("limit", 50), data.get("include_entities", True)
-        )
     elif operation == "setup_mechanical":
         result = await backend.drawing_setup_mechanical(data)
     elif operation == "purge":
@@ -181,6 +246,12 @@ async def drawing(
             f"Unknown drawing operation: {operation}", code="E_UNSUPPORTED_OPERATION"
         )
 
+    if operation in mutation_operations:
+        result = await _attach_document_context(
+            backend, result, doc_id=data.get("doc_id"), mutated=True
+        )
+    elif operation in context_required:
+        result = await _attach_document_context(backend, result)
     return await add_screenshot_if_available(result, include_screenshot)
 
 
@@ -193,6 +264,8 @@ async def drawing(
 @_safe("entity")
 async def entity(
     operation: str,
+    doc_id: str | None = None,
+    expected_revision: int | None = None,
     x1: float | None = None,
     y1: float | None = None,
     x2: float | None = None,
@@ -236,6 +309,11 @@ async def entity(
     """
     data = data or {}
     backend = await get_backend()
+    mutating = operation not in {"list", "count", "get"}
+    if mutating:
+        guard = await _guard_mutation(backend, doc_id, expected_revision)
+        if not guard.ok:
+            return await add_screenshot_if_available(guard, False)
 
     expectation = None
     create_kind = operation.removeprefix("create_")
@@ -243,6 +321,9 @@ async def entity(
         "create_line", "create_circle", "create_polyline", "create_rectangle",
         "create_arc", "create_ellipse", "create_mtext", "create_text",
     }:
+        layer_check = await _require_existing_layer(backend, layer)
+        if not layer_check.ok:
+            return await add_screenshot_if_available(layer_check, False)
         params = dict(data)
         if operation in {"create_line", "create_rectangle"}:
             params.update(x1=x1, y1=y1, x2=x2, y2=y2)
@@ -350,6 +431,11 @@ async def entity(
     if expectation is not None:
         result = await backend.verify_created_entity(expectation, result)
 
+    if mutating:
+        result = await _attach_document_context(
+            backend, result, doc_id=doc_id, mutated=True
+        )
+
     return await add_screenshot_if_available(result, include_screenshot)
 
 
@@ -362,6 +448,8 @@ async def entity(
 @_safe("layer")
 async def layer(
     operation: str,
+    doc_id: str | None = None,
+    expected_revision: int | None = None,
     data: dict | None = None,
     include_screenshot: bool = False,
 ) -> ToolResult:
@@ -379,6 +467,11 @@ async def layer(
     """
     data = data or {}
     backend = await get_backend()
+    mutating = operation != "list"
+    if mutating:
+        guard = await _guard_mutation(backend, doc_id, expected_revision)
+        if not guard.ok:
+            return await add_screenshot_if_available(guard, False)
 
     if operation == "list":
         result = await backend.layer_list()
@@ -404,6 +497,8 @@ async def layer(
     else:
         return tool_error(f"Unknown layer operation: {operation}", code="E_UNSUPPORTED_OPERATION")
 
+    if mutating:
+        result = await _attach_document_context(backend, result, doc_id=doc_id, mutated=True)
     return await add_screenshot_if_available(result, include_screenshot)
 
 
@@ -416,6 +511,8 @@ async def layer(
 @_safe("block")
 async def block(
     operation: str,
+    doc_id: str | None = None,
+    expected_revision: int | None = None,
     data: dict | None = None,
     include_screenshot: bool = False,
 ) -> ToolResult:
@@ -431,6 +528,11 @@ async def block(
     """
     data = data or {}
     backend = await get_backend()
+    mutating = operation not in {"list", "get_attributes"}
+    if mutating:
+        guard = await _guard_mutation(backend, doc_id, expected_revision)
+        if not guard.ok:
+            return await add_screenshot_if_available(guard, False)
 
     if operation == "list":
         result = await backend.block_list()
@@ -453,6 +555,8 @@ async def block(
     else:
         return tool_error(f"Unknown block operation: {operation}", code="E_UNSUPPORTED_OPERATION")
 
+    if mutating:
+        result = await _attach_document_context(backend, result, doc_id=doc_id, mutated=True)
     return await add_screenshot_if_available(result, include_screenshot)
 
 
@@ -465,6 +569,8 @@ async def block(
 @_safe("annotation")
 async def annotation(
     operation: str,
+    doc_id: str | None = None,
+    expected_revision: int | None = None,
     data: dict | None = None,
     include_screenshot: bool = False,
 ) -> ToolResult:
@@ -480,6 +586,12 @@ async def annotation(
     """
     data = data or {}
     backend = await get_backend()
+    guard = await _guard_mutation(backend, doc_id, expected_revision)
+    if not guard.ok:
+        return await add_screenshot_if_available(guard, False)
+    layer_check = await _require_existing_layer(backend, data.get("layer"))
+    if not layer_check.ok:
+        return await add_screenshot_if_available(layer_check, False)
 
     if operation == "create_text":
         result = await backend.create_text(
@@ -509,6 +621,7 @@ async def annotation(
             f"Unknown annotation operation: {operation}", code="E_UNSUPPORTED_OPERATION"
         )
 
+    result = await _attach_document_context(backend, result, doc_id=doc_id, mutated=True)
     return await add_screenshot_if_available(result, include_screenshot)
 
 
@@ -521,6 +634,8 @@ async def annotation(
 @_safe("solid")
 async def solid(
     operation: str,
+    doc_id: str | None = None,
+    expected_revision: int | None = None,
     data: dict | None = None,
     include_screenshot: bool = False,
 ) -> ToolResult:
@@ -539,6 +654,12 @@ async def solid(
     """
     data = data or {}
     backend = await get_backend()
+    guard = await _guard_mutation(backend, doc_id, expected_revision)
+    if not guard.ok:
+        return await add_screenshot_if_available(guard, False)
+    layer_check = await _require_existing_layer(backend, data.get("layer"))
+    if not layer_check.ok:
+        return await add_screenshot_if_available(layer_check, False)
 
     if operation == "create_box":
         result = await backend.solid_create_box(
@@ -569,6 +690,7 @@ async def solid(
     else:
         return tool_error(f"Unknown solid operation: {operation}", code="E_UNSUPPORTED_OPERATION")
 
+    result = await _attach_document_context(backend, result, doc_id=doc_id, mutated=True)
     return await add_screenshot_if_available(result, include_screenshot)
 
 
@@ -576,6 +698,8 @@ async def solid(
 @_safe("pid")
 async def pid(
     operation: str,
+    doc_id: str | None = None,
+    expected_revision: int | None = None,
     data: dict | None = None,
     include_screenshot: bool = False,
 ) -> ToolResult:
@@ -597,6 +721,11 @@ async def pid(
     """
     data = data or {}
     backend = await get_backend()
+    mutating = operation != "list_symbols"
+    if mutating:
+        guard = await _guard_mutation(backend, doc_id, expected_revision)
+        if not guard.ok:
+            return await add_screenshot_if_available(guard, False)
 
     if operation == "setup_layers":
         result = await backend.pid_setup_layers()
@@ -640,12 +769,42 @@ async def pid(
     else:
         return tool_error(f"Unknown pid operation: {operation}", code="E_UNSUPPORTED_OPERATION")
 
+    if mutating:
+        result = await _attach_document_context(backend, result, doc_id=doc_id, mutated=True)
     return await add_screenshot_if_available(result, include_screenshot)
 
 
 # ==========================================================================
 # 7. view — Viewport and screenshot
 # ==========================================================================
+
+
+@mcp.tool(annotations={"title": "AutoCAD Transactions", "readOnlyHint": False})
+@_safe("transaction")
+async def transaction(
+    operation: str,
+    doc_id: str,
+    expected_revision: int,
+    transaction_id: str | None = None,
+) -> ToolResult:
+    """Begin, commit, or roll back a document-scoped AutoCAD undo transaction."""
+    backend = await get_backend()
+    if operation == "begin":
+        result = await backend.transaction_begin(doc_id, expected_revision)
+    elif operation == "commit":
+        result = await backend.transaction_commit(
+            transaction_id, doc_id, expected_revision
+        )
+    elif operation == "rollback":
+        result = await backend.transaction_rollback(
+            transaction_id, doc_id, expected_revision
+        )
+    else:
+        return tool_error(
+            f"Unknown transaction operation: {operation}",
+            code="E_UNSUPPORTED_OPERATION",
+        )
+    return await add_screenshot_if_available(result, False)
 
 
 @mcp.tool(annotations={"title": "AutoCAD View Operations", "readOnlyHint": True})
@@ -810,31 +969,15 @@ async def system(
 
 def main():
     """Run the MCP server on stdio transport."""
-    import logging
-    import sys
-
     # Load NumPy-backed ezdxf modules before AnyIO starts worker threads.
     # Late native-module imports can stall on some Windows Python runtimes.
     import ezdxf  # noqa: F401
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler(sys.stderr)],
-    )
+    from autocad_mcp.logging_setup import configure_logging
 
-    structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
-        cache_logger_on_first_use=True,
-        processors=[
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso"),
-            structlog.dev.ConsoleRenderer(),
-        ],
-    )
+    log_path = configure_logging()
 
     from autocad_mcp import __version__
 
-    log.info("autocad_mcp_starting", version=__version__)
+    log.info("autocad_mcp_starting", version=__version__, log_path=str(log_path))
     mcp.run(transport="stdio")

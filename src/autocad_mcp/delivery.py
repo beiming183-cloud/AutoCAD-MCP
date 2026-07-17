@@ -120,6 +120,18 @@ async def deliver_drawing(
         )
 
     request = dict(data or {})
+    source_context_result = await backend.document_context()
+    if not source_context_result.ok:
+        return source_context_result
+    source_context = dict(source_context_result.payload)
+    requested_doc_id = request.get("doc_id")
+    if requested_doc_id and requested_doc_id != source_context.get("active_doc_id"):
+        return CommandResult(
+            ok=False,
+            error="Delivery source document does not match doc_id",
+            error_code="E_DOCUMENT_ID_MISMATCH",
+            payload={"requested_doc_id": requested_doc_id, "actual": source_context},
+        )
     name = request.get("name") or "drawing"
     job = create_job(name)
     root = Path(job["root"])
@@ -140,8 +152,8 @@ async def deliver_drawing(
         plot["paper"] = metadata_sheet.split()[0]
     if "landscape" in metadata_sheet.lower() and "orientation" not in plot:
         plot["orientation"] = "landscape"
-    plot.setdefault("paper", "A4")
-    plot.setdefault("orientation", "auto")
+    plot.setdefault("paper", "A3")
+    plot.setdefault("orientation", "landscape")
     plot.setdefault("plot_style", "monochrome.ctb")
     plot.setdefault("scale_mode", "fit")
     plot.setdefault("scale", "1:1")
@@ -173,6 +185,7 @@ async def deliver_drawing(
         "backend": backend.name,
         "autocad_mcp_version": __version__,
         "metadata": request.get("metadata") or {},
+        "source_document": source_context,
         "plot": {"requested": plot, "actual": None},
         "validation": {"rules": rules, "checks": []},
         "steps": [],
@@ -220,7 +233,7 @@ async def deliver_drawing(
     if not all(check["passed"] for check in checks):
         return fail("Source drawing failed validation gates")
 
-    save_dwg = await run_step("save-dwg", backend.drawing_save(str(paths["dwg"])))
+    save_dwg = await run_step("copy-dwg", backend.drawing_copy_dwg(str(paths["dwg"])))
     if not save_dwg.ok:
         return fail(save_dwg.error or "DWG save failed")
     plot_pdf = await run_step(
@@ -286,13 +299,14 @@ async def deliver_drawing(
     if not all(check["passed"] for check in export_checks):
         return fail("DXF geometry or metadata does not match the source drawing")
 
-    restore = await run_step("restore-dwg", backend.drawing_save(str(paths["dwg"])))
-    if not restore.ok:
-        return fail(restore.error or "Failed to restore the active DWG after DXF export")
-    if isinstance(restore.payload, dict) and restore.payload.get("active_document"):
-        active_document = Path(restore.payload["active_document"]).resolve()
-        if active_document != paths["dwg"].resolve():
-            return fail("AutoCAD did not return to the primary DWG after DXF export")
+    final_context_result = await backend.document_context()
+    if not final_context_result.ok:
+        return fail(final_context_result.error or "Could not verify the active document after delivery")
+    final_context = final_context_result.payload
+    for field in ("active_doc_id", "active_path"):
+        if final_context.get(field) != source_context.get(field):
+            return fail(f"Delivery changed source document field {field}")
+    manifest["source_document_after"] = final_context
 
     write_json_atomic(paths["validation"], manifest["validation"])
     for key in ("dwg", "dxf", "pdf", "audit", "request", "validation"):

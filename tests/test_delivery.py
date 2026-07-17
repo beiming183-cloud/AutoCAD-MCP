@@ -17,6 +17,9 @@ class FakeDeliveryBackend(AutoCADBackend):
         self.layers = layers or {"OUTLINE": entity_count}
         self.types = types or {"LINE": entity_count}
         self.fail_step = fail_step
+        self.active_doc_id = "doc-source"
+        self.active_path = "D:/CAD-Automation/drawings/source.dwg"
+        self.revision = 7
 
     @property
     def name(self):
@@ -31,6 +34,18 @@ class FakeDeliveryBackend(AutoCADBackend):
 
     async def status(self):
         return CommandResult(ok=True)
+
+    async def document_context(self):
+        return CommandResult(
+            ok=True,
+            payload={
+                "doc_id": self.active_doc_id,
+                "active_doc_id": self.active_doc_id,
+                "requested_path": self.active_path,
+                "active_path": self.active_path,
+                "revision": self.revision,
+            },
+        )
 
     def _write(self, path, content):
         output = Path(path)
@@ -52,6 +67,16 @@ class FakeDeliveryBackend(AutoCADBackend):
         if self.fail_step == "dwg":
             return CommandResult(ok=False, error="save failed")
         return self._write(path, b"DWG")
+
+    async def drawing_copy_dwg(self, path):
+        if self.fail_step == "dwg":
+            return CommandResult(ok=False, error="copy failed")
+        result = self._write(path, b"DWG")
+        result.payload["read_only_context"] = True
+        if self.fail_step == "switch-doc":
+            self.active_doc_id = "doc-copy"
+            self.active_path = str(path)
+        return result
 
     async def drawing_plot_pdf(
         self,
@@ -117,10 +142,27 @@ async def test_delivery_creates_manifest_audit_and_checksums(monkeypatch, tmp_pa
     assert {"dwg", "dxf", "pdf", "audit", "request", "validation"} == set(manifest["artifacts"])
     assert all(len(item["sha256"]) == 64 for item in manifest["artifacts"].values())
     assert json.loads((root / "audits" / "drawing-audit.json").read_text(encoding="utf-8"))["entity_count"] == 3
+    assert manifest["source_document_after"]["active_doc_id"] == "doc-source"
+    assert manifest["source_document_after"]["active_path"].endswith("source.dwg")
     assert all(
         check["passed"]
         for check in json.loads((root / "reports" / "validation.json").read_text(encoding="utf-8"))["checks"]
     )
+
+
+@pytest.mark.asyncio
+async def test_delivery_rejects_copy_that_switches_active_document(monkeypatch, tmp_path):
+    monkeypatch.setenv("AUTOCAD_MCP_OUTPUT_ROOT", str(tmp_path / "CAD-Automation"))
+
+    result = await deliver_drawing(
+        FakeDeliveryBackend(fail_step="switch-doc"),
+        {"name": "must-not-switch", "doc_id": "doc-source"},
+    )
+
+    assert result.ok is False
+    manifest = json.loads(Path(result.payload["manifest"]).read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert "active_doc_id" in manifest["error"]
 
 
 @pytest.mark.asyncio

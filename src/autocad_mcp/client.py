@@ -13,7 +13,7 @@ from mcp.types import CallToolResult, ImageContent, TextContent
 
 from autocad_mcp.backends.base import AutoCADBackend, CommandResult
 from autocad_mcp.config import ONLY_TEXT_FEEDBACK, _current_backend_env, detect_backend
-from autocad_mcp.errors import error_payload
+from autocad_mcp.errors import error_payload, exception_context
 
 log = structlog.get_logger()
 
@@ -127,9 +127,20 @@ def tool_error(
     )
 
 
-def _error(e: Exception, context: str = "") -> CallToolResult:
+def _error(
+    e: Exception,
+    context: str = "",
+    *,
+    parameters: dict | None = None,
+) -> CallToolResult:
     """Format an exception with an actionable hint."""
-    msg = str(e)
+    msg, details = exception_context(
+        e,
+        operation=context or "mcp-tool",
+        parameters=parameters,
+        system_call="tool-handler",
+        file_path=str(getattr(e, "filename", "") or "") or None,
+    )
     msg_lower = msg.lower()
 
     if "window not found" in msg_lower or "no autocad" in msg_lower:
@@ -143,7 +154,13 @@ def _error(e: Exception, context: str = "") -> CallToolResult:
     else:
         hint = "Unexpected error. Check AutoCAD is responsive and retry."
 
-    return tool_error(msg, context=context, recommended_action=hint)
+    code = "E_SYSTEM_CALL_FAILED" if getattr(e, "errno", None) is not None else None
+    return tool_error(
+        msg,
+        code=code,
+        recommended_action=hint,
+        details=details,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +179,7 @@ def _safe(tool_name: str):
             except Exception as e:
                 op = kwargs.get("operation", "unknown")
                 log.error("tool_error", tool=tool_name, operation=op, error=str(e))
-                return _error(e, f"{tool_name}.{op}")
+                return _error(e, f"{tool_name}.{op}", parameters=kwargs)
 
         return wrapper
 

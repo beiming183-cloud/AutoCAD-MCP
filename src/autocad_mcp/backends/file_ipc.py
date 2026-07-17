@@ -16,7 +16,9 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -28,6 +30,7 @@ from autocad_mcp.audit import INSUNITS_NAMES, audit_dxf_file, build_audit, geome
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
 from autocad_mcp.config import DOCUMENT_TIMEOUT, IPC_DIR, IPC_TIMEOUT, LISP_DIR, _autostart_autocad
 from autocad_mcp.drafting import encode_autocad_text
+from autocad_mcp.errors import LayerNotFoundError, exception_context
 from autocad_mcp.variables import mechanical_variable_updates, validate_variable_updates
 
 log = structlog.get_logger()
@@ -94,6 +97,134 @@ def find_autocad_window() -> int | None:
             return None
     except ImportError:
         return None
+
+
+def _window_process_id(hwnd: int | None) -> int | None:
+    if sys.platform != "win32" or not hwnd:
+        return None
+    try:
+        import win32process
+
+        return int(win32process.GetWindowThreadProcessId(hwnd)[1])
+    except Exception:
+        return None
+
+
+def _process_executable_name(process_id: int | None) -> str | None:
+    if sys.platform != "win32" or not process_id:
+        return None
+    process_handle = None
+    try:
+        import win32api
+        import win32con
+        import win32process
+
+        process_handle = win32api.OpenProcess(
+            win32con.PROCESS_QUERY_INFORMATION | win32con.PROCESS_VM_READ,
+            False,
+            int(process_id),
+        )
+        return Path(win32process.GetModuleFileNameEx(process_handle, 0)).name.casefold()
+    except Exception:
+        return None
+    finally:
+        if process_handle is not None:
+            try:
+                win32api.CloseHandle(process_handle)
+            except Exception:
+                pass
+
+
+def _process_is_alive(process_id: int | None) -> bool | None:
+    if sys.platform != "win32" or not process_id:
+        return None
+    try:
+        import ctypes
+
+        process = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(process_id))
+        if not process:
+            return None
+        try:
+            exit_code = ctypes.c_ulong()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code)):
+                return None
+            return exit_code.value == 259  # STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(process)
+    except Exception:
+        return None
+
+
+def detect_autocad_crash_state(
+    hwnd: int | None = None, process_id: int | None = None
+) -> dict:
+    """Detect process exit and visible AutoCAD fatal-error dialogs."""
+    if sys.platform != "win32":
+        return {"crashed": False}
+    pid = process_id or _window_process_id(hwnd)
+    if process_id and _process_is_alive(process_id) is False:
+        return {
+            "crashed": True,
+            "reason": "process_exited",
+            "process_id": int(process_id),
+        }
+
+    try:
+        import win32gui
+
+        fatal_tokens = (
+            "fatal error",
+            "error aborting",
+            "unhandled exception",
+            "致命错误",
+            "无法继续",
+        )
+        product_tokens = ("autocad", "autodesk")
+        dialogs: list[dict] = []
+
+        def callback(window, _):
+            if not win32gui.IsWindowVisible(window):
+                return True
+            window_pid = _window_process_id(window)
+            title = win32gui.GetWindowText(window) or ""
+            child_text: list[str] = []
+
+            def child_callback(child, __):
+                text = win32gui.GetWindowText(child)
+                if text:
+                    child_text.append(text)
+                return True
+
+            try:
+                win32gui.EnumChildWindows(window, child_callback, None)
+            except Exception:
+                pass
+            combined = " ".join([title, *child_text]).lower()
+            same_process = bool(pid and window_pid == pid)
+            identified_product = any(token in combined for token in product_tokens)
+            fatal = any(token in combined for token in fatal_tokens)
+            if fatal and (same_process or identified_product):
+                dialogs.append(
+                    {
+                        "hwnd": int(window),
+                        "title": title,
+                        "process_id": window_pid,
+                        "message": " | ".join(child_text[:8]),
+                    }
+                )
+            return True
+
+        win32gui.EnumWindows(callback, None)
+        if dialogs:
+            return {
+                "crashed": True,
+                "reason": "fatal_error_dialog",
+                "process_id": pid,
+                "dialog": dialogs[0],
+            }
+    except Exception:
+        pass
+    return {"crashed": False, "process_id": pid}
 
 
 def _com_value(obj, name: str, default=None):
@@ -246,6 +377,12 @@ class FileIPCBackend(AutoCADBackend):
         self._dispatcher_version: str | None = None
         self._product_info: dict = {}
         self._window_policy_applied = False
+        self._acad_process_id: int | None = None
+        self._doc_ids_by_key: dict[str, str] = {}
+        self._doc_revisions: dict[str, int] = {}
+        self._transactions: dict[str, dict] = {}
+        self._deferred_output_cleanup: set[Path] = set()
+        self._user_foreground_hwnd: int | None = None
 
     @property
     def name(self) -> str:
@@ -269,6 +406,42 @@ class FileIPCBackend(AutoCADBackend):
             can_project_views=False,
         )
 
+    @staticmethod
+    def _industrial_capability_matrix() -> dict:
+        """Report deterministic industrial features without advertising placeholders."""
+        return {
+            "supported": [
+                "document_identity",
+                "optimistic_revision_guard",
+                "undo_transactions",
+                "atomic_entity_batches",
+                "layer_preconditions",
+                "entity_postcondition_readback",
+                "native_2d_entities",
+                "basic_native_solids",
+                "solid_boolean",
+                "offline_dxf_audit",
+                "native_pdf_plot",
+                "native_png_plot",
+                "read_only_dwg_copy",
+            ],
+            "unsupported": {
+                "stable_feature_selection": "AutoCAD COM does not expose a proven persistent semantic edge/face identifier here",
+                "fillet_edges": "blocked until stable feature selection and rollback are verified",
+                "chamfer_edges": "blocked until stable feature selection and rollback are verified",
+                "shell": "not implemented by the current safe backend",
+                "offset_face": "not implemented by the current safe backend",
+                "loft": "not implemented by the current safe backend",
+                "draft": "not implemented by the current safe backend",
+                "parametric_assembly": "component identity, mates, configurations, and DOF solving are not implemented",
+                "motion_sweep_interference": "requires a verified parametric assembly and motion solver",
+                "offscreen_3d_render": "current native PNG output is a deterministic plot, not a material 3D renderer",
+                "surface_continuity_g0_g1_g2": "not implemented",
+                "wall_thickness": "not implemented",
+                "draft_angle_analysis": "not implemented",
+            },
+        }
+
     async def initialize(self) -> CommandResult:
         """Make AutoCAD and its versioned dispatcher ready for commands."""
         return await self.ensure_ready()
@@ -277,16 +450,29 @@ class FileIPCBackend(AutoCADBackend):
         """Discover, start, connect, load, handshake, and ping AutoCAD."""
         self._hwnd = find_autocad_window()
         if not self._hwnd:
+            prior_crash = detect_autocad_crash_state(None, self._acad_process_id)
+            if prior_crash.get("crashed"):
+                return self._autocad_crashed_result(prior_crash, "system.ensure_ready")
             try:
                 self._hwnd = _autostart_autocad(find_autocad_window)
             except Exception as exc:
+                crash = detect_autocad_crash_state(None, self._acad_process_id)
+                if crash.get("crashed"):
+                    return self._autocad_crashed_result(crash, "system.ensure_ready")
                 return CommandResult(ok=False, error=str(exc))
         if not self._hwnd:
+            crash = detect_autocad_crash_state(None, self._acad_process_id)
+            if crash.get("crashed"):
+                return self._autocad_crashed_result(crash, "system.ensure_ready")
             return CommandResult(
                 ok=False,
                 error="AutoCAD is not running and automatic startup is unavailable",
                 error_code="E_AUTOCAD_NOT_RUNNING",
             )
+        self._acad_process_id = _window_process_id(self._hwnd)
+        crash = detect_autocad_crash_state(self._hwnd, self._acad_process_id)
+        if crash.get("crashed"):
+            return self._autocad_crashed_result(crash, "system.ensure_ready")
 
         visibility = self._ensure_autocad_visible()
         log.info("autocad_visibility", **visibility)
@@ -296,7 +482,8 @@ class FileIPCBackend(AutoCADBackend):
             return CommandResult(
                 ok=False,
                 error=document["error"],
-                error_code="E_NO_ACTIVE_DOCUMENT",
+                error_code=document.get("error_code", "E_NO_ACTIVE_DOCUMENT"),
+                payload=document.get("details"),
             )
         self._product_info = self._discover_product()
 
@@ -328,23 +515,28 @@ class FileIPCBackend(AutoCADBackend):
 
         last_result = None
         loaded_path = None
+        load_attempts = 0
         self._dispatcher_version = None
         for candidate in candidates:
             if not candidate.is_file():
                 continue
             normalized_path = str(candidate.resolve()).replace("\\", "/")
-            self._type_command(f'(load "{normalized_path}")')
-            await asyncio.sleep(0.75)
-            self._wait_for_autocad_idle(timeout=10.0)
-            last_result = await self._dispatch("ping", {})
-            version = (
-                last_result.payload.get("dispatcher_version")
-                if last_result.ok and isinstance(last_result.payload, dict)
-                else None
-            )
-            if version == __version__:
-                self._dispatcher_version = version
-                loaded_path = str(candidate.resolve())
+            for attempt in range(1, 4):
+                load_attempts += 1
+                self._type_command(f'(load "{normalized_path}")')
+                await asyncio.sleep(0.75 * attempt)
+                self._wait_for_autocad_idle(timeout=10.0)
+                last_result = await self._dispatch("ping", {})
+                version = (
+                    last_result.payload.get("dispatcher_version")
+                    if last_result.ok and isinstance(last_result.payload, dict)
+                    else None
+                )
+                if version == __version__:
+                    self._dispatcher_version = version
+                    loaded_path = str(candidate.resolve())
+                    break
+            if self._dispatcher_version == __version__:
                 break
 
         if not last_result or not last_result.ok:
@@ -352,6 +544,10 @@ class FileIPCBackend(AutoCADBackend):
                 ok=False,
                 error="AutoCAD is running but the MCP dispatcher could not be loaded or pinged",
                 error_code="E_DISPATCHER_NOT_LOADED",
+                payload={
+                    "load_attempts": load_attempts,
+                    "last_result": last_result.to_dict() if last_result else None,
+                },
             )
         if self._dispatcher_version != __version__:
             actual = (
@@ -373,19 +569,26 @@ class FileIPCBackend(AutoCADBackend):
                     "running": True,
                     "hwnd": self._hwnd,
                     "active_document": document["name"],
+                    "active_document_path": document.get("path"),
+                    "created_first_document": document.get("created_first_document", False),
                 },
                 "dispatcher": {
                     "loaded": True,
                     "version": self._dispatcher_version,
                     "path": loaded_path,
+                    "load_attempts": load_attempts,
                 },
                 "transport": "file_ipc",
+                "dispatcher_isolation": "external-python-process",
                 "ready": True,
                 "visibility": visibility,
             },
         )
 
     async def status(self) -> CommandResult:
+        crash = detect_autocad_crash_state(self._hwnd, self._acad_process_id)
+        if crash.get("crashed"):
+            return self._autocad_crashed_result(crash, "system.status")
         info = {
             "backend": "file_ipc",
             "hwnd": self._hwnd,
@@ -401,8 +604,264 @@ class FileIPCBackend(AutoCADBackend):
                 "expected_version": __version__,
             },
             "ready": bool(self._hwnd and self._dispatcher_version == __version__),
+            "dispatcher_isolation": "external-python-process",
+            "industrial_capabilities": self._industrial_capability_matrix(),
         }
         return CommandResult(ok=True, payload=info)
+
+    def _autocad_crashed_result(self, state: dict, operation: str) -> CommandResult:
+        reason = state.get("reason", "unknown")
+        dialog = state.get("dialog") or {}
+        title = dialog.get("title")
+        description = f"AutoCAD crashed or entered a fatal error state ({reason})"
+        if title:
+            description += f": {title}"
+        return CommandResult(
+            ok=False,
+            error=description,
+            error_code="E_AUTOCAD_CRASHED",
+            recoverable=True,
+            recommended_action="close_fatal_dialog_restart_autocad_and_retry",
+            payload={"operation": operation, "crash": state},
+        )
+
+    @staticmethod
+    def _document_key(document) -> str:
+        hwnd = _com_value(document, "HWND")
+        if hwnd:
+            return f"hwnd:{int(hwnd)}"
+        path = str(_com_value(document, "FullName", "") or "").strip()
+        name = str(_com_value(document, "Name", "") or "").strip()
+        return os.path.normcase(path or name)
+
+    def _bind_document(self, document, *, force_new: bool = False) -> dict:
+        key = self._document_key(document)
+        doc_id = None if force_new else self._doc_ids_by_key.get(key)
+        if not doc_id:
+            doc_id = f"acad-{uuid.uuid4().hex}"
+            self._doc_ids_by_key[key] = doc_id
+            self._doc_revisions.setdefault(doc_id, 0)
+        path = str(_com_value(document, "FullName", "") or _com_value(document, "Name", ""))
+        return {
+            "doc_id": doc_id,
+            "active_doc_id": doc_id,
+            "requested_path": path,
+            "active_path": path,
+            "revision": int(self._doc_revisions.get(doc_id, 0)),
+            "document_name": str(_com_value(document, "Name", "")),
+            "backend": self.name,
+        }
+
+    async def document_context(self) -> CommandResult:
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            if int(application.Documents.Count) == 0:
+                return CommandResult(
+                    ok=False,
+                    error="AutoCAD has no document",
+                    error_code="E_NO_ACTIVE_DOCUMENT",
+                )
+            return CommandResult(
+                ok=True, payload=self._bind_document(application.ActiveDocument)
+            )
+        except Exception as exc:
+            crash = detect_autocad_crash_state(self._hwnd, self._acad_process_id)
+            if crash.get("crashed"):
+                return self._autocad_crashed_result(crash, "drawing.context")
+            return self._exception_result(
+                exc,
+                operation="drawing.context",
+                system_call="AutoCAD.Application.ActiveDocument",
+            )
+
+    async def require_document_context(
+        self, doc_id: str | None, expected_revision: int | None
+    ) -> CommandResult:
+        context = await self.document_context()
+        if not context.ok:
+            return context
+        actual = context.payload
+        if not doc_id:
+            return CommandResult(
+                ok=False,
+                error="A modifying operation requires doc_id",
+                error_code="E_PARAMETER_REJECTED",
+                recommended_action="read_document_context_and_retry",
+                payload={"required": ["doc_id", "expected_revision"], "actual": actual},
+            )
+        if str(doc_id) != str(actual["active_doc_id"]):
+            return CommandResult(
+                ok=False,
+                error="The active AutoCAD document does not match doc_id",
+                error_code="E_DOCUMENT_ID_MISMATCH",
+                recoverable=False,
+                payload={"requested_doc_id": doc_id, "actual": actual},
+            )
+        if expected_revision is None or int(expected_revision) != int(actual["revision"]):
+            return CommandResult(
+                ok=False,
+                error="The active AutoCAD document revision is stale or missing",
+                error_code="E_DOCUMENT_REVISION_MISMATCH",
+                recoverable=False,
+                payload={"expected_revision": expected_revision, "actual": actual},
+            )
+        return CommandResult(ok=True, payload=actual)
+
+    async def record_document_mutation(self, doc_id: str) -> CommandResult:
+        context = await self.document_context()
+        if not context.ok:
+            return context
+        if str(doc_id) != str(context.payload["active_doc_id"]):
+            return CommandResult(
+                ok=False,
+                error="Cannot advance revision for a non-active document",
+                error_code="E_DOCUMENT_ID_MISMATCH",
+            )
+        self._doc_revisions[doc_id] = int(self._doc_revisions.get(doc_id, 0)) + 1
+        context.payload["revision"] = self._doc_revisions[doc_id]
+        return context
+
+    async def drawing_activate(self, doc_id: str) -> CommandResult:
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            for index in range(int(application.Documents.Count)):
+                document = application.Documents.Item(index)
+                context = self._bind_document(document)
+                if context["doc_id"] == doc_id:
+                    document.Activate()
+                    actual = self._bind_document(application.ActiveDocument)
+                    differences = [] if actual["active_doc_id"] == doc_id else [
+                        {"path": "active_doc_id", "requested": doc_id, "actual": actual["active_doc_id"]}
+                    ]
+                    return CommandResult(
+                        ok=not differences,
+                        payload={**actual, "requested_doc_id": doc_id, "diff": differences},
+                        error="AutoCAD activated a different document" if differences else None,
+                        error_code="E_DOCUMENT_ID_MISMATCH" if differences else None,
+                    )
+            return CommandResult(
+                ok=False,
+                error=f"Unknown document id: {doc_id}",
+                error_code="E_DOCUMENT_ID_MISMATCH",
+            )
+        except Exception as exc:
+            return self._exception_result(
+                exc,
+                operation="drawing.activate",
+                parameters={"doc_id": doc_id},
+                system_call="AutoCAD.Document.Activate",
+            )
+
+    async def transaction_begin(self, doc_id: str, expected_revision: int) -> CommandResult:
+        guard = await self.require_document_context(doc_id, expected_revision)
+        if not guard.ok:
+            return guard
+        if self._transactions:
+            return CommandResult(
+                ok=False,
+                error="Only one AutoCAD transaction may be active at a time",
+                error_code="E_TRANSACTION_BEGIN",
+            )
+        result = await self._dispatch("transaction-begin", {})
+        if not result.ok:
+            return result
+        transaction_id = f"tx-{uuid.uuid4().hex}"
+        self._transactions[transaction_id] = {
+            "doc_id": doc_id,
+            "base_revision": expected_revision,
+        }
+        return CommandResult(
+            ok=True,
+            payload={
+                "transaction_id": transaction_id,
+                "state": "active",
+                **guard.payload,
+            },
+        )
+
+    async def _finish_transaction(
+        self,
+        transaction_id: str,
+        doc_id: str,
+        expected_revision: int,
+        *,
+        rollback: bool,
+    ) -> CommandResult:
+        transaction = self._transactions.get(str(transaction_id))
+        if not transaction or transaction["doc_id"] != doc_id:
+            return CommandResult(
+                ok=False,
+                error="Transaction does not exist for the requested document",
+                error_code="E_TRANSACTION_NOT_FOUND",
+                payload={"transaction_id": transaction_id, "doc_id": doc_id},
+            )
+        guard = await self.require_document_context(doc_id, expected_revision)
+        if not guard.ok:
+            return guard
+        command = "transaction-rollback" if rollback else "transaction-commit"
+        result = await self._dispatch(command, {})
+        if not result.ok:
+            return result
+        self._transactions.pop(str(transaction_id), None)
+        context = await self.record_document_mutation(doc_id)
+        return CommandResult(
+            ok=context.ok,
+            payload={
+                "transaction_id": transaction_id,
+                "state": "rolled_back" if rollback else "committed",
+                **(context.payload if context.ok else {}),
+            },
+            error=context.error,
+            error_code=context.error_code,
+        )
+
+    async def transaction_commit(
+        self, transaction_id: str, doc_id: str, expected_revision: int
+    ) -> CommandResult:
+        return await self._finish_transaction(
+            transaction_id, doc_id, expected_revision, rollback=False
+        )
+
+    async def transaction_rollback(
+        self, transaction_id: str, doc_id: str, expected_revision: int
+    ) -> CommandResult:
+        return await self._finish_transaction(
+            transaction_id, doc_id, expected_revision, rollback=True
+        )
+
+    @staticmethod
+    def _exception_result(
+        exc: Exception,
+        *,
+        operation: str,
+        parameters: dict | None = None,
+        system_call: str | None = None,
+        file_path: str | None = None,
+        error_code: str = "E_SYSTEM_CALL_FAILED",
+        recommended_action: str = "inspect_path_parameters_and_system_error",
+    ) -> CommandResult:
+        message, details = exception_context(
+            exc,
+            operation=operation,
+            parameters=parameters,
+            system_call=system_call,
+            file_path=file_path,
+        )
+        return CommandResult(
+            ok=False,
+            error=message,
+            error_code=error_code,
+            recommended_action=recommended_action,
+            payload=details,
+        )
 
     def _discover_product(self) -> dict:
         executable = os.environ.get("AUTOCAD_MCP_ACAD_EXE", "").strip()
@@ -433,6 +892,9 @@ class FileIPCBackend(AutoCADBackend):
     def _ensure_active_document(self) -> dict:
         deadline = time.monotonic() + DOCUMENT_TIMEOUT
         last_error = None
+        stable_key = None
+        stable_reads = 0
+        created_first_document = False
         while time.monotonic() < deadline:
             try:
                 import pythoncom
@@ -440,13 +902,42 @@ class FileIPCBackend(AutoCADBackend):
 
                 pythoncom.CoInitialize()
                 application = win32com.client.GetActiveObject("AutoCAD.Application")
-                if int(application.Documents.Count) == 0:
-                    application.Documents.Add()
-                document = application.ActiveDocument
-                document.Activate()
-                return {"ready": True, "name": str(document.Name)}
+                document_count = int(application.Documents.Count)
+                if document_count == 0 and not created_first_document:
+                    document = application.Documents.Add()
+                    created_first_document = True
+                else:
+                    document = application.ActiveDocument
+                name = str(document.Name)
+                path = str(document.FullName or document.Name)
+                document_key = self._document_key(document)
+                if document_key == stable_key:
+                    stable_reads += 1
+                else:
+                    stable_key = document_key
+                    stable_reads = 1
+                if stable_reads < 3:
+                    time.sleep(0.25)
+                    continue
+                context = self._bind_document(document)
+                return {
+                    "ready": True,
+                    "name": name,
+                    "path": path,
+                    "created_first_document": created_first_document,
+                    "stability_reads": stable_reads,
+                    **context,
+                }
             except Exception as exc:
                 last_error = exc
+                crash = detect_autocad_crash_state(self._hwnd, self._acad_process_id)
+                if crash.get("crashed"):
+                    return {
+                        "ready": False,
+                        "error": "AutoCAD crashed while creating or reading the first document",
+                        "error_code": "E_AUTOCAD_CRASHED",
+                        "details": crash,
+                    }
                 time.sleep(0.25)
         return {
             "ready": False,
@@ -482,6 +973,9 @@ class FileIPCBackend(AutoCADBackend):
 
             # Type the fixed dispatch trigger only after AutoCAD reaches idle.
             if not self._type_dispatch_trigger():
+                crash = detect_autocad_crash_state(self._hwnd, self._acad_process_id)
+                if crash.get("crashed"):
+                    return self._autocad_crashed_result(crash, command)
                 return CommandResult(
                     ok=False,
                     error="AutoCAD command state remained blocked after cancellation",
@@ -491,6 +985,9 @@ class FileIPCBackend(AutoCADBackend):
             # Poll for result
             deadline = time.time() + TIMEOUT
             while time.time() < deadline:
+                crash = detect_autocad_crash_state(self._hwnd, self._acad_process_id)
+                if crash.get("crashed"):
+                    return self._autocad_crashed_result(crash, command)
                 if result_file.exists():
                     try:
                         # AutoCAD LISP writes files in Windows-1252 encoding;
@@ -516,6 +1013,9 @@ class FileIPCBackend(AutoCADBackend):
                 await asyncio.sleep(POLL_INTERVAL)
 
             self._cancel_active_command()
+            crash = detect_autocad_crash_state(self._hwnd, self._acad_process_id)
+            if crash.get("crashed"):
+                return self._autocad_crashed_result(crash, command)
             return CommandResult(
                 ok=False,
                 error=(
@@ -695,6 +1195,17 @@ class FileIPCBackend(AutoCADBackend):
         if activate:
             mode = "foreground"
 
+        foreground_before = None
+        if sys.platform == "win32":
+            try:
+                import win32gui
+
+                foreground_before = win32gui.GetForegroundWindow()
+                if foreground_before and foreground_before != self._hwnd:
+                    self._user_foreground_hwnd = int(foreground_before)
+            except Exception:
+                pass
+
         transport = "win32"
         try:
             import pythoncom
@@ -724,6 +1235,13 @@ class FileIPCBackend(AutoCADBackend):
                     win32gui.ShowWindow(self._hwnd, win32con.SW_SHOWNOACTIVATE)
                 elif not self._window_policy_applied:
                     win32gui.ShowWindow(self._hwnd, win32con.SW_SHOWMINNOACTIVE)
+                if mode != "foreground" and foreground_before:
+                    current = win32gui.GetForegroundWindow()
+                    if current == self._hwnd and current != foreground_before:
+                        try:
+                            win32gui.SetForegroundWindow(foreground_before)
+                        except Exception:
+                            pass
             except Exception:
                 pass
         self._window_policy_applied = True
@@ -855,23 +1373,134 @@ class FileIPCBackend(AutoCADBackend):
     # --- Drawing management ---
 
     async def drawing_info(self) -> CommandResult:
-        return await self._dispatch("drawing-info", {})
+        result = await self._dispatch("drawing-info", {})
+        context = await self.document_context()
+        if result.ok and context.ok and isinstance(result.payload, dict):
+            result.payload.update(context.payload)
+        return result
 
     async def drawing_save(self, path: str | None = None) -> CommandResult:
         try:
-            return CommandResult(ok=True, payload=self._save_via_com(path))
+            actual = self._save_via_com(path)
+            requested = {"path": str(Path(path).expanduser().resolve()) if path else None}
+            return CommandResult(
+                ok=True,
+                payload={
+                    **actual,
+                    "requested": requested,
+                    "actual": actual,
+                    "diff": [],
+                },
+            )
         except Exception as com_error:
             result = await self._dispatch("drawing-save", {"path": path})
             if result.ok and isinstance(result.payload, dict):
-                result.payload["warning"] = f"COM save unavailable: {com_error}"
-            return result
+                _, details = exception_context(
+                    com_error,
+                    operation="drawing.save",
+                    parameters={"path": path},
+                    system_call="AutoCAD.Document.SaveAs",
+                    file_path=path,
+                )
+                result.payload["com_fallback"] = details
+                return result
+            failure = self._exception_result(
+                com_error,
+                operation="drawing.save",
+                parameters={"path": path},
+                system_call="AutoCAD.Document.SaveAs",
+                file_path=path,
+                recommended_action="verify_document_path_permissions_and_retry",
+            )
+            failure.payload["dispatcher_fallback"] = result.to_dict()
+            return failure
 
     async def drawing_save_as_dxf(self, path: str) -> CommandResult:
         try:
-            return CommandResult(ok=True, payload=self._export_dxf_via_com(path))
+            actual = self._export_dxf_via_com(path)
+            return CommandResult(
+                ok=True,
+                payload={
+                    **actual,
+                    "requested": {"path": str(Path(path).expanduser().resolve()), "format": "dxf"},
+                    "actual": actual,
+                    "diff": [],
+                },
+            )
         except Exception as exc:
-            return CommandResult(ok=False, error=str(exc), error_code="E_DXF_EXPORT")
+            return self._exception_result(
+                exc,
+                operation="drawing.save_as_dxf",
+                parameters={"path": path},
+                system_call="AutoCAD.Document.Export",
+                file_path=path,
+                error_code="E_DXF_EXPORT",
+                recommended_action="verify_dxf_output_path_and_export_settings",
+            )
 
+    async def drawing_copy_dwg(self, path: str) -> CommandResult:
+        try:
+            import pythoncom
+            import win32com.client
+
+            output = Path(path).expanduser().resolve()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.unlink(missing_ok=True)
+            pythoncom.CoInitialize()
+            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            document = application.ActiveDocument
+            before = self._bind_document(document)
+            selection_name = f"MCP_WBLOCK_{uuid.uuid4().hex[:8]}"
+            selection = document.SelectionSets.Add(selection_name)
+            try:
+                selection.Select(5)
+                document.Wblock(str(output), selection)
+            finally:
+                try:
+                    selection.Delete()
+                except Exception:
+                    pass
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and not output.is_file():
+                time.sleep(0.1)
+            if not output.is_file() or output.stat().st_size <= 0:
+                raise RuntimeError(f"AutoCAD Wblock did not create a non-empty DWG: {output}")
+            after = self._bind_document(application.ActiveDocument)
+            differences = []
+            for field in ("active_doc_id", "active_path"):
+                if before[field] != after[field]:
+                    differences.append(
+                        {"path": field, "requested": before[field], "actual": after[field]}
+                    )
+            if differences:
+                return CommandResult(
+                    ok=False,
+                    error="DWG copy changed the active document",
+                    error_code="E_DOCUMENT_ID_MISMATCH",
+                    payload={"requested": before, "actual": after, "diff": differences},
+                )
+            return CommandResult(
+                ok=True,
+                payload={
+                    "path": str(output),
+                    "format": "dwg",
+                    "renderer": "autocad-com-wblock",
+                    "read_only_context": True,
+                    "requested": {"path": str(output), "source": before},
+                    "actual": {"path": str(output), "source": after},
+                    "diff": [],
+                    **after,
+                },
+            )
+        except Exception as exc:
+            return self._exception_result(
+                exc,
+                operation="drawing.copy_dwg",
+                parameters={"path": path},
+                system_call="AutoCAD.Document.Wblock",
+                file_path=path,
+                recommended_action="verify_output_path_and_wblock_availability",
+            )
     async def drawing_create(self, name: str | None = None) -> CommandResult:
         requested = str(name).strip() if name else None
         try:
@@ -889,6 +1518,7 @@ class FileIPCBackend(AutoCADBackend):
                 document.SaveAs(str(output), 64)
             actual_path = str(document.FullName or document.Name)
             actual_name = str(document.Name)
+            context = self._bind_document(document, force_new=True)
             if requested:
                 expected = str(Path(requested).expanduser().resolve().with_suffix(".dwg"))
                 if os.path.normcase(str(Path(actual_path).resolve())) != os.path.normcase(expected):
@@ -907,10 +1537,21 @@ class FileIPCBackend(AutoCADBackend):
                     "actual_name": actual_name,
                     "actual_path": actual_path,
                     "name_honored": not requested or os.path.normcase(actual_path) == os.path.normcase(expected),
+                    "requested": {"path": requested, "format": "dwg"},
+                    "actual": {"path": actual_path, "name": actual_name, "format": "dwg"},
+                    "diff": [],
+                    **context,
                 },
             )
         except Exception as exc:
-            return CommandResult(ok=False, error=f"Drawing create failed: {exc}")
+            return self._exception_result(
+                exc,
+                operation="drawing.create",
+                parameters={"name": name},
+                system_call="AutoCAD.Documents.Add/Document.SaveAs",
+                file_path=requested,
+                recommended_action="restart_autocad_or_choose_a_valid_managed_dwg_path",
+            )
 
     async def drawing_purge(self) -> CommandResult:
         return await self._dispatch("drawing-purge", {})
@@ -941,33 +1582,338 @@ class FileIPCBackend(AutoCADBackend):
             },
         )
 
+    def _publish_staged_file(
+        self, staging: Path, output: Path, *, timeout: float = 2.0
+    ) -> dict:
+        """Publish atomically, copying away from an AutoCAD-owned source lock."""
+        started = time.monotonic()
+        deadline = started + max(0.0, float(timeout))
+        last_lock = None
+        while True:
+            try:
+                os.replace(staging, output)
+                return {
+                    "mode": "atomic-rename",
+                    "wait_seconds": round(time.monotonic() - started, 3),
+                    "staging_removed": True,
+                }
+            except PermissionError as exc:
+                last_lock = exc
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.1)
+
+        publish_copy = output.with_name(
+            f".{output.stem}.{uuid.uuid4().hex}.publish{output.suffix}"
+        )
+        try:
+            shutil.copyfile(staging, publish_copy)
+            os.replace(publish_copy, output)
+        except Exception:
+            self._remove_staging_file(publish_copy, timeout=0.0)
+            raise last_lock
+        staging_removed = self._remove_staging_file(staging, timeout=0.0)
+        if not staging_removed:
+            self._deferred_output_cleanup.add(staging)
+        return {
+            "mode": "copy-then-atomic-rename",
+            "wait_seconds": round(time.monotonic() - started, 3),
+            "staging_removed": staging_removed,
+        }
+
+    @staticmethod
+    def _remove_staging_file(path: Path, *, timeout: float = 2.0) -> bool:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            try:
+                path.unlink(missing_ok=True)
+                return True
+            except PermissionError:
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.1)
+            except OSError:
+                return False
+
+    def _cleanup_deferred_outputs(self, *, timeout: float = 0.0) -> list[str]:
+        removed = []
+        for path in list(self._deferred_output_cleanup):
+            if self._remove_staging_file(path, timeout=timeout):
+                self._deferred_output_cleanup.discard(path)
+                removed.append(str(path))
+        return removed
+
+    @staticmethod
+    def _start_output_viewer_guard(
+        path: Path, foreground_anchor: int | None = None
+    ) -> dict:
+        """Hide and close only a viewer window opened for this exact output file."""
+        state = {
+            "enabled": sys.platform == "win32",
+            "target": str(path),
+            "foreground_before": None,
+            "events": [],
+            "preexisting_pids": set(),
+            "stop": threading.Event(),
+            "thread": None,
+        }
+        if sys.platform != "win32":
+            return state
+        try:
+            import win32con
+            import win32gui
+            import win32process
+
+            target_name = path.name.casefold()
+            current_foreground = win32gui.GetForegroundWindow()
+            state["foreground_before"] = foreground_anchor or current_foreground
+
+            def remember_process(hwnd, _):
+                try:
+                    state["preexisting_pids"].add(
+                        int(win32process.GetWindowThreadProcessId(hwnd)[1])
+                    )
+                except Exception:
+                    pass
+                return True
+
+            win32gui.EnumWindows(remember_process, None)
+
+            def watch() -> None:
+                seen = set()
+                while not state["stop"].is_set():
+                    def inspect(hwnd, _):
+                        try:
+                            title = win32gui.GetWindowText(hwnd) or ""
+                            if target_name not in title.casefold() or hwnd in seen:
+                                return True
+                            seen.add(hwnd)
+                            process_id = win32process.GetWindowThreadProcessId(hwnd)[1]
+                            was_foreground = win32gui.GetForegroundWindow() == hwnd
+                            win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+                            win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                            restored = False
+                            previous = state["foreground_before"]
+                            if was_foreground and previous and win32gui.IsWindow(previous):
+                                try:
+                                    win32gui.SetForegroundWindow(previous)
+                                    restored = True
+                                except Exception:
+                                    pass
+                            state["events"].append(
+                                {
+                                    "hwnd": int(hwnd),
+                                    "process_id": int(process_id),
+                                    "title": title,
+                                    "hidden": True,
+                                    "close_requested": True,
+                                    "foreground_restored": restored,
+                                }
+                            )
+                        except Exception:
+                            pass
+                        return True
+
+                    try:
+                        win32gui.EnumWindows(inspect, None)
+                    except Exception:
+                        pass
+                    if state["events"]:
+                        try:
+                            foreground = win32gui.GetForegroundWindow()
+                            foreground_pid = int(
+                                win32process.GetWindowThreadProcessId(foreground)[1]
+                            )
+                            previous = state["foreground_before"]
+                            process_name = _process_executable_name(foreground_pid)
+                            is_new_process = foreground_pid not in state["preexisting_pids"]
+                            is_focus_stealer = process_name in {
+                                "acad.exe",
+                                "wpspdf.exe",
+                                "acrord32.exe",
+                                "foxitpdfreader.exe",
+                                "sumatrapdf.exe",
+                            }
+                            if foreground != previous and (is_new_process or is_focus_stealer):
+                                title = win32gui.GetWindowText(foreground) or ""
+                                if is_new_process:
+                                    win32gui.ShowWindow(foreground, win32con.SW_HIDE)
+                                    win32gui.PostMessage(
+                                        foreground, win32con.WM_CLOSE, 0, 0
+                                    )
+                                restored = False
+                                if previous and win32gui.IsWindow(previous):
+                                    try:
+                                        win32gui.SetForegroundWindow(previous)
+                                        restored = True
+                                    except Exception:
+                                        pass
+                                state["events"].append(
+                                    {
+                                        "hwnd": int(foreground),
+                                        "process_id": foreground_pid,
+                                        "process_name": process_name,
+                                        "title": title,
+                                        "hidden": is_new_process,
+                                        "close_requested": is_new_process,
+                                        "foreground_restored": restored,
+                                        "new_viewer_process": is_new_process,
+                                        "focus_recovered": True,
+                                    }
+                                )
+                        except Exception:
+                            pass
+                    state["stop"].wait(0.02)
+
+            thread = threading.Thread(
+                target=watch, name="autocad-mcp-viewer-guard", daemon=True
+            )
+            state["thread"] = thread
+            thread.start()
+        except Exception as exc:
+            state["enabled"] = False
+            state["error"] = str(exc)
+        return state
+
+    @staticmethod
+    def _stop_output_viewer_guard(state: dict, *, grace: float = 1.5) -> dict:
+        thread = state.get("thread")
+        if thread is not None:
+            time.sleep(max(0.0, float(grace)))
+            state["stop"].set()
+            thread.join(timeout=1.0)
+        return {
+            "enabled": bool(state.get("enabled")),
+            "target": state.get("target"),
+            "foreground_before": state.get("foreground_before"),
+            "viewer_detected": bool(state.get("events")),
+            "viewer_suppressed": bool(state.get("events")),
+            "events": list(state.get("events", [])),
+            **({"error": state["error"]} if state.get("error") else {}),
+        }
+
     async def drawing_plot_pdf(
         self,
         path: str,
-        paper: str = "A4",
-        orientation: str = "auto",
+        paper: str = "A3",
+        orientation: str = "landscape",
         plot_style: str = "monochrome.ctb",
         scale_mode: str = "fit",
         scale: str = "1:1",
         center: bool = True,
     ) -> CommandResult:
+        output = Path(path).expanduser().resolve()
+        staging = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.tmp.pdf")
+        requested = {
+            "path": str(output),
+            "paper": str(paper).upper(),
+            "orientation": str(orientation).lower(),
+            "plot_style": plot_style,
+            "scale_mode": str(scale_mode).lower(),
+            "scale": str(scale),
+            "center": bool(center),
+        }
+        viewer_guard_state = self._start_output_viewer_guard(
+            staging, self._user_foreground_hwnd
+        )
         try:
-            payload = self._plot_preview_via_com(
-                path, paper, orientation, plot_style, scale_mode, scale, center
+            actual = self._plot_preview_via_com(
+                str(staging), paper, orientation, plot_style, scale_mode, scale, center
             )
-            return CommandResult(ok=True, payload=payload)
         except Exception as com_error:
-            result = await self._dispatch("drawing-plot-pdf", {"path": path})
-            output = Path(path).expanduser().resolve()
-            if result.ok and output.is_file() and output.stat().st_size > 0:
-                payload = result.payload if isinstance(result.payload, dict) else {"path": str(output)}
-                payload.update(renderer="autolisp-plot", warning=f"COM plot unavailable: {com_error}")
-                return CommandResult(ok=True, payload=payload)
-            fallback_error = result.error or "AutoLISP reported success but no non-empty PDF was created"
+            result = await self._dispatch("drawing-plot-pdf", {"path": str(staging)})
+            if result.ok and staging.is_file() and staging.stat().st_size > 0:
+                actual = result.payload if isinstance(result.payload, dict) else {"path": str(staging)}
+                _, fallback = exception_context(
+                    com_error,
+                    operation="drawing.plot_pdf",
+                    parameters=requested,
+                    system_call="AutoCAD.Plot.PlotToFile",
+                    file_path=str(output),
+                )
+                actual.update(renderer="autolisp-plot", com_fallback=fallback)
+            else:
+                fallback_error = result.error or "AutoLISP reported success but no non-empty PDF was created"
+                self._remove_staging_file(staging)
+                failure = self._exception_result(
+                    com_error,
+                    operation="drawing.plot_pdf",
+                    parameters=requested,
+                    system_call="AutoCAD.Plot.PlotToFile",
+                    file_path=str(output),
+                    recommended_action="verify_plot_device_output_path_and_autocad_state",
+                )
+                failure.payload["dispatcher_fallback"] = {
+                    "error": fallback_error,
+                    "result": result.to_dict(),
+                }
+                failure.payload["viewer_guard"] = self._stop_output_viewer_guard(
+                    viewer_guard_state
+                )
+                return failure
+
+        viewer_guard = self._stop_output_viewer_guard(viewer_guard_state)
+        actual["viewer_guard"] = viewer_guard
+
+        try:
+            pdf_page = self._read_pdf_page(str(staging))
+        except Exception as exc:
+            self._remove_staging_file(staging)
+            return self._exception_result(
+                exc,
+                operation="drawing.plot_pdf.verify",
+                parameters=requested,
+                system_call="PyMuPDF.open/page.mediabox",
+                file_path=str(Path(path).expanduser().resolve()),
+                error_code="E_PLOT_PAGE_MISMATCH",
+                recommended_action="inspect_generated_pdf_and_plot_device",
+            )
+
+        pdf_page["path"] = str(output)
+        actual = {
+            **actual,
+            "path": str(output),
+            "staged_path": str(staging),
+            "pdf_page": pdf_page,
+        }
+        differences = self._plot_differences(requested, actual)
+        payload = {
+            **actual,
+            "verified": not differences,
+            "requested": requested,
+            "actual": actual,
+            "diff": differences,
+        }
+        if differences:
+            self._remove_staging_file(staging)
             return CommandResult(
                 ok=False,
-                error=f"COM plot failed: {com_error}; AutoLISP plot failed: {fallback_error}",
+                error="Generated PDF page or plot settings do not match the requested configuration",
+                error_code="E_PLOT_PAGE_MISMATCH",
+                recoverable=False,
+                recommended_action="inspect_plot_device_media_and_retry",
+                payload=payload,
             )
+        try:
+            publication = self._publish_staged_file(staging, output)
+        except Exception as exc:
+            staging_removed = self._remove_staging_file(staging)
+            failure = self._exception_result(
+                exc,
+                operation="drawing.plot_pdf.publish",
+                parameters=requested,
+                system_call="os.replace",
+                file_path=str(output),
+                error_code="E_OUTPUT_LOCKED",
+                recommended_action="close_the_file_owner_and_retry",
+            )
+            failure.payload["staging_removed"] = staging_removed
+            return failure
+        actual.pop("staged_path", None)
+        payload.pop("staged_path", None)
+        payload["actual"] = actual
+        payload["publication"] = publication
+        return CommandResult(ok=True, payload=payload)
 
     async def drawing_audit(
         self,
@@ -1073,16 +2019,35 @@ class FileIPCBackend(AutoCADBackend):
                 error_code="E_OUTPUT_EXISTS",
             )
         output.parent.mkdir(parents=True, exist_ok=True)
-        if force:
-            output.unlink(missing_ok=True)
+        staging = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.tmp.png")
         try:
             raster = self._plot_png_via_com(
-                output, paper=paper, orientation=orientation, plot_style=plot_style, dpi=int(dpi)
+                staging, paper=paper, orientation=orientation, plot_style=plot_style, dpi=int(dpi)
             )
             try:
                 digest = geometry_digest(self._collect_entities_via_com())
             except Exception:
                 digest = None
+            try:
+                publication = self._publish_staged_file(staging, output)
+            except Exception as exc:
+                staging_removed = self._remove_staging_file(staging)
+                failure = self._exception_result(
+                    exc,
+                    operation="drawing.render_preview.publish",
+                    parameters={
+                        "path": str(output), "paper": paper, "orientation": orientation,
+                        "dpi": dpi, "force": force,
+                    },
+                    system_call="os.replace",
+                    file_path=str(output),
+                    error_code="E_OUTPUT_LOCKED",
+                    recommended_action="close_the_file_owner_and_retry",
+                )
+                failure.payload["staging_removed"] = staging_removed
+                return failure
+            raster["path"] = str(output)
+            raster["publication"] = publication
             return CommandResult(
                 ok=True,
                 payload={
@@ -1092,7 +2057,34 @@ class FileIPCBackend(AutoCADBackend):
                 },
             )
         except Exception as exc:
-            return CommandResult(ok=False, error=f"PNG preview failed: {exc}")
+            self._remove_staging_file(staging)
+            return self._exception_result(
+                exc,
+                operation="drawing.render_preview",
+                parameters={"path": str(output), "paper": paper, "orientation": orientation, "dpi": dpi},
+                system_call="AutoCAD.Plot.PlotToFile",
+                file_path=str(output),
+            )
+
+    @staticmethod
+    def _correct_png_orientation(
+        path: Path, selected_orientation: str
+    ) -> tuple[int, int, bool]:
+        """Normalize raster orientation after AutoCAD device-specific rotation."""
+        from PIL import Image
+
+        with Image.open(path) as image:
+            width, height = image.size
+            needs_rotation = (
+                selected_orientation == "landscape" and width < height
+            ) or (
+                selected_orientation == "portrait" and width > height
+            )
+            if not needs_rotation:
+                return width, height, False
+            rotated = image.transpose(Image.Transpose.ROTATE_90)
+            rotated.save(path, format="PNG")
+            return rotated.width, rotated.height, True
 
     def _plot_png_via_com(
         self, output: Path, *, paper: str, orientation: str, plot_style: str, dpi: int
@@ -1181,14 +2173,17 @@ class FileIPCBackend(AutoCADBackend):
                 time.sleep(0.1)
             if not output.is_file() or output.stat().st_size <= 0:
                 raise RuntimeError(f"AutoCAD PNG PlotToFile returned {plotted} without an output file")
-            with Image.open(output) as image:
-                width, height = image.size
+            width, height, orientation_corrected = self._correct_png_orientation(
+                output, selected_orientation
+            )
             return {
                 "path": str(output),
+                "document_path": str(document.FullName or document.Name),
                 "format": "png",
                 "renderer": "autocad-native-png-plot",
                 "paper": paper,
                 "orientation": selected_orientation,
+                "orientation_corrected": orientation_corrected,
                 "plot_style": plot_style,
                 "media": media,
                 "requested_dpi": dpi,
@@ -1211,6 +2206,82 @@ class FileIPCBackend(AutoCADBackend):
                     document.SetVariable("BACKGROUNDPLOT", old_background_plot)
                 except Exception:
                     pass
+
+    @staticmethod
+    def _read_pdf_page(path: str) -> dict:
+        import fitz
+
+        output = Path(path).expanduser().resolve()
+        document = fitz.open(str(output))
+        try:
+            if document.page_count != 1:
+                raise ValueError(f"Expected one PDF page, received {document.page_count}")
+            page = document.load_page(0)
+            rect = page.rect
+            width_points, height_points = float(rect.width), float(rect.height)
+        finally:
+            document.close()
+        width_mm = width_points * 25.4 / 72.0
+        height_mm = height_points * 25.4 / 72.0
+        standard = {
+            "A0": (841.0, 1189.0),
+            "A1": (594.0, 841.0),
+            "A2": (420.0, 594.0),
+            "A3": (297.0, 420.0),
+            "A4": (210.0, 297.0),
+            "LETTER": (215.9, 279.4),
+        }
+        normalized = sorted((width_mm, height_mm))
+        detected_paper = min(
+            standard,
+            key=lambda name: max(
+                abs(normalized[0] - min(standard[name])),
+                abs(normalized[1] - max(standard[name])),
+            ),
+        )
+        expected = sorted(standard[detected_paper])
+        paper_error_mm = max(
+            abs(normalized[0] - expected[0]), abs(normalized[1] - expected[1])
+        )
+        return {
+            "path": str(output),
+            "page_count": 1,
+            "mediabox_points": [round(width_points, 3), round(height_points, 3)],
+            "width_mm": round(width_mm, 3),
+            "height_mm": round(height_mm, 3),
+            "orientation": "landscape" if width_mm >= height_mm else "portrait",
+            "detected_paper": detected_paper,
+            "paper_error_mm": round(paper_error_mm, 3),
+            "verified_standard_paper": paper_error_mm <= 2.0,
+        }
+
+    @staticmethod
+    def _plot_differences(requested: dict, actual: dict) -> list[dict]:
+        differences = []
+        pdf_page = actual.get("pdf_page") or {}
+
+        def compare(path: str, expected, received) -> None:
+            if str(expected).casefold() != str(received).casefold():
+                differences.append(
+                    {"path": path, "requested": expected, "actual": received}
+                )
+
+        compare("path", requested["path"], actual.get("path"))
+        compare("paper", requested["paper"], pdf_page.get("detected_paper"))
+        if requested["orientation"] != "auto":
+            compare("orientation", requested["orientation"], pdf_page.get("orientation"))
+        compare("scale_mode", requested["scale_mode"], actual.get("scale_mode"))
+        if requested["scale_mode"] == "fixed":
+            compare("scale", requested["scale"], actual.get("scale"))
+        if not pdf_page.get("verified_standard_paper", False):
+            differences.append(
+                {
+                    "path": "pdf_page.mediabox",
+                    "requested": requested["paper"],
+                    "actual": pdf_page,
+                }
+            )
+        return differences
 
     async def drawing_get_variables(self, names: list[str] | None = None) -> CommandResult:
         if names:
@@ -1262,6 +2333,15 @@ class FileIPCBackend(AutoCADBackend):
         if result.ok:
             self._audit_revision = 0
             self._audit_fingerprints = None
+            context = await self.document_context()
+            if context.ok and isinstance(result.payload, dict):
+                result.payload.update(
+                    {
+                        **context.payload,
+                        "requested_path": str(Path(path).expanduser().resolve()),
+                        "diff": [],
+                    }
+                )
         return result
 
     def _save_via_com(self, path: str | None, file_type: int | None = None) -> dict:
@@ -1271,6 +2351,7 @@ class FileIPCBackend(AutoCADBackend):
         pythoncom.CoInitialize()
         application = win32com.client.GetActiveObject("AutoCAD.Application")
         document = application.ActiveDocument
+        identity = self._bind_document(document)
         if not path:
             document.Save()
             return {"path": str(document.FullName), "renderer": "autocad-com-save"}
@@ -1288,6 +2369,7 @@ class FileIPCBackend(AutoCADBackend):
         if not output.exists():
             raise RuntimeError(f"AutoCAD SaveAs completed but file is missing: {output}")
         active_path = Path(str(document.FullName)).expanduser().resolve()
+        self._doc_ids_by_key[self._document_key(document)] = identity["doc_id"]
         if os.path.normcase(str(active_path)) != os.path.normcase(str(output)):
             raise RuntimeError(
                 f"AutoCAD SaveAs did not activate the requested output: {active_path} != {output}"
@@ -1558,8 +2640,10 @@ class FileIPCBackend(AutoCADBackend):
         if target_layer != "0":
             try:
                 document.Layers.Item(target_layer)
-            except Exception:
-                document.Layers.Add(target_layer)
+            except Exception as exc:
+                raise LayerNotFoundError(
+                    f"Layer does not exist: {target_layer}"
+                ) from exc
 
         if kind == "line":
             entity = modelspace.AddLine(
@@ -1633,12 +2717,34 @@ class FileIPCBackend(AutoCADBackend):
             result = self._create_entity_via_com(kind, params, layer)
             self._auto_fit_view()
             return result
+        except LayerNotFoundError as exc:
+            return CommandResult(
+                ok=False,
+                error=str(exc),
+                error_code="E_LAYER_NOT_FOUND",
+                recoverable=False,
+                recommended_action="create_or_select_an_existing_layer",
+                payload={"operation": command, "layer": str(layer), "entity_created": False},
+            )
         except Exception as com_error:
             result = await self._dispatch(command, dispatch_params)
+            _, details = exception_context(
+                com_error,
+                operation=command,
+                parameters=dispatch_params,
+                system_call=f"AutoCAD.ModelSpace.{kind}",
+            )
             if result.ok and isinstance(result.payload, dict):
                 result.payload["renderer"] = "autolisp-fallback"
-                result.payload["com_warning"] = str(com_error)
-            return result
+                result.payload["com_fallback"] = details
+                return result
+            failure = CommandResult(
+                ok=False,
+                error=f"{command} failed in both COM and dispatcher transports",
+                error_code="E_SYSTEM_CALL_FAILED",
+                payload={"com": details, "dispatcher": result.to_dict()},
+            )
+            return failure
 
     async def create_line(self, x1, y1, x2, y2, layer=None) -> CommandResult:
         params = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
@@ -2075,7 +3181,11 @@ class FileIPCBackend(AutoCADBackend):
             self._auto_fit_view()
             return CommandResult(ok=True, payload=self._solid_payload(solid, "box"))
         except Exception as exc:
-            return CommandResult(ok=False, error=str(exc), error_code="E_SOLID_OPERATION")
+            return self._exception_result(
+                exc, operation="solid.create_box",
+                parameters={"center": center, "length": length, "width": width, "height": height, "layer": layer},
+                system_call="AutoCAD.ModelSpace.AddBox", error_code="E_SOLID_OPERATION",
+            )
 
     async def solid_create_cylinder(self, base_center, radius, height, layer=None) -> CommandResult:
         try:
@@ -2091,7 +3201,11 @@ class FileIPCBackend(AutoCADBackend):
             self._auto_fit_view()
             return CommandResult(ok=True, payload=self._solid_payload(solid, "cylinder"))
         except Exception as exc:
-            return CommandResult(ok=False, error=str(exc), error_code="E_SOLID_OPERATION")
+            return self._exception_result(
+                exc, operation="solid.create_cylinder",
+                parameters={"base_center": base_center, "radius": radius, "height": height, "layer": layer},
+                system_call="AutoCAD.ModelSpace.AddCylinder", error_code="E_SOLID_OPERATION",
+            )
 
     async def solid_extrude(
         self, profile_id, height, taper_angle=0.0, erase_profile=False, layer=None
@@ -2111,7 +3225,11 @@ class FileIPCBackend(AutoCADBackend):
             solid.Update()
             return CommandResult(ok=True, payload=self._solid_payload(solid, "extrude"))
         except Exception as exc:
-            return CommandResult(ok=False, error=str(exc), error_code="E_SOLID_OPERATION")
+            return self._exception_result(
+                exc, operation="solid.extrude",
+                parameters={"profile_id": profile_id, "height": height, "taper_angle": taper_angle, "layer": layer},
+                system_call="AutoCAD.ModelSpace.AddExtrudedSolid", error_code="E_SOLID_OPERATION",
+            )
         finally:
             if region is not None:
                 try:
@@ -2150,7 +3268,11 @@ class FileIPCBackend(AutoCADBackend):
             solid.Update()
             return CommandResult(ok=True, payload=self._solid_payload(solid, "revolve"))
         except Exception as exc:
-            return CommandResult(ok=False, error=str(exc), error_code="E_SOLID_OPERATION")
+            return self._exception_result(
+                exc, operation="solid.revolve",
+                parameters={"profile_id": profile_id, "axis_point": axis_point, "axis_direction": axis_direction, "angle": angle, "layer": layer},
+                system_call="AutoCAD.ModelSpace.AddRevolvedSolid", error_code="E_SOLID_OPERATION",
+            )
         finally:
             if region is not None:
                 try:
@@ -2172,7 +3294,11 @@ class FileIPCBackend(AutoCADBackend):
             solid.Update()
             return CommandResult(ok=True, payload=self._solid_payload(solid, "sweep"))
         except Exception as exc:
-            return CommandResult(ok=False, error=str(exc), error_code="E_SOLID_OPERATION")
+            return self._exception_result(
+                exc, operation="solid.sweep",
+                parameters={"profile_id": profile_id, "path_id": path_id, "layer": layer},
+                system_call="AutoCAD.ModelSpace.AddExtrudedSolidAlongPath", error_code="E_SOLID_OPERATION",
+            )
         finally:
             if region is not None:
                 try:
@@ -2201,12 +3327,37 @@ class FileIPCBackend(AutoCADBackend):
                 ok=True, payload=self._solid_payload(primary, f"boolean-{operation_name}")
             )
         except Exception as exc:
-            return CommandResult(ok=False, error=str(exc), error_code="E_SOLID_OPERATION")
+            return self._exception_result(
+                exc, operation=f"solid.boolean.{operation_name}",
+                parameters={"primary_id": primary_id, "tool_id": tool_id},
+                system_call="AutoCAD.3DSolid.Boolean", error_code="E_SOLID_OPERATION",
+            )
 
     # --- Layer operations ---
 
     async def layer_list(self) -> CommandResult:
         return await self._dispatch("layer-list", {})
+
+    async def layer_exists(self, name: str) -> CommandResult:
+        try:
+            import pythoncom
+            import win32com.client
+
+            pythoncom.CoInitialize()
+            document = win32com.client.GetActiveObject("AutoCAD.Application").ActiveDocument
+            try:
+                document.Layers.Item(str(name))
+                exists = True
+            except Exception:
+                exists = False
+            return CommandResult(ok=True, payload={"name": str(name), "exists": exists})
+        except Exception as exc:
+            return self._exception_result(
+                exc,
+                operation="layer.exists",
+                parameters={"name": name},
+                system_call="AutoCAD.Layers.Item",
+            )
 
     async def layer_create(
         self, name, color="white", linetype="CONTINUOUS", lineweight=None

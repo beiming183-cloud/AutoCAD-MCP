@@ -2,7 +2,9 @@
 
 MCP server for full AutoCAD automation, AutoCAD LT automation, and headless DXF generation.
 
-Version 3.8 treats every structured entity creation as a checked transaction: request fields are strict and immutable, the created handle is read back, geometry and layer are compared, and a mismatch is deleted with `E_POSTCONDITION_MISMATCH`. Atomic batches roll back when any semantic postcondition fails.
+Version 3.9 distinguishes AutoCAD crashes from missing documents, creates the first document through `Documents.Add`, keeps DXF audits fully offline, validates PDF mediabox/paper/orientation after plotting, and writes BOM-prefixed UTF-8 logs for Windows. The external Python/File IPC boundary contains dispatcher exceptions instead of introducing an in-process .NET plugin dependency.
+
+Structured entity creation remains a checked transaction: request fields are strict and immutable, the created handle is read back, geometry and layer are compared, and a mismatch is deleted with `E_POSTCONDITION_MISMATCH`. Atomic batches roll back when any semantic postcondition fails.
 
 This edition is based on [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp) and keeps its MIT license. It adds full AutoCAD COM command delivery, process-based window detection, optional AutoCAD startup, and session-scoped dispatcher loading.
 
@@ -13,7 +15,7 @@ Two backends, one API:
 | **File IPC** | Windows Python | Yes - full AutoCAD or AutoCAD LT 2024+ | Topology audit + native PDF and direct PNG |
 | **ezdxf** | Any platform | No (headless) | Structured audit + deterministic PNG |
 
-The server exposes **9 consolidated tools** (`drawing`, `entity`, `solid`, `layer`, `block`, `annotation`, `pid`, `view`, `system`) over the standard MCP stdio transport. It is client-independent and works with Codex, Claude Code, Claude Desktop, Cursor, and other MCP-compatible clients.
+The server exposes **10 consolidated tools** (`drawing`, `entity`, `solid`, `layer`, `block`, `annotation`, `pid`, `transaction`, `view`, `system`) over the standard MCP stdio transport. It is client-independent and works with Codex, Claude Code, Claude Desktop, Cursor, and other MCP-compatible clients.
 
 ## Prerequisites (File IPC backend)
 
@@ -41,7 +43,7 @@ Open AutoCAD or AutoCAD LT and load `mcp_dispatch.lsp` using **APPLOAD**:
 1. Type `APPLOAD` in the AutoCAD command line
 2. Browse to `<repo>/lisp-code/mcp_dispatch.lsp`
 3. Click **Load**
-4. You should see: `=== MCP Dispatch v3.8.0 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
+4. You should see: `=== MCP Dispatch v3.9.0 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
 
 > **Tip:** Add the file to your AutoCAD Startup Suite (in the APPLOAD dialog) so it loads automatically with every drawing.
 
@@ -120,13 +122,19 @@ system(operation="status")
 
 You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"` for headless mode.
 
+### Optional industrial design Skill
+
+[`skills/industrial-product-design`](skills/industrial-product-design/SKILL.md) is a client-neutral upstream workflow for briefs, concept gates, product architecture, configurations, motion, camera/render evidence, and honest CAD capability checks. Install or reference that folder in any `SKILL.md`-compatible client, then use `mechanical-drafting-gbt` downstream for GB/T manufacturing definition and release.
+
 ## Tools
 
 ### `drawing` — File/drawing management
 
 | Operation | Description | File IPC | ezdxf |
 |-----------|-------------|----------|-------|
-| `create` | Reset to clean drawing (erase all + purge) | Yes | Yes |
+| `create` | Create and activate a new document, optionally at a managed path | Yes | Yes |
+| `context` | Return active document ID, path, and monotonic revision | Yes | Yes |
+| `activate` | Activate an explicitly identified document and verify readback | Yes | Limited |
 | `open` | Open an existing drawing | Yes | Yes (DXF) |
 | `info` | Get entity count and layers | Yes | Yes |
 | `save` | Save current drawing (to path if given) | Yes | Yes |
@@ -167,6 +175,8 @@ For `ANSI31`, pass `angle: 0` to retain the pattern's native 45-degree section a
 
 The `solid` tool is available on full AutoCAD through the native ActiveX object model. Box placement uses its center; cylinder placement uses the center of its base. Extrude, revolve, and sweep consume a closed profile handle; boolean accepts `union`, `intersection`, or `subtract`. AutoCAD LT and the ezdxf backend report these operations as unsupported. Edge fillets/chamfers and projected drawing views are not advertised yet because their prompt-driven workflows have not reached the same deterministic standard.
 
+`system.status` includes an `industrial_capabilities` matrix. It explicitly separates verified features from unavailable stable edge/face selection, shelling, parametric assemblies, motion sweeps, surface analysis, and offscreen material rendering. Clients must not infer those features from basic solid support.
+
 ### `layer` — Layer management
 
 `list`, `create`, `set_current`, `set_properties`, `freeze`, `thaw`, `lock`, `unlock`
@@ -202,6 +212,22 @@ The `solid` tool is available on full AutoCAD through the native ActiveX object 
 
 Normal validation is data-first: use `drawing.audit` after edits and `drawing.render_preview` at milestones. `get_screenshot` remains available only for diagnosing AutoCAD UI state.
 
+### `transaction` - Document-scoped transactions
+
+`begin`, `commit`, `rollback`
+
+Every modifying tool requires the `doc_id` and `expected_revision` returned by `drawing(operation="context")`. A document mismatch returns `E_DOCUMENT_ID_MISMATCH`; stale or missing revision data returns `E_DOCUMENT_REVISION_MISMATCH`. Transactions return a `transaction_id` and use AutoCAD undo marks so a failed stage can be rolled back as one unit.
+
+```json
+{
+  "operation": "begin",
+  "doc_id": "acad-...",
+  "expected_revision": 12
+}
+```
+
+Layer names are preconditions. Creating geometry on an absent layer returns `E_LAYER_NOT_FOUND` before mutation instead of silently falling back to layer `0`.
+
 ### Data-first validation
 
 ```text
@@ -210,7 +236,7 @@ edit entities -> drawing.audit -> native render_preview -> audit_dxf for final d
 
 `drawing.audit` returns entity counts by type and layer, drawing bounds, units, a handle-independent geometry digest, geometry DRC, an endpoint topology graph, limited normalized entity geometry, and added/modified/removed handles since the previous audit. In addition to degenerate geometry, rules can check connection gaps, dangling endpoints, interior crossings, explicit tangent pairs, equal-radius groups, and cross-view projection alignment. `limit` is clamped to 500 so large drawings do not flood model context.
 
-`drawing.render_preview` always returns a real PNG. Full AutoCAD plots a temporary PDF with its native renderer and rasterizes it with PyMuPDF, preserving plot styles without capturing the desktop. The result includes DPI, pixel size, SHA-256, and the source geometry digest. `drawing.plot_pdf` remains the release-quality vector output.
+`drawing.render_preview` always returns a real PNG. Full AutoCAD writes it through the native PNG plot device without capturing the desktop or opening a viewer. The result includes DPI, pixel size, orientation correction, SHA-256, and the source geometry digest. `drawing.plot_pdf` remains the release-quality vector output.
 
 ### Industrial delivery jobs
 
@@ -295,6 +321,7 @@ The File IPC backend sends `(c:mcp-dispatch)` to the active drawing. Full AutoCA
 | `AUTOCAD_MCP_ACTIVATE_ON_DRAW` | `false` | Allow per-command activation only when `AUTOCAD_MCP_WINDOW_MODE=foreground` |
 | `AUTOCAD_MCP_AUTO_FIT` | `true` | Automatically center and fit drawing extents after geometry changes |
 | `AUTOCAD_MCP_OUTPUT_ROOT` | `~/Documents/AutoCAD-MCP` | Unified root for specs, scripts, models, drawings, reports, outputs, jobs, templates, logs, and archives |
+| `AUTOCAD_MCP_LOG_PATH` | `<output-root>/logs/autocad-mcp.log` | BOM-prefixed UTF-8 diagnostic log readable by Windows PowerShell |
 | `AUTOCAD_MCP_ALLOW_EXTERNAL_OUTPUTS` | `false` | Permit writes outside the managed output root; disabled by default |
 | `AUTOCAD_MCP_ACAD_EXE` | empty | Full path to `acad.exe` used by automatic startup |
 | `AUTOCAD_MCP_ACAD_SCRIPT` | empty | Optional AutoCAD `.scr` file passed with `/b` during startup |
@@ -302,6 +329,8 @@ The File IPC backend sends `(c:mcp-dispatch)` to the active drawing. Full AutoCA
 | `AUTOCAD_MCP_LISP_PATH` | empty | Dispatcher path loaded for the current AutoCAD session only |
 
 > `mcp_dispatch.lsp` reads `AUTOCAD_MCP_IPC_DIR` from the AutoCAD process environment and falls back to `C:/temp`.
+
+`drawing.audit_dxf` is an offline operation and does not start AutoCAD, require an active document, or ping the dispatcher. `drawing.plot_pdf` defaults to `A3`, `landscape`, and `FIT`; the result includes requested settings, actual document/output paths, PDF mediabox dimensions, detected paper/orientation, and field-level differences.
 
 ## Development
 
@@ -324,7 +353,26 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 
 The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
 
-## What's New in v3.7
+## What's New in v3.9
+
+- **Document identity and optimistic revisions** - create/open/activate/context responses carry document ID, requested/active paths, and monotonic revision; all modifications reject wrong or stale contexts.
+- **Public transactions** - explicit begin/commit/rollback joins atomic batch rollback and missing-layer preconditions.
+- **Crash and system error classification** - fatal AutoCAD state, COM failures, file paths, system calls, errno/winerror, and recovery actions use structured error envelopes.
+- **Read-only delivery copies** - DWG packaging uses `Wblock` and verifies the active source document and path did not change.
+- **Offline DXF audits** - DXF parsing does not start AutoCAD or require a dispatcher or active document.
+- **Atomic outputs** - PDF and PNG publish through validated temporary files; locked destinations return `E_OUTPUT_LOCKED` without half-written artifacts.
+- **Verified paper and orientation** - A3 landscape FIT is the PDF default, mediabox settings are read back, and device-rotated PNG output is normalized.
+- **No viewer focus theft** - a per-output window guard hides and closes only the exact temporary PDF opened by an external viewer, restores the last non-AutoCAD user window, and records suppression evidence.
+- **Cold-start stability gate** - AutoCAD must return the same active document through consecutive COM reads; dispatcher loading is retried within a fixed bound before readiness is reported.
+- **Honest industrial capability reporting** - status exposes verified features and names advanced 3D, assembly, analysis, selection, and rendering functions that remain unsupported.
+
+### v3.8
+
+- **Immutable entity contracts** - strict requests are read back by handle with `requested`, `actual`, and `diff`; mismatches are deleted and fail the atomic batch.
+- **Semantic topology** - component ownership, line class, and intentional open ends feed stricter dangling-endpoint and crossing audits.
+- **No-focus desktop behavior** - AutoCAD remains user-visible in the taskbar but minimized by default, drawing calls do not steal focus, and PDF/PNG viewers are never launched.
+
+### v3.7
 
 - **Topology-aware DRC** - audits expose endpoint connectivity and configurable checks for near misses, dangling endpoints, non-endpoint crossings, tangency, equal-radius groups, and projection alignment.
 - **Atomic batches** - `create_batch` opens an AutoCAD undo transaction by default and rolls back the whole batch on failure.

@@ -568,20 +568,39 @@ class TestVariableNameStripping:
 class TestVerifiedPdfPlot:
     @pytest.mark.asyncio
     async def test_plot_pdf_prefers_native_com(self, monkeypatch, tmp_path):
+        import fitz
         from autocad_mcp.backends.file_ipc import FileIPCBackend
 
         backend = FileIPCBackend()
         output = tmp_path / "drawing.pdf"
+
+        def fake_plot(path, *args):
+            document = fitz.open()
+            document.new_page(width=420 / 25.4 * 72, height=297 / 25.4 * 72)
+            document.save(path)
+            document.close()
+            return {
+                "path": str(path),
+                "renderer": "autocad-plot",
+                "paper": "A3",
+                "orientation": "landscape",
+                "scale_mode": "fit",
+                "scale": "fit",
+                "center": True,
+            }
         monkeypatch.setattr(
             backend,
             "_plot_preview_via_com",
-            lambda *args: {"path": str(output), "renderer": "autocad-plot"},
+            fake_plot,
         )
 
         result = await backend.drawing_plot_pdf(str(output))
 
         assert result.ok is True
         assert result.payload["renderer"] == "autocad-plot"
+        assert result.payload["verified"] is True
+        assert result.payload["pdf_page"]["detected_paper"] == "A3"
+        assert result.payload["diff"] == []
 
     @pytest.mark.asyncio
     async def test_plot_pdf_rejects_lisp_false_success(self, monkeypatch, tmp_path):
@@ -603,7 +622,11 @@ class TestVerifiedPdfPlot:
         result = await backend.drawing_plot_pdf(str(output))
 
         assert result.ok is False
-        assert "no non-empty PDF" in result.error
+        assert result.error_code == "E_SYSTEM_CALL_FAILED"
+        assert result.payload["operation"] == "drawing.plot_pdf"
+        assert result.payload["system_call"] == "AutoCAD.Plot.PlotToFile"
+        assert result.payload["file_path"] == str(output.resolve())
+        assert "dispatcher_fallback" in result.payload
 
 
 def test_dispatch_trigger_refuses_persistently_busy_command_state(monkeypatch):

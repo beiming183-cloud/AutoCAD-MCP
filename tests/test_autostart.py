@@ -57,6 +57,12 @@ async def test_file_ipc_ensure_ready_loads_and_version_checks_dispatcher(monkeyp
     backend = FileIPCBackend()
     backend._ipc_dir = tmp_path / "ipc"
     monkeypatch.setattr(file_ipc, "find_autocad_window", lambda: 123)
+    monkeypatch.setattr(file_ipc, "_window_process_id", lambda hwnd: 456)
+    monkeypatch.setattr(
+        file_ipc,
+        "detect_autocad_crash_state",
+        lambda hwnd=None, process_id=None: {"crashed": False, "process_id": process_id},
+    )
     monkeypatch.setattr(backend, "_ensure_autocad_visible", lambda: {"shown": True})
     monkeypatch.setattr(backend, "_ensure_active_document", lambda: {"ready": True, "name": "Drawing1.dwg"})
     monkeypatch.setattr(
@@ -72,9 +78,12 @@ async def test_file_ipc_ensure_ready_loads_and_version_checks_dispatcher(monkeyp
         backend,
         "_dispatch",
         AsyncMock(
-            return_value=CommandResult(
-                    ok=True, payload={"pong": True, "dispatcher_version": "3.8.0"}
-            )
+            side_effect=[
+                CommandResult(ok=False, error="AutoCAD COM is still registering"),
+                CommandResult(
+                    ok=True, payload={"pong": True, "dispatcher_version": "3.9.0"}
+                ),
+            ]
         ),
     )
     monkeypatch.delenv("AUTOCAD_MCP_LISP_PATH", raising=False)
@@ -84,5 +93,7 @@ async def test_file_ipc_ensure_ready_loads_and_version_checks_dispatcher(monkeyp
     assert result.ok is True
     assert result.payload["ready"] is True
     assert result.payload["autocad"]["product"] == "AutoCAD 2025"
-    assert result.payload["dispatcher"]["version"] == "3.8.0"
+    assert result.payload["dispatcher"]["version"] == "3.9.0"
+    assert result.payload["dispatcher"]["load_attempts"] == 2
+    assert len(typed) == 2
     assert typed and "mcp_dispatch.lsp" in typed[0]

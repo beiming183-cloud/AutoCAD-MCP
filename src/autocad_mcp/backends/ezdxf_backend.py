@@ -15,6 +15,7 @@ import structlog
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
 from autocad_mcp.audit import INSUNITS_NAMES, audit_dxf_file, build_audit, normalize_ezdxf_entity
 from autocad_mcp.drafting import lineweight_hundredths
+from autocad_mcp.errors import LayerNotFoundError
 from autocad_mcp.screenshot import MatplotlibScreenshotProvider
 from autocad_mcp.variables import validate_variable_updates
 
@@ -77,7 +78,7 @@ class EzdxfBackend(AutoCADBackend):
 
     def _ensure_layer(self, layer: str | None):
         if layer and layer not in self._doc.layers:
-            self._doc.layers.add(layer)
+            raise LayerNotFoundError(f"Layer does not exist: {layer}")
 
     # --- Drawing management ---
 
@@ -218,6 +219,9 @@ class EzdxfBackend(AutoCADBackend):
         self._audit_revision = 0
         self._audit_fingerprints = None
         self._semantic_store().clear()
+        if hasattr(self, "_document_state"):
+            delattr(self, "_document_state")
+        context = (await self.document_context()).payload
         return CommandResult(
             ok=True,
             payload={
@@ -225,6 +229,7 @@ class EzdxfBackend(AutoCADBackend):
                 "requested_name": name,
                 "actual_name": self._save_path or "untitled.dxf",
                 "name_honored": bool(name),
+                **context,
             },
         )
 
@@ -243,7 +248,10 @@ class EzdxfBackend(AutoCADBackend):
             self._audit_revision = 0
             self._audit_fingerprints = None
             self._semantic_store().clear()
-            return CommandResult(ok=True, payload={"path": path})
+            if hasattr(self, "_document_state"):
+                delattr(self, "_document_state")
+            context = (await self.document_context()).payload
+            return CommandResult(ok=True, payload={"path": path, **context})
         except Exception as ex:
             return CommandResult(ok=False, error=str(ex))
 
@@ -397,6 +405,10 @@ class EzdxfBackend(AutoCADBackend):
                     height=e.dxf.height,
                     rotation=e.dxf.rotation,
                 )
+            normalized = normalize_ezdxf_entity(e)
+            for field in ("bounds", "length", "area", "volume"):
+                if normalized.get(field) is not None:
+                    info[field] = normalized[field]
             semantics = self._semantic_store().get(str(entity_id))
             if semantics:
                 info["semantics"] = dict(semantics)
@@ -572,6 +584,12 @@ class EzdxfBackend(AutoCADBackend):
                 "is_locked": l.is_locked(),
             })
         return CommandResult(ok=True, payload={"layers": layers})
+
+    async def layer_exists(self, name: str) -> CommandResult:
+        return CommandResult(
+            ok=True,
+            payload={"name": str(name), "exists": str(name) in self._doc.layers},
+        )
 
     def _ensure_linetype(self, name: str) -> str:
         normalized = name.upper()

@@ -192,6 +192,8 @@ def test_explicit_equal_radius_projection_and_tangency_rules():
 async def test_ezdxf_backend_incremental_audit():
     backend = EzdxfBackend()
     await backend.initialize()
+    await backend.layer_create("OUTLINE")
+    await backend.layer_create("HOLES")
     await backend.create_line(0, 0, 10, 0, "OUTLINE")
     first = await backend.drawing_audit()
     assert first.ok
