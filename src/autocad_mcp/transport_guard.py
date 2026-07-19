@@ -43,6 +43,8 @@ def _bounded_float(value: Any, default: float, lower: float, upper: float) -> fl
         parsed = float(value)
     except (TypeError, ValueError):
         parsed = default
+    if not math.isfinite(parsed):
+        parsed = default
     return max(lower, min(upper, parsed))
 
 
