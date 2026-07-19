@@ -184,6 +184,18 @@
     server conditionally closes the matching accepted record and returns
     explicit journal reconciliation evidence instead of leaving a permanent
     `E_OPERATION_IN_PROGRESS` state.
+77. A process-wide FIFO `TransportGuard` now serializes every MCP tool handler,
+    bounds the waiting queue, and applies a sliding-window admission budget;
+    rejected bursts return structured retry metadata instead of interleaving
+    AutoCAD calls or exhausting the desktop host.
+78. Screenshot responses are persisted under the managed output root and
+    return path, dimensions, byte count, and SHA-256 by default. Inline image
+    content requires explicit opt-in and a byte ceiling.
+79. `_json` enforces `AUTOCAD_MCP_MAX_RESPONSE_BYTES`; oversized entity/audit
+    results become a compact hash/count evidence envelope rather than flooding
+    the MCP transcript.
+80. The incident runbook records the 2026-07-19 454-call/18-screenshot context
+    flood as a host-pressure failure distinct from AutoCAD's startup crash.
 
 ## MCP client registration
 

@@ -21,7 +21,9 @@ from autocad_mcp.client import (
     add_screenshot_if_available,
     ensure_backend_ready,
     get_backend,
+    request_admission_snapshot,
     reset_backend,
+    _screenshot_result,
     tool_error,
 )
 from autocad_mcp.contracts import build_entity_expectation
@@ -2022,14 +2024,11 @@ async def view(
         return _json(result.to_dict())
     elif operation == "get_screenshot":
         result = await backend.get_screenshot()
-        if result.ok and result.payload:
-            from mcp.types import ImageContent, TextContent
-
-            return [
-                TextContent(type="text", text=_json({"ok": True, "screenshot": "attached"})),
-                ImageContent(type="image", data=result.payload, mimeType="image/png"),
-            ]
-        return _json(result.to_dict())
+        return _screenshot_result(
+            result,
+            include_image=bool(data.get("include_image", False)),
+            stem="view-capture",
+        )
     else:
         return tool_error(f"Unknown view operation: {operation}", code="E_UNSUPPORTED_OPERATION")
 
@@ -2150,6 +2149,7 @@ async def system(
                 "cwd": os.getcwd(),
                 "backend_env": os.environ.get("AUTOCAD_MCP_BACKEND", "auto"),
                 "wsl_interop": bool(os.environ.get("WSL_INTEROP")),
+                "request_admission": request_admission_snapshot(),
             }
         )
     elif operation == "supervisor_status":

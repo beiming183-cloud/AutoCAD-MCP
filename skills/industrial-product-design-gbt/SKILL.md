@@ -68,6 +68,8 @@ These gates apply before and during native 3D work. A successful command respons
 - **P1 render truth**: Bind each view to document, revision, configuration, fixed camera/projection, actual visual style, resolution, visible components, nonblank ratio, clipping state, content hash, and `material_render_verified`. Wireframe/linework output cannot pass a shaded or material review.
 - **P1 prepared views**: Section and exploded evidence require revision-bound section planes/cut sets or reversible component transforms. Ad-hoc camera movement is not a prepared section or exploded state.
 - **P1 plot truth**: `FIT`/`NTS` and fixed ratios are mutually exclusive. Verify paper, orientation, PDF MediaBox, viewport scale, and title-block declaration; any mixed claim is `PLOT_SCALE_CONSISTENCY=FAIL`.
+- **P0 transport pressure**: Route AutoCAD MCP calls through one FIFO lane with a bounded queue and sliding-window budget. Never launch parallel mutation or screenshot calls; when the guard returns a retryable limit/queue error, stop the round and preserve its evidence.
+- **P1 response truth**: Screenshot feedback returns a managed path, dimensions, byte count, and SHA-256 by default. Inline base64 requires explicit opt-in and a size ceiling; large entity/audit responses must be narrowed or read from saved artifacts instead of being replayed into the transcript.
 - **P1 evidence**: Preserve a machine-written `reports/round.json` containing identity, transactions, rollback proof, requested/actual diffs, DRC, interference method, render truth, plot truth, artifact hashes, cleanup, lessons, and next-round changes.
 
 ## Research and Tool Contract

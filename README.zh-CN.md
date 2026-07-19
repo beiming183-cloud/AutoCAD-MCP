@@ -203,6 +203,11 @@ uv run pytest tests -q
 - 行为规范见 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)。
 - 完整英文 API、环境变量和架构说明见 [README.md](README.md)。
 
+为避免桌面端被工具洪泛拖垮，MCP 默认把 AutoCAD 调用放入单一串行队列，
+并限制单位时间调用数和响应大小。`view.get_screenshot` 默认只返回 D 盘工作区中的
+PNG 路径、尺寸和 SHA-256，不回传 base64；只有显式设置
+`data.include_image=true` 且 `AUTOCAD_MCP_ALLOW_INLINE_IMAGES=true` 才会内嵌图片。
+
 本项目基于 [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp) 继续开发，并保留 MIT 许可证。
 
 ## 许可证

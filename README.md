@@ -327,9 +327,9 @@ The 3D protocol borrows proven patterns from [build123d](https://github.com/gumy
 | `zoom_extents` | Zoom to show all entities |
 | `zoom_window` | Zoom to a specified window |
 | `set_visual_style` | Apply an allowlisted built-in style (Conceptual, Realistic, Shaded, etc.) with optional verified entity colors; requires `doc_id` and `expected_revision` |
-| `get_screenshot` | Diagnostic-only AutoCAD window capture |
+| `get_screenshot` | Diagnostic-only capture; returns a managed PNG path, dimensions, and SHA-256 by default. Raw image content requires `data.include_image=true` plus `AUTOCAD_MCP_ALLOW_INLINE_IMAGES=true`. |
 
-Normal validation is data-first: use `drawing.audit` after edits and `drawing.render_preview` at milestones. `get_screenshot` remains available only for diagnosing AutoCAD UI state.
+Normal validation is data-first: use `drawing.audit` after edits and `drawing.render_preview` at milestones. `get_screenshot` remains available only for diagnosing AutoCAD UI state. The MCP serializes AutoCAD calls and caps response/call bursts so a parallel screenshot loop cannot exhaust the client context.
 
 ### `transaction` - Document-scoped transactions
 
@@ -481,6 +481,13 @@ The File IPC backend sends `(c:mcp-dispatch)` to the active drawing. Full AutoCA
 | `AUTOCAD_MCP_IPC_TIMEOUT` | `10.0` | IPC command timeout in seconds (1-300) |
 | `AUTOCAD_MCP_DOCUMENT_TIMEOUT` | `30.0` | Seconds to wait for COM registration and an active document after the window appears (5-120) |
 | `AUTOCAD_MCP_ONLY_TEXT` | `true` | Disable automatic screenshot attachments; direct diagnostic capture remains available |
+| `AUTOCAD_MCP_ALLOW_INLINE_IMAGES` | `false` | Explicitly allow raw screenshot image content in MCP responses; leave disabled to return path/hash metadata |
+| `AUTOCAD_MCP_MAX_INLINE_IMAGE_BYTES` | `262144` | Maximum PNG bytes allowed in an explicitly requested inline image |
+| `AUTOCAD_MCP_MAX_RESPONSE_BYTES` | `524288` | Hard response ceiling; oversized lists are replaced by a hash/count evidence envelope |
+| `AUTOCAD_MCP_TRANSPORT_WINDOW_BUDGET` (alias `AUTOCAD_MCP_MAX_CALLS_PER_WINDOW`) | `120` | Sliding-window MCP admission budget; prefer the namespaced variable, while AutoCAD calls remain serialized |
+| `AUTOCAD_MCP_TRANSPORT_WINDOW_SECONDS` (alias `AUTOCAD_MCP_CALL_WINDOW_SECONDS`) | `60` | Sliding-window duration for the MCP admission budget |
+| `AUTOCAD_MCP_TRANSPORT_MAX_QUEUE` | `32` | Maximum queued calls waiting for the single AutoCAD lane |
+| `AUTOCAD_MCP_TRANSPORT_QUEUE_TIMEOUT` (alias `AUTOCAD_MCP_REQUEST_QUEUE_TIMEOUT`) | `30` | Maximum time a concurrent request waits for the single AutoCAD queue |
 | `AUTOCAD_MCP_AUTOSTART` | `false` | Start AutoCAD automatically when File IPC is requested and no AutoCAD window exists |
 | `AUTOCAD_MCP_ACAD_PROFILE` | empty | Optional existing profile name or exported `.arg` path passed through `/p`; never changes the user's current profile |
 | `AUTOCAD_MCP_PROFILE_MODE` | `existing` | `existing`/`explicit`; `isolated` or `required` fails closed unless an explicit profile/ARG is supplied |

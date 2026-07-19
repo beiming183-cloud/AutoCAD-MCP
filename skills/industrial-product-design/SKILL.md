@@ -63,6 +63,8 @@ Any failed identity, transaction, topology, or output-integrity gate is a hard s
 - Label AABB overlap and sampled motion checks as broad-phase only. Distinguish containment, contact, permitted crossing, intentional motion overlays, and exact B-rep interference.
 - Re-import required exchange formats and compare units, body count, bounds, critical dimensions, and configuration identity.
 - Use deterministic named cameras and native/offscreen rendering for product review. Window screenshots and `SendKeys` are diagnostic fallbacks, not release evidence.
+- Serialize AutoCAD MCP calls through the transport guard. A bounded queue, sliding-window budget, and hard response ceiling are release-safety controls; stop a campaign on `E_TRANSPORT_*`/`E_MCP_*` admission errors rather than retrying in parallel.
+- Treat screenshots as file evidence: return path, dimensions, byte count, and SHA-256. Only embed image bytes after explicit opt-in and size verification, and prefer a fresh bounded review round after repeated context compaction.
 - Bind every render to document ID, revision, configuration, camera, style, resolution, output path, content hash, clipping state, visible components, and `material_render_verified`. A linework image cannot pass a shaded/material review.
 - Prepare revision-bound section planes/cut sets and exploded component transforms before requesting section or exploded evidence. Camera movement alone does not create either state.
 - Treat `FIT`/`NTS` and fixed numeric plot scales as mutually exclusive. Verify paper, orientation, PDF MediaBox, viewport scale, and title-block declaration before release.
