@@ -98,7 +98,11 @@
     name instead of silently returning `Drawing1.dwg`.
 43. AutoCAD process exit and fatal-error dialogs are classified as
     `E_AUTOCAD_CRASHED`; they no longer fall through to `E_NO_ACTIVE_DOCUMENT`.
-44. First-document startup uses `Documents.Add` before reading `ActiveDocument`,
+44. `view.set_visual_style` accepts only built-in AutoCAD styles, applies them
+    through the shared COM STA, and returns requested/actual/diff readback.
+    Native PNG and product previews can request a shaded style temporarily,
+    preserving the user's previous viewport presentation by default.
+44a. First-document startup uses `Documents.Add` before reading `ActiveDocument`,
     and dispatcher execution remains isolated in the external Python/File IPC process.
 45. `drawing.audit_dxf` bypasses backend initialization and parses DXF files fully
     offline, including when AutoCAD is stopped or has no document.
@@ -147,6 +151,39 @@
     rotated-AABB screening clearly labeled as non-exact B-rep interference.
 65. Appearance, ergonomics, adapter clearance, cable management, stability, and
     mains/rotation safety reviews use independent PASS/FAIL/NOT_EVALUATED verdicts.
+66. AutoCAD autostart uses shell-free configurable profile/argument provenance, a
+    minimized launch hint, consecutive stable-window reads, fatal-dialog settling
+    checks, durable startup evidence, and an identical-failure cooldown circuit
+    breaker.
+67. Recent Autodesk CER `rawdata-t2.pb` metadata can be parsed offline for
+    exception/build/theme-stack diagnosis; no dump upload or GUI viewer is required.
+68. The managed test workflow records harness interruptions separately from CAD
+    failures and avoids unbounded nested waits.
+69. Live campaign operations and the complete campaign now have independent
+    hard timeouts; timeout records use `E_TEST_OPERATION_TIMEOUT` or
+    `E_CAMPAIGN_TIMEOUT` instead of leaving an await pending.
+70. The bounded pytest runner starts a process group, attempts tree termination
+    on timeout, and records `alive_after` when the host denies cleanup.
+71. A timed-out COM callback quarantines the STA executor, drains queued work,
+    ignores late Future completion races, and exposes `E_COM_STA_TIMEOUT` /
+    `E_COM_STA_UNAVAILABLE` with a restart recommendation.
+72. Forced backend re-initialization now shuts down the old COM STA and drops
+    native transport handles without closing the user's AutoCAD process.
+73. Compatibility destructive product replacements fail closed before COM
+    access unless `AUTOCAD_MCP_ALLOW_UNVERIFIED_COMPAT_CUTOUTS=true` is set;
+    the default path therefore cannot delete a source solid without a proven
+    transaction.
+74. `drawing.activate` now requires `doc_id` plus a non-negative
+    `expected_revision`; native and COM paths validate the target before the
+    switch and verify active-document identity/revision afterward without
+    changing window focus or visibility.
+75. HATCH creation reads the new handle back and compares type, layer, pattern,
+    angle, and scale. A mismatch is erased with `E_POSTCONDITION_MISMATCH`, and
+    batch hatches use the same contract.
+76. If idempotency commit/fail persistence errors after a CAD operation, the
+    server conditionally closes the matching accepted record and returns
+    explicit journal reconciliation evidence instead of leaving a permanent
+    `E_OPERATION_IN_PROGRESS` state.
 
 ## MCP client registration
 

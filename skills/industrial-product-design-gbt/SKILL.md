@@ -1,6 +1,6 @@
 ---
 name: industrial-product-design-gbt
-description: Create and review industrial design and physical product design from brief through concept selection, product architecture, proportion, form language, ergonomics, human factors, controls, interfaces, CMF, parametric CAD, refined native 3D, surface quality, product rendering, motion states, engineering validation, DFM, and revision-bound GB/T handoff. Use for consumer products, consumer electronics, appliances, smart-home hardware, enclosures, tools, equipment, rotating mechanisms, reference-image redesign, aesthetic direction, prototype planning, 3D product-quality review, or any task where Codex must design or improve a physical product before mechanical drafting and manufacturing release.
+description: Create and review industrial design and physical product design from brief through concept selection, product architecture, proportion, form language, ergonomics, human factors, controls, interfaces, CMF, parametric CAD, refined native 3D, surface quality, product rendering, motion states, engineering validation, DFM, and revision-bound GB/T handoff. Use for consumer products, consumer electronics, appliances, smart-home hardware, enclosures, tools, equipment, rotating mechanisms, reference-image redesign, aesthetic direction, prototype planning, 3D product-quality review, or any task where an agent must design or improve a physical product before mechanical drafting and manufacturing release.
 ---
 
 # Industrial Product Design with GB/T Handoff
@@ -56,6 +56,19 @@ For Chinese-language drafting work, prefer the matching file under `references/z
 - Use `mechanical-drafting-gbt` downstream to complete manufacturing definition, GB/T drawings, dimensions, fits, GPS/GD&T, BOMs, DRC/DFM, exchange verification, and release evidence.
 - Do not enter manufacturing drawing work while the industrial-design gates for the claimed maturity remain failed or unevaluated.
 - Do not duplicate the complete GB/T rule set here; never weaken or bypass it at handoff.
+
+## CAD Reliability Gates
+
+These gates apply before and during native 3D work. A successful command response never overrides them.
+
+- **P0 document identity**: After `create`, `open`, `activate`, `save`, export, or render, read back document ID, requested and active paths, revision, configuration, and units. Every mutation carries document ID and expected revision. Divergence returns `E_DOCUMENT_ID_MISMATCH` and stops the stage without silently switching a user document.
+- **P0 atomic state**: Treat the semantic feature registry, native entity registry, and B-rep as one transaction. A failed feature, stale revision, missing layer, backend exception, timeout, or postcondition mismatch rolls back geometry, registry rows, layer changes, temporary outputs, and journal pointers. Prove rollback with before/after counts and revision.
+- **P0 postconditions**: Compare requested and actual kind, parameters, associations, stable IDs, bounds, volume, layer, and configuration transform after every mutable operation. Any unexplained diff or unknown handle is a hard stop; permit one bounded recovery, then change backend or mark `BLOCKED`.
+- **P1 interference semantics**: Label AABB and sampled-motion results as broad-phase only. Separate containment, contact, permitted crossing, intentional motion overlay, and exact B-rep interference; geometry validity cannot substitute for an assembly or motion verdict.
+- **P1 render truth**: Bind each view to document, revision, configuration, fixed camera/projection, actual visual style, resolution, visible components, nonblank ratio, clipping state, content hash, and `material_render_verified`. Wireframe/linework output cannot pass a shaded or material review.
+- **P1 prepared views**: Section and exploded evidence require revision-bound section planes/cut sets or reversible component transforms. Ad-hoc camera movement is not a prepared section or exploded state.
+- **P1 plot truth**: `FIT`/`NTS` and fixed ratios are mutually exclusive. Verify paper, orientation, PDF MediaBox, viewport scale, and title-block declaration; any mixed claim is `PLOT_SCALE_CONSISTENCY=FAIL`.
+- **P1 evidence**: Preserve a machine-written `reports/round.json` containing identity, transactions, rollback proof, requested/actual diffs, DRC, interference method, render truth, plot truth, artifact hashes, cleanup, lessons, and next-round changes.
 
 ## Research and Tool Contract
 

@@ -1,3 +1,3 @@
-"""AutoCAD MCP Server v3.10.1 with product-design and 3D evidence contracts."""
+"""AutoCAD MCP Server v4.0.0 with native transactional worker support."""
 
-__version__ = "3.10.1"
+__version__ = "4.0.0"

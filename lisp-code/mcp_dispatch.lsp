@@ -1,4 +1,4 @@
-;;; mcp_dispatch.lsp - File-based IPC dispatcher for AutoCAD MCP v3.10.1
+;;; mcp_dispatch.lsp - File-based IPC dispatcher for AutoCAD MCP v4.0.0
 ;;;
 ;;; Protocol:
 ;;;   1. Python writes command JSON to C:/temp/autocad_mcp_cmd_{id}.json
@@ -241,7 +241,7 @@
   (cond
     ;; --- Ping ---
     ((= cmd-name "ping")
- (cons T "{\"pong\":true,\"dispatcher_version\":\"3.10.1\"}"))
+ (cons T "{\"pong\":true,\"dispatcher_version\":\"4.0.0\"}"))
 
     ;; --- Freehand LISP execution ---
     ((= cmd-name "execute-lisp")
@@ -1001,7 +1001,7 @@
 
 ;; --- Entity query: get ---
 
-(defun mcp-cmd-entity-get (params / entity-id ent ent-data etype handle elayer result item point points)
+(defun mcp-cmd-entity-get (params / entity-id ent ent-data etype handle elayer result item point points pattern angle scale)
   (setq entity-id (mcp-json-get-string params "entity_id"))
   (if (= entity-id "last")
     (setq ent (entlast))
@@ -1043,9 +1043,20 @@
            )
          )
          (setq result (strcat result
-           ",\"points\":[" points "]"
-           ",\"closed\":" (if (and (assoc 70 ent-data) (= 1 (logand 1 (cdr (assoc 70 ent-data))))) "true" "false"))))
-        ((or (= etype "TEXT") (= etype "MTEXT"))
+            ",\"points\":[" points "]"
+            ",\"closed\":" (if (and (assoc 70 ent-data) (= 1 (logand 1 (cdr (assoc 70 ent-data))))) "true" "false"))))
+         ((= etype "HATCH")
+          ;; DXF group codes 2/52/41 are the native pattern, angle and scale.
+          ;; Returning them lets the Python boundary verify a hatch instead of
+          ;; trusting entlast alone.
+          (setq pattern (if (assoc 2 ent-data) (cdr (assoc 2 ent-data)) ""))
+          (setq angle (if (assoc 52 ent-data) (cdr (assoc 52 ent-data)) 0.0))
+          (setq scale (if (assoc 41 ent-data) (cdr (assoc 41 ent-data)) 1.0))
+          (setq result (strcat result
+            ",\"pattern\":\"" (mcp-escape-string pattern) "\""
+            ",\"angle\":" (rtos (* 180.0 (/ angle pi)) 2 6)
+            ",\"scale\":" (rtos scale 2 6))))
+         ((or (= etype "TEXT") (= etype "MTEXT"))
          (setq result (strcat result
            ",\"insert\":[" (rtos (car (cdr (assoc 10 ent-data))) 2 6) "," (rtos (cadr (cdr (assoc 10 ent-data))) 2 6) "]"
            ",\"text\":\"" (mcp-escape-string (cdr (assoc 1 ent-data))) "\""
@@ -1814,7 +1825,7 @@
 ;; Startup message
 ;; -----------------------------------------------------------------------
 
- (princ "\n=== MCP Dispatch v3.10.1 loaded ===")
+  (princ "\n=== MCP Dispatch v4.0.0 loaded ===")
 (princ "\nIPC directory: ")
 (princ *mcp-ipc-dir*)
 (princ "\nReady for commands via (c:mcp-dispatch)")

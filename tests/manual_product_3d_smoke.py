@@ -180,7 +180,7 @@ async def run(output_root: Path) -> dict:
         )
         summary.update(
             status="PASS",
-        version="3.10.1",
+        version="4.0.0",
             document=context.payload,
             visibility=backend._window_visibility_status(),
             document_creation=created_document.payload,

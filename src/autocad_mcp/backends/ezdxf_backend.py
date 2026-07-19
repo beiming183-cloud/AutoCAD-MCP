@@ -178,7 +178,22 @@ class EzdxfBackend(AutoCADBackend):
         plot_type="extents",
         normalize_framing=False,
         framing_fill=0.82,
+        visual_style=None,
+        preserve_visual_style=True,
     ) -> CommandResult:
+        if visual_style is not None:
+            return CommandResult(
+                ok=False,
+                error="The ezdxf backend cannot verify or apply an AutoCAD visual style",
+                error_code="E_VISUAL_STYLE_UNSUPPORTED",
+                recoverable=False,
+                recommended_action="use_file_ipc_or_native_render_backend_for_visual_style_evidence",
+                payload={
+                    "requested_visual_style": visual_style,
+                    "material_render_verified": False,
+                    "preserve_visual_style": bool(preserve_visual_style),
+                },
+            )
         output = Path(path).expanduser().resolve()
         if output.suffix.lower() != ".png":
             return CommandResult(ok=False, error="ezdxf preview output must use a .png extension")
@@ -210,15 +225,34 @@ class EzdxfBackend(AutoCADBackend):
                 "bytes": output.stat().st_size,
                 "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
                 "force_overwrite": bool(force),
+                "visual_style": None,
+                "material_render": False,
+                "material_render_verified": False,
+                "render_truth": "matplotlib_linework_unverified_as_material_render",
             },
         )
 
-    async def drawing_create(self, name: str | None = None) -> CommandResult:
+    async def drawing_create(
+        self, name: str | None = None, idempotency_key: str | None = None
+    ) -> CommandResult:
         self._doc = ezdxf.new("R2013")
         self._msp = self._doc.modelspace()
         self._screenshot.doc = self._doc
         self._entity_counter = 0
-        self._save_path = f"{name}.dxf" if name else None
+        # ``server.drawing(create)`` resolves a managed output target before
+        # calling the backend, so ``name`` may already contain an extension
+        # (and an absolute path).  Appending ``.dxf`` unconditionally used to
+        # produce names such as ``part.dxf.dxf`` and made the returned
+        # document identity disagree with the requested path.  Normalize once
+        # at the backend boundary while preserving the historical stem-only
+        # behaviour used by direct callers.
+        if name:
+            requested_path = Path(str(name)).expanduser()
+            if requested_path.suffix.lower() != ".dxf":
+                requested_path = requested_path.with_suffix(".dxf")
+            self._save_path = str(requested_path)
+        else:
+            self._save_path = None
         self._audit_revision = 0
         self._audit_fingerprints = None
         self._semantic_store().clear()
@@ -407,6 +441,12 @@ class EzdxfBackend(AutoCADBackend):
                     text=e.dxf.text,
                     height=e.dxf.height,
                     rotation=e.dxf.rotation,
+                )
+            elif e.dxftype() == "HATCH":
+                info.update(
+                    pattern=e.dxf.get("pattern_name", ""),
+                    angle=e.dxf.get("pattern_angle", 0.0),
+                    scale=e.dxf.get("pattern_scale", 1.0),
                 )
             normalized = normalize_ezdxf_entity(e)
             for field in ("bounds", "length", "area", "volume"):

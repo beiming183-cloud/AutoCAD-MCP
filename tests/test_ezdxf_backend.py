@@ -48,6 +48,13 @@ class TestDrawingManagement:
         assert r.payload["name"] == "TestDrawing"
         assert backend._save_path == "TestDrawing.dxf"
 
+    async def test_drawing_create_does_not_duplicate_existing_extension(self, backend, tmp_path):
+        requested = tmp_path / "TestDrawing.dxf"
+        r = await backend.drawing_create(str(requested))
+        assert r.ok
+        assert backend._save_path == str(requested)
+        assert not backend._save_path.endswith(".dxf.dxf")
+
     async def test_drawing_save(self, backend):
         with tempfile.NamedTemporaryFile(suffix=".dxf", delete=False) as f:
             path = f.name
@@ -136,6 +143,26 @@ class TestEntityCreation:
         r = await backend.create_text(10, 10, "Label", height=2.5, rotation=45)
         assert r.ok
         assert r.payload["entity_type"] == "TEXT"
+
+    async def test_create_hatch_readback_contract(self, backend):
+        boundary = await backend.create_polyline(
+            [[0, 0], [20, 0], [20, 10], [0, 10]], closed=True
+        )
+        hatch = await backend.create_hatch(
+            boundary.payload["handle"], pattern="ANSI31", angle=15.0, scale=2.0
+        )
+        verified = await backend.verify_created_hatch(
+            hatch,
+            entity_id=boundary.payload["handle"],
+            pattern="ANSI31",
+            angle=15.0,
+            scale=2.0,
+        )
+        assert verified.ok
+        assert verified.payload["verified"] is True
+        assert verified.payload["actual"]["pattern"] == "ANSI31"
+        assert abs(float(verified.payload["actual"]["angle"]) - 15.0) < 1e-6
+        assert abs(float(verified.payload["actual"]["scale"]) - 2.0) < 1e-6
 
 
 # ---------------------------------------------------------------------------

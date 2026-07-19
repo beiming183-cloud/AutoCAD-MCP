@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ApplicationPackage
+  SchemaVersion="1.0"
+  AppVersion="4.0.0"
+  ProductCode="{7C6EDC4D-BE42-4D0E-95A8-67FB9B02C3B7}"
+  UpgradeCode="{D49C282A-CCF6-46C7-A8D7-F3FB5C8C8C15}"
+  Name="AutoCAD MCP Native Worker">
+  <CompanyDetails Name="AutoCAD-MCP" Url="https://github.com/beiming183-cloud/AutoCAD-MCP" />
+  <RuntimeRequirements OS="Win64" Platform="AutoCAD*" SeriesMin="R25.0" SeriesMax="R25.1" />
+  <Components>
+    <ComponentEntry
+      AppName="AutoCADMcp.Plugin"
+      ModuleName="./Contents/Windows/AutoCADMcp.Plugin.dll"
+      AppDescription="Transactional local worker for AutoCAD MCP"
+      LoadOnAutoCADStartup="True" />
+  </Components>
+</ApplicationPackage>

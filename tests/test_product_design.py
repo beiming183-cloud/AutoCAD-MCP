@@ -9,6 +9,8 @@ from autocad_mcp.product_design import (
     image_content_metrics,
     image_difference,
     interference_sample,
+    mark_feature_handles_invalid,
+    mark_feature_replaced,
     normalize_feature,
     query_edges_by_semantic_role,
     register_feature,
@@ -62,6 +64,73 @@ def test_rounded_box_contract_and_semantic_edge_query():
     assert result["stable_across_rebuild"] is True
     assert result["native_brep_edge_indices_exposed"] is False
     assert result["edges"][0]["fillet_radius"] == 5
+
+
+def test_erased_native_handle_invalidates_registry_without_deleting_evidence():
+    backend = ProductBackend()
+    register_feature(backend, "doc", rounded_feature())
+
+    result = mark_feature_handles_invalid(backend, "doc", ["body-handle"])
+    # The fixture has no native handle until the backend returns one; emulate
+    # the real product response before checking the invalidation contract.
+    backend._product_states["doc"]["features"]["body"]["handle"] = "body-handle"
+    result = mark_feature_handles_invalid(backend, "doc", ["body-handle"])
+
+    assert result["invalidated"] == ["body"]
+    feature = backend._product_states["doc"]["features"]["body"]
+    assert feature["registry_status"] == "INVALID"
+    assert feature["verified"] is False
+    assert "body" in backend._product_states["doc"]["features"]
+
+
+def test_boolean_replacement_marks_old_feature_historical():
+    backend = ProductBackend()
+    feature = rounded_feature()
+    feature["handle"] = "old"
+    register_feature(backend, "doc", feature)
+
+    result = mark_feature_replaced(
+        backend, "doc", "old", "new", replacement_feature_id="cavity"
+    )
+
+    assert result["replaced"] == ["body"]
+    old = backend._product_states["doc"]["features"]["body"]
+    assert old["registry_status"] == "REPLACED"
+    assert old["verified"] is False
+    assert old["replaced_by_handle"] == "new"
+
+
+def test_invalid_and_replaced_features_are_excluded_from_interference():
+    backend = ProductBackend()
+    moving = rounded_feature("moving", "rotor", (0, 0, 0))
+    moving["handle"] = "moving-handle"
+    stale = rounded_feature("stale", "obsolete", (0, 0, 0))
+    stale["handle"] = "stale-handle"
+    fixed = rounded_feature("fixed", "base", (120, 0, 0))
+    register_feature(backend, "doc", moving)
+    register_feature(backend, "doc", stale)
+    register_feature(backend, "doc", fixed)
+    mark_feature_handles_invalid(backend, "doc", ["stale-handle"])
+
+    result = interference_sample(backend, "doc")
+
+    assert result["status"] == "PASS"
+    assert result["findings"] == []
+
+
+def test_aabb_containment_is_not_reported_as_exact_interference():
+    backend = ProductBackend()
+    register_feature(backend, "doc", rounded_feature("housing", "housing"))
+    insert = rounded_feature("insert", "insert")
+    insert["bounds"] = {"min": [-10, -10, -5], "max": [10, 10, 5]}
+    register_feature(backend, "doc", insert)
+
+    result = interference_sample(backend, "doc")
+
+    assert result["status"] == "NOT_EVALUATED"
+    assert result["overlap_candidates"] == []
+    assert result["containment_candidates"][0]["relation"] == "first_contains_second"
+    assert result["exact_brep_status"] == "NOT_EVALUATED"
 
 
 def test_usb_cutout_rejects_concept_dimensions():

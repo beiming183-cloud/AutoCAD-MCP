@@ -68,3 +68,15 @@ PIDv4-CTO/
 
 # pytest
 .pytest_cache/
+.pytest-local/
+.pytest-local-*/
+
+# Native plugin build output
+/native/**/bin/
+/native/**/obj/
+/native/artifacts/
+
+# Workstation-only recovery and inventory evidence
+/docs/TOOLS-INVENTORY-UPDATE-*.md
+/docs/tool-installation-record-*.md
+/scripts/restore_autocad_user_profile.ps1

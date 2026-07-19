@@ -196,3 +196,47 @@ def workspace_info() -> dict[str, Any]:
         "folders": {name: str(path) for name, path in folders.items() if name != "root"},
         "allow_external_outputs": _env_flag("AUTOCAD_MCP_ALLOW_EXTERNAL_OUTPUTS"),
     }
+
+
+def cleanup_test_job_artifacts(job_id: str) -> dict[str, Any]:
+    """Delete managed CAD artifacts while retaining specs, audits, and logs."""
+    folders = ensure_workspace()
+    jobs_root = folders["jobs"].resolve()
+    job_root = (jobs_root / str(job_id)).resolve()
+    if job_root == jobs_root or not _is_within(job_root, jobs_root):
+        raise ValueError("job_id must resolve to a managed job directory")
+    if job_root.name == "_journal" or not job_root.is_dir():
+        raise FileNotFoundError(f"Managed job does not exist: {job_id}")
+
+    artifact_categories = ("models", "drawings", "dxf", "pdf", "previews", "outputs")
+    deleted = []
+    for category in artifact_categories:
+        category_root = job_root / category
+        if not category_root.is_dir():
+            continue
+        for path in sorted(item for item in category_root.rglob("*") if item.is_file()):
+            record = {
+                "path": str(path.relative_to(job_root)),
+                "category": category,
+                "bytes": path.stat().st_size,
+                "sha256": sha256_file(path),
+            }
+            path.unlink()
+            record["deleted"] = True
+            deleted.append(record)
+
+    report = {
+        "schema_version": 1,
+        "job_id": str(job_id),
+        "cleanup_type": "test-artifacts",
+        "cleaned_at": datetime.now().astimezone().isoformat(),
+        "job_root": str(job_root),
+        "deleted_count": len(deleted),
+        "deleted_bytes": sum(item["bytes"] for item in deleted),
+        "deleted": deleted,
+        "retained_categories": ["specs", "audits", "reports", "logs"],
+    }
+    report_path = job_root / "reports" / "artifact-cleanup.json"
+    write_json_atomic(report_path, report)
+    report["report_path"] = str(report_path)
+    return report

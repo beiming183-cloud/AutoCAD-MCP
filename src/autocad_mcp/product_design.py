@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -165,12 +166,40 @@ def aabb_overlap(first: dict[str, Any], second: dict[str, Any], clearance: float
         )
         axes.append({"axis": axis, "overlap": penetration})
     intersects = all(axis["overlap"] > -clearance for axis in axes)
+    first_contains_second = all(
+        float(first["min"][index]) <= float(second["min"][index]) + clearance
+        and float(first["max"][index]) >= float(second["max"][index]) - clearance
+        for index in range(3)
+    )
+    second_contains_first = all(
+        float(second["min"][index]) <= float(first["min"][index]) + clearance
+        and float(second["max"][index]) >= float(first["max"][index]) - clearance
+        for index in range(3)
+    )
+    touching = intersects and any(abs(axis["overlap"]) <= clearance for axis in axes)
+    if not intersects:
+        relation = "separated"
+    elif first_contains_second and second_contains_first:
+        relation = "coincident_bounds"
+    elif first_contains_second:
+        relation = "first_contains_second"
+    elif second_contains_first:
+        relation = "second_contains_first"
+    elif touching:
+        relation = "contact_candidate"
+    else:
+        relation = "overlap_candidate"
     return {
         "intersects": intersects,
+        "relation": relation,
+        "containment": relation in {
+            "coincident_bounds", "first_contains_second", "second_contains_first"
+        },
         "clearance": clearance,
         "axis_overlaps": axes,
         "method": "broad_phase_aabb",
         "exact_brep_interference": False,
+        "interference_proven": False,
     }
 
 
@@ -185,7 +214,10 @@ def normalize_module_contract(data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("measured modules require physical_measurement authority")
     if status == "supplier_controlled" and authority != "supplier_drawing":
         raise ValueError("supplier_controlled modules require supplier_drawing authority")
-    do_not_dimension = bool(data.get("do_not_dimension_apertures", True))
+    raw_do_not_dimension = data.get("do_not_dimension_apertures", True)
+    if not isinstance(raw_do_not_dimension, bool):
+        raise ValueError("do_not_dimension_apertures must be a boolean")
+    do_not_dimension = raw_do_not_dimension
     return {
         "module_status": status,
         "authority": authority,
@@ -202,9 +234,14 @@ def normalize_motion(data: dict[str, Any]) -> dict[str, Any]:
     component_id = str(data.get("component_id", "")).strip()
     if not component_id:
         raise ValueError("motion component_id is required")
-    axis_point = point3(data.get("motion_axis", {}).get("point", data.get("axis_point")), "axis_point")
+    axis_spec = data.get("motion_axis", {})
+    if axis_spec is None:
+        axis_spec = {}
+    if not isinstance(axis_spec, Mapping):
+        raise ValueError("motion_axis must be an object with point and direction")
+    axis_point = point3(axis_spec.get("point", data.get("axis_point")), "axis_point")
     direction = point3(
-        data.get("motion_axis", {}).get("direction", data.get("axis_direction")),
+        axis_spec.get("direction", data.get("axis_direction")),
         "axis_direction",
     )
     magnitude = math.sqrt(sum(value * value for value in direction))
@@ -271,6 +308,7 @@ def product_state(backend: Any, doc_id: str) -> dict[str, Any]:
         {
             "revision": 0,
             "features": {},
+            "feature_history": [],
             "motions": {},
             "reviews": {},
             "views": {},
@@ -283,15 +321,110 @@ def register_feature(backend: Any, doc_id: str, feature: dict[str, Any]) -> dict
     feature_id = str(feature.get("feature_id", "")).strip()
     if not feature_id:
         raise ValueError("feature_id is required")
-    state["features"][feature_id] = dict(feature)
+    existing = state["features"].get(feature_id)
+    if existing is not None:
+        if existing.get("registry_status", "VALID") == "VALID" and existing.get(
+            "verified", True
+        ):
+            raise ValueError(f"feature_id is already registered and valid: {feature_id}")
+        state.setdefault("feature_history", []).append(
+            {
+                **existing,
+                "archived_reason": "feature_id_reused_after_invalidation_or_replacement",
+            }
+        )
+    stored = dict(feature)
+    # A feature is only considered usable while its native handle is known to
+    # belong to the current document.  Keep invalid/replaced records for
+    # audit history, but never silently present them as verified geometry.
+    stored.setdefault("registry_status", "VALID")
+    stored.setdefault("verified", True)
+    state["features"][feature_id] = stored
     state["revision"] += 1
-    return {**feature, "product_state_revision": state["revision"]}
+    return {**stored, "product_state_revision": state["revision"]}
+
+
+def mark_feature_handles_invalid(
+    backend: Any,
+    doc_id: str,
+    handles: list[str] | set[str] | tuple[str, ...],
+    *,
+    reason: str = "native_entity_erased",
+) -> dict[str, Any]:
+    """Invalidate registry records whose native handle was erased.
+
+    The record remains in the registry as evidence, but its ``verified`` flag
+    is cleared so stale handles cannot be used for dimensions, edge queries,
+    or release decisions.  This is deliberately synchronous and backend
+    agnostic; the caller is responsible for proving the erase succeeded.
+    """
+    normalized = {str(handle).strip() for handle in handles if str(handle).strip()}
+    state = product_state(backend, doc_id)
+    invalidated: list[str] = []
+    if not normalized:
+        return {"invalidated": invalidated, "stale_count": 0, "product_state_revision": state["revision"]}
+    for feature_id, feature in state["features"].items():
+        candidates = {
+            str(feature.get("handle", "")),
+            str(feature.get("target_id", "")),
+            str(feature.get("replaced_target_handle", "")),
+            str(feature.get("replaced_by_handle", "")),
+        }
+        if not normalized.intersection(candidates):
+            continue
+        if feature.get("registry_status") == "INVALID" and not feature.get("verified", True):
+            continue
+        feature["registry_status"] = "INVALID"
+        feature["verified"] = False
+        feature["invalid_reason"] = reason
+        feature["invalid_handles"] = sorted(normalized.intersection(candidates))
+        invalidated.append(str(feature_id))
+    if invalidated:
+        state["revision"] += 1
+    return {
+        "invalidated": invalidated,
+        "stale_count": len(invalidated),
+        "product_state_revision": state["revision"],
+    }
+
+
+def mark_feature_replaced(
+    backend: Any,
+    doc_id: str,
+    old_handle: str | None,
+    new_handle: str | None,
+    *,
+    replacement_feature_id: str | None = None,
+) -> dict[str, Any]:
+    """Mark a Boolean-replaced feature as historical, never silently valid."""
+    old = str(old_handle or "").strip()
+    new = str(new_handle or "").strip()
+    state = product_state(backend, doc_id)
+    replaced: list[str] = []
+    if not old:
+        return {"replaced": replaced, "product_state_revision": state["revision"]}
+    for feature_id, feature in state["features"].items():
+        if str(feature.get("handle", "")) != old:
+            continue
+        feature["registry_status"] = "REPLACED"
+        feature["verified"] = False
+        feature["replaced_by_handle"] = new or None
+        feature["replacement_feature_id"] = replacement_feature_id
+        replaced.append(str(feature_id))
+    if replaced:
+        state["revision"] += 1
+    return {"replaced": replaced, "product_state_revision": state["revision"]}
 
 
 def list_features(backend: Any, doc_id: str) -> dict[str, Any]:
     state = product_state(backend, doc_id)
+    features = list(state["features"].values())
     return {
-        "features": list(state["features"].values()),
+        "features": features,
+        "feature_history": list(state.get("feature_history", [])),
+        "stale_count": sum(
+            1 for feature in features if feature.get("registry_status") in {"INVALID", "REPLACED"}
+        ),
         "product_state_revision": state["revision"],
     }
 
@@ -306,6 +439,10 @@ def query_edges_by_semantic_role(
     feature = get_feature(backend, doc_id, feature_id)
     if not feature:
         raise ValueError(f"Unknown feature_id: {feature_id}")
+    if feature.get("registry_status") in {"INVALID", "REPLACED"} or not feature.get("verified", True):
+        raise ValueError(
+            f"Feature {feature_id} is {feature.get('registry_status', 'INVALID')} and cannot be queried"
+        )
     edges = list(feature.get("semantic_edges", []))
     if role:
         edges = [edge for edge in edges if edge.get("role") == role]
@@ -324,6 +461,10 @@ def measure_registered_feature(
     feature = get_feature(backend, doc_id, feature_id)
     if not feature:
         raise ValueError(f"Unknown feature_id: {feature_id}")
+    if feature.get("registry_status") in {"INVALID", "REPLACED"} or not feature.get("verified", True):
+        raise ValueError(
+            f"Feature {feature_id} is {feature.get('registry_status', 'INVALID')} and cannot be measured"
+        )
     if measurement == "fillet_radius" and feature.get("kind") in {"rounded_box", "recessed_panel"}:
         return {
             "feature_id": feature_id,
@@ -351,8 +492,12 @@ def interference_sample(
 ) -> dict[str, Any]:
     state = product_state(backend, doc_id)
     selected = [
-        feature for feature in state["features"].values()
-        if not component_ids or feature.get("component_id") in component_ids
+        feature
+        for feature in state["features"].values()
+        if feature.get("registry_status", "VALID") == "VALID"
+        and feature.get("verified", True)
+        and isinstance(feature.get("bounds"), dict)
+        and (not component_ids or feature.get("component_id") in component_ids)
     ]
     findings = []
     for index, first in enumerate(selected):
@@ -366,11 +511,18 @@ def interference_sample(
                     "components": [first["component_id"], second["component_id"]],
                     **result,
                 })
+    overlap_findings = [item for item in findings if not item.get("containment")]
+    containment_findings = [item for item in findings if item.get("containment")]
     return {
-        "status": "WARNING" if findings else "PASS",
+        "status": (
+            "WARNING" if overlap_findings else "NOT_EVALUATED" if containment_findings else "PASS"
+        ),
         "findings": findings,
+        "overlap_candidates": overlap_findings,
+        "containment_candidates": containment_findings,
         "method": "broad_phase_aabb",
         "exact_brep_interference": False,
+        "exact_brep_status": "NOT_EVALUATED" if findings else "NOT_REQUIRED",
         "recommended_action": "run_exact_native_interference_check_for_release",
         "product_state_revision": state["revision"],
     }
@@ -436,12 +588,19 @@ def clearance_sweep(
     clearance_value = motion["clearance"] if clearance is None else _finite(clearance, "clearance")
     if clearance_value < 0:
         raise ValueError("clearance must not be negative")
+    active_features = [
+        feature
+        for feature in state["features"].values()
+        if feature.get("registry_status", "VALID") == "VALID"
+        and feature.get("verified", True)
+        and isinstance(feature.get("bounds"), dict)
+    ]
     moving = [
-        feature for feature in state["features"].values()
+        feature for feature in active_features
         if feature.get("component_id") == component_id
     ]
     fixed = [
-        feature for feature in state["features"].values()
+        feature for feature in active_features
         if feature.get("component_id") != component_id
     ]
     angles = [
@@ -463,15 +622,22 @@ def clearance_sweep(
                             **overlap,
                         }
                     )
+    overlap_findings = [item for item in findings if not item.get("containment")]
+    containment_findings = [item for item in findings if item.get("containment")]
     return {
-        "status": "WARNING" if findings else "PASS",
+        "status": (
+            "WARNING" if overlap_findings else "NOT_EVALUATED" if containment_findings else "PASS"
+        ),
         "component_id": component_id,
         "sample_count": sample_count,
         "sampled_angles": angles,
         "clearance": clearance_value,
         "findings": findings,
+        "overlap_candidates": overlap_findings,
+        "containment_candidates": containment_findings,
         "method": "sampled_rotated_aabb",
         "exact_brep_interference": False,
+        "exact_brep_status": "NOT_EVALUATED" if findings else "NOT_REQUIRED",
         "recommended_action": "run_exact_continuous_brep_sweep_for_release",
         "product_state_revision": state["revision"],
     }

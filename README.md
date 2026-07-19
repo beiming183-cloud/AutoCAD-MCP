@@ -3,7 +3,7 @@
 **Reliable AutoCAD automation for AI agents, with checked geometry, native 3D, and delivery evidence.**
 
 [![Tests](https://github.com/beiming183-cloud/AutoCAD-MCP/actions/workflows/tests.yml/badge.svg)](https://github.com/beiming183-cloud/AutoCAD-MCP/actions/workflows/tests.yml)
-[![Version](https://img.shields.io/badge/version-3.10.1-0B7285)](https://github.com/beiming183-cloud/AutoCAD-MCP/releases)
+[![Version](https://img.shields.io/badge/version-4.0.0-0B7285)](https://github.com/beiming183-cloud/AutoCAD-MCP/releases)
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-2F855A)](LICENSE)
 
@@ -15,7 +15,7 @@ AutoCAD-MCP connects Codex, Claude Code, Claude Desktop, Cursor, and any standar
 
 ## Why AutoCAD-MCP
 
-- **Checked writes:** strict inputs, handle readback, requested/actual diffs, document revisions, and rollback on failed postconditions.
+- **Checked writes:** strict inputs, handle readback, requested/actual diffs, and document revisions. Native-worker transactions are atomic; compatibility COM/LISP paths report compensation limits instead of promising rollback they cannot prove.
 - **Useful CAD coverage:** structured 2D drawing, layers, dimensions, topology DRC, native AutoCAD solids and booleans, bounded product features, motion screening, and fixed-camera review views.
 - **Delivery evidence:** DWG/DXF/PDF/PNG outputs, exported-DXF re-audit, paper and scale verification, geometry digests, manifests, and SHA-256 hashes.
 - **Desktop friendly:** AutoCAD stays taskbar-visible but minimized by default, drawing does not steal focus, and preview/PDF viewers are not launched.
@@ -41,25 +41,25 @@ With a healthy, manually opened AutoCAD session, reproduce the promotional
 rotary actuator as editable native solids:
 
 ```powershell
-uv run python examples/generate_actuator_promo.py --record --pause 0.8
+uv run python examples/generate_actuator_promo.py --record --pause 1.0
 ```
 
-The command shows each modeling step in AutoCAD, renders a fixed isometric PNG,
-and leaves the final document open. It does not claim manufacturing authority;
-the model is a concept-level demonstration of checked native 3D operations.
-For a presentation after manually clearing the current drawing, add
-`--reuse-active --rotate --rotation-seconds 12`.
+Recording mode activates AutoCAD once, creates a blank document, frames the
+planned model before the first write, pauses one second after each completed
+semantic step, and leaves the final document open. It deliberately skips PNG/PDF
+rendering and final rotation so no viewer or camera motion interrupts capture.
 
 ## Choose a Backend
 
 | Backend | Runtime | Requires AutoCAD? | Validation feedback |
 |---------|---------|-------------------|------------|
-| **File IPC** | Windows Python | Yes - full AutoCAD or AutoCAD LT 2024+ | Topology audit + native PDF and direct PNG |
+| **Native worker** | Windows Python | Full AutoCAD 2025/2026 | Database transactions, revision events, feature IDs, native 2D/3D |
+| **File IPC compatibility** | Windows Python | Full AutoCAD or AutoCAD LT 2024+ | COM/LISP coverage, topology audit, PDF and PNG |
 | **ezdxf** | Any platform | No (headless) | Structured audit + deterministic PNG |
 
-The server exposes **11 consolidated tools** (`drawing`, `entity`, `solid`, `product`, `layer`, `block`, `annotation`, `pid`, `transaction`, `view`, `system`) over standard MCP stdio.
+The server exposes **12 consolidated tools** (`drawing`, `entity`, `solid`, `product`, `layer`, `block`, `annotation`, `pid`, `transaction`, `view`, `job`, `system`) over standard MCP stdio.
 
-This edition is based on [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp) and retains its MIT license. Version 3.10 adds a reliable document core, checked transactions, industrial-product contracts, native B-rep features, motion semantics, fixed-camera evidence, semantic DRC, and independent product-design review verdicts.
+This edition is based on [puran-water/autocad-mcp](https://github.com/puran-water/autocad-mcp) and retains its MIT license. Version 4.0 adds a native transactional worker, client-independent named-pipe protocol, external desktop supervisor, durable idempotency journal, and database-owned document revisions while retaining COM/LISP compatibility.
 
 For startup failures caused by a damaged Python COM environment, an orphaned
 `acad.exe`, or Activity Insights permissions, use the [Windows AutoCAD recovery
@@ -85,18 +85,53 @@ cd AutoCAD-MCP
 uv sync
 ```
 
-### 2. Load the LISP dispatcher in AutoCAD
+### 2. Install the signed native worker (full AutoCAD 2025/2026)
+
+The preferred industrial path is the .NET 8 worker under `native/`. It executes
+mutations under `DocumentLock` plus a native database transaction and publishes
+a current-user named pipe. Build, Authenticode-sign, verify, and install it with:
+
+```powershell
+$env:AUTOCAD_MCP_AUTOCAD_DIR = "D:\cad\AutoCAD 2025"
+.\native\scripts\build-plugin.ps1 `
+  -AutoCADDir $env:AUTOCAD_MCP_AUTOCAD_DIR `
+  -DotNet "D:\Codex\Tools\dotnet-sdk\dotnet.exe" `
+  -CertificateThumbprint "YOUR_CODE_SIGNING_CERT_THUMBPRINT" `
+  -Install
+```
+
+Installation refuses an unsigned DLL. Keep AutoCAD `SECURELOAD` enabled. The
+bundle loads at AutoCAD startup and writes its worker descriptor to
+`%LOCALAPPDATA%\AutoCAD-MCP\workers`.
+
+For a stable desktop session, start the user-owned supervisor from an ordinary
+PowerShell window, not from an MCP client's sandbox:
+
+```powershell
+$env:AUTOCAD_MCP_OUTPUT_ROOT = "D:\Codex\AutoCAD-MCP"
+autocad-mcp-supervisor run `
+  --acad-exe "D:\cad\AutoCAD 2025\acad.exe" `
+  --window-mode quiet_minimized `
+  --output-root "D:\Codex\AutoCAD-MCP"
+```
+
+The supervisor leaves AutoCAD visible in the taskbar but minimized, never opens
+PDF/PNG viewers, and leaves AutoCAD running when supervision stops. Use
+`autocad-mcp-supervisor status` from another terminal to inspect PID, HWND,
+heartbeat, fatal-window state, and native-worker discovery.
+
+### 3. Load the LISP dispatcher for LT or compatibility fallback
 
 Open AutoCAD or AutoCAD LT and load `mcp_dispatch.lsp` using **APPLOAD**:
 
 1. Type `APPLOAD` in the AutoCAD command line
 2. Browse to `<repo>/lisp-code/mcp_dispatch.lsp`
 3. Click **Load**
-4. You should see: `=== MCP Dispatch v3.10.1 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
+4. You should see: `=== MCP Dispatch v4.0.0 loaded ===` and `Ready for commands via (c:mcp-dispatch)`
 
 > **Tip:** Add the file to your AutoCAD Startup Suite (in the APPLOAD dialog) so it loads automatically with every drawing.
 
-### 3. Configure your MCP client
+### 4. Configure your MCP client
 
 Add to your MCP client configuration (e.g. Claude Desktop `claude_desktop_config.json`):
 
@@ -127,12 +162,13 @@ The same server command can be used in Claude Code project-level `.mcp.json`:
       "env": {
         "PYTHONPATH": "C:\\path\\to\\autocad-mcp\\src",
         "AUTOCAD_MCP_BACKEND": "file_ipc",
+        "AUTOCAD_MCP_NATIVE_PLUGIN": "auto",
         "AUTOCAD_MCP_AUTOSTART": "false",
         "AUTOCAD_MCP_VISIBLE": "true",
-        "AUTOCAD_MCP_WINDOW_MODE": "minimized",
+         "AUTOCAD_MCP_WINDOW_MODE": "preserve",
         "AUTOCAD_MCP_ACTIVATE_ON_DRAW": "false",
-        "AUTOCAD_MCP_OUTPUT_ROOT": "D:/CAD-Automation",
-        "AUTOCAD_MCP_ACTIVITY_INSIGHTS_PATH": "D:/CAD-Automation/activity-insights"
+        "AUTOCAD_MCP_OUTPUT_ROOT": "D:/Codex/AutoCAD-MCP",
+        "AUTOCAD_MCP_ACTIVITY_INSIGHTS_PATH": "D:/Codex/AutoCAD-MCP/activity-insights"
       }
     }
   }
@@ -143,8 +179,14 @@ The same server command can be used in Claude Code project-level `.mcp.json`:
 
 - The `command` must point to the **Windows Python** inside the project venv (not WSL python).
 - `AUTOCAD_MCP_BACKEND` can be `auto` (tries File IPC, then falls back to ezdxf), `file_ipc` (recommended for engineering drawings), or `ezdxf` (headless only).
-- Full AutoCAD uses COM `SendCommand`; AutoCAD LT uses the original window-message transport.
-- Set `AUTOCAD_MCP_AUTOSTART=true` and `AUTOCAD_MCP_ACAD_EXE` to let the MCP start AutoCAD when needed.
+- Full AutoCAD prefers the native worker. COM/LISP remains a compatibility path; AutoCAD LT uses LISP/window messaging.
+- `AUTOCAD_MCP_NATIVE_PLUGIN=required` fails closed when the signed native worker is absent; `auto` falls back to COM/LISP.
+- Prefer the desktop supervisor over MCP-owned startup. `AUTOCAD_MCP_AUTOSTART=true` remains available for compatibility.
+- When attaching to a CAD instance opened by a user, startup/profile/window policy
+  is read-only: it does not rewrite Activity Insights variables or change the
+  window unless
+  `AUTOCAD_MCP_APPLY_ACTIVITY_POLICY=true` or
+  `AUTOCAD_MCP_APPLY_WINDOW_POLICY_TO_EXISTING=true` is explicitly set.
 
 #### Running from WSL
 
@@ -163,7 +205,7 @@ If your MCP client runs in WSL (e.g. Claude Code), launch the server through `cm
 }
 ```
 
-### 4. Verify
+### 5. Verify
 
 From your MCP client, call:
 
@@ -187,7 +229,7 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 |-----------|-------------|----------|-------|
 | `create` | Create and activate a new document, optionally at a managed path | Yes | Yes |
 | `context` | Return active document ID, path, and monotonic revision | Yes | Yes |
-| `activate` | Activate an explicitly identified document and verify readback | Yes | Limited |
+| `activate` | Activate a `doc_id` at an exact `expected_revision`, then verify active-document readback | Yes | Limited |
 | `open` | Open an existing drawing | Yes | Yes (DXF) |
 | `info` | Get entity count and layers | Yes | Yes |
 | `save` | Save current drawing (to path if given) | Yes | Yes |
@@ -210,9 +252,9 @@ You should see `backend: "file_ipc"` if AutoCAD is running, or `backend: "ezdxf"
 
 **Create:** `create_line`, `create_circle`, `create_polyline`, `create_rectangle`, `create_arc`, `create_tangent_arc`, `create_ellipse`, `create_mtext`, `create_hatch`, `create_batch`
 
-`create_batch` accepts up to 500 structured entities in one MCP call. It supports line, circle, polyline, rectangle, arc, ellipse, text, mtext, and hatch records. A hatch can use `entity_id: "$last"` to reference the preceding entity. Batches are atomic by default: a failed operation rolls back the AutoCAD undo group or the tracked headless entities. This is the preferred high-throughput path; it does not enable arbitrary AutoLISP.
+`create_batch` accepts up to 500 structured entities in one MCP call. It supports line, circle, polyline, rectangle, arc, ellipse, text, mtext, and hatch records. A hatch can use `entity_id: "$last"` to reference the preceding entity. The native worker and headless backend provide atomic batches; the compatibility COM/LISP path uses an AutoCAD undo group and returns rollback evidence, but callers must treat an unverified compensation as a hard stop. This is the preferred high-throughput path; it does not enable arbitrary AutoLISP.
 
-For `ANSI31`, pass `angle: 0` to retain the pattern's native 45-degree section angle. `scale` and hatch `layer` are also explicit parameters.
+For `ANSI31`, pass `angle: 0` to retain the pattern's native 45-degree section angle. `scale` and hatch `layer` are also explicit parameters. Every HATCH is read back by handle and checked for type, layer, pattern, angle, and scale; a mismatch is erased and returned as `E_POSTCONDITION_MISMATCH`.
 
 **Read:** `list`, `count`, `get`
 
@@ -238,11 +280,18 @@ USB cutouts are deliberately gated. A production aperture requires `module_statu
 
 Motion operations are `set_motion`, `interference_sample`, and `clearance_sweep`. They report broad-phase AABB or sampled rotated-AABB evidence and always state `exact_brep_interference: false`; release work still requires an exact native continuous sweep.
 
-`render_view` accepts `front`, `right`, `top`, `bottom`, `iso`, `rotated_iso`, `section`, and `exploded`. Section/exploded views require caller-prepared geometry. The result includes fixed camera data, PNG hash, content bounds, non-background ratio, clipping, framing status, and optional pixel difference. It is a native plot view, not an offscreen material renderer.
+`render_view` accepts `front`, `right`, `top`, `bottom`, `iso`, `rotated_iso`, `section`, and `exploded`. Section/exploded views require caller-prepared geometry. The result includes fixed camera data, PNG hash, content bounds, non-background ratio, clipping, framing status, and optional pixel difference. Pass an allow-listed `visual_style` to request an AutoCAD display style; the response separately reports style readback, restoration verification, and `material_render_verified` (currently false for the compatibility plot path). This remains a native AutoCAD plot, not an offscreen material renderer.
 
 `set_review` and `review_summary` keep `appearance_review`, `ergonomics_review`, `adapter_clearance_review`, `cable_management_review`, `stability_review`, and `mains_rotation_safety_review` separate from geometry/STEP validity. Each is `PASS`, `FAIL`, or `NOT_EVALUATED`; `PASS` requires evidence.
 
 General `fillet_edges` and `chamfer_edges` reject volatile native edge indices with `E_STABLE_FEATURE_SELECTION_UNAVAILABLE`. Use analytic features now. A future OpenCascade/FreeCAD plugin may provide selector-based general edge operations without weakening the AutoCAD document and transaction contract.
+
+On the COM/LISP compatibility backend, destructive product replacements
+(`recessed_panel`, `port_cutout_usb_a`, and `port_cutout_usb_c`) fail closed with
+`E_COMPAT_FEATURE_TRANSACTION_UNAVAILABLE` because ActiveX cannot prove an
+atomic replacement. Use the signed native worker; the unsafe compatibility
+fallback requires an explicit `AUTOCAD_MCP_ALLOW_UNVERIFIED_COMPAT_CUTOUTS=true`
+and is unsuitable for release work.
 
 The 3D protocol borrows proven patterns from [build123d](https://github.com/gumyr/build123d), [build123d-mcp](https://pypi.org/project/build123d-mcp/), [FreeCAD MCP](https://github.com/neka-nat/freecad-mcp), and [Open CASCADE fillet/chamfer APIs](https://dev.opencascade.org/doc/refman/html/package_b_repfilletapi.html): explicit parameter sources, semantic/property selectors, measure-render-validate loops, and honest kernel capability boundaries.
 
@@ -277,23 +326,66 @@ The 3D protocol borrows proven patterns from [build123d](https://github.com/gumy
 |-----------|-------------|
 | `zoom_extents` | Zoom to show all entities |
 | `zoom_window` | Zoom to a specified window |
+| `set_visual_style` | Apply an allowlisted built-in style (Conceptual, Realistic, Shaded, etc.) with optional verified entity colors; requires `doc_id` and `expected_revision` |
 | `get_screenshot` | Diagnostic-only AutoCAD window capture |
 
 Normal validation is data-first: use `drawing.audit` after edits and `drawing.render_preview` at milestones. `get_screenshot` remains available only for diagnosing AutoCAD UI state.
 
 ### `transaction` - Document-scoped transactions
 
-`begin`, `commit`, `rollback`
+`context`, `create`, `execute`, plus compatibility `begin`, `commit`, `rollback`
 
-Every modifying tool requires the `doc_id` and `expected_revision` returned by `drawing(operation="context")`. A document mismatch returns `E_DOCUMENT_ID_MISMATCH`; stale or missing revision data returns `E_DOCUMENT_REVISION_MISMATCH`. Transactions return a `transaction_id` and use AutoCAD undo marks so a failed stage can be rolled back as one unit.
+For the native path, call `context`, then send one strict `execute` request with a
+stable `idempotency_key`. The plugin validates the active document and revision,
+opens one database transaction, rejects missing layers before creation, and
+commits all operations or none. A document mismatch returns
+`E_DOCUMENT_ID_MISMATCH`; stale revision data returns
+`E_DOCUMENT_REVISION_MISMATCH`. Successful idempotent requests can be replayed;
+failed requests are not cached and remain retryable.
 
 ```json
 {
-  "operation": "begin",
+  "operation": "execute",
   "doc_id": "acad-...",
-  "expected_revision": 12
+  "expected_revision": 12,
+  "idempotency_key": "gearbox-stage-01",
+  "data": {
+    "session_id": "native-...",
+    "operations": [
+      {
+        "type": "solid.box",
+        "resultId": "body",
+        "featureId": "gearbox-body",
+        "center": [0, 0, 20],
+        "length": 120,
+        "width": 80,
+        "height": 40,
+        "layer": "0"
+      },
+      {
+        "type": "solid.cylinder",
+        "resultId": "bore",
+        "baseCenter": [0, 0, -1],
+        "radius": 12,
+        "height": 42,
+        "layer": "0"
+      },
+      {
+        "type": "solid.boolean",
+        "resultId": "finished",
+        "primaryRef": "body",
+        "toolRef": "bore",
+        "operation": "subtract",
+        "layer": "0"
+      }
+    ]
+  }
 }
 ```
+
+The older `begin`/`commit`/`rollback` operations remain for AutoCAD LT and
+compatibility workflows. They use undo marks and do not replace the native
+database transaction when the plugin is available.
 
 Layer names are preconditions. Creating geometry on an absent layer returns `E_LAYER_NOT_FOUND` before mutation instead of silently falling back to layer `0`.
 
@@ -305,7 +397,7 @@ edit entities -> drawing.audit -> native render_preview -> audit_dxf for final d
 
 `drawing.audit` returns entity counts by type and layer, drawing bounds, units, a handle-independent geometry digest, geometry DRC, an endpoint topology graph, limited normalized entity geometry, and added/modified/removed handles since the previous audit. In addition to degenerate geometry, rules can check connection gaps, dangling endpoints, interior crossings, explicit tangent pairs, equal-radius groups, and cross-view projection alignment. `limit` is clamped to 500 so large drawings do not flood model context.
 
-`drawing.render_preview` always returns a real PNG. Full AutoCAD writes it through the native PNG plot device without capturing the desktop or opening a viewer. The result includes DPI, pixel size, orientation correction, SHA-256, and the source geometry digest. `drawing.plot_pdf` remains the release-quality vector output.
+`drawing.render_preview` always returns a real PNG. Full AutoCAD writes it through the native PNG plot device without capturing the desktop or opening a viewer. The result includes DPI, pixel size, orientation correction, SHA-256, and the source geometry digest. Add `visual_style` to request a controlled display style; the response reports actual style restoration and whether material rendering was independently verified. `drawing.plot_pdf` remains the release-quality vector output.
 
 ### Industrial delivery jobs
 
@@ -340,11 +432,11 @@ The job contains `specs/request.json`, `manifest.json`, editable DWG and DXF fil
 
 ### Industrial automation roadmap
 
-- **v3.6 reliability (complete):** self-healing startup, dispatcher version handshake, machine-readable MCP failures, controlled variables, geometry DRC, DXF units/digests, and enforced plot configuration.
-- **v3.7 geometry control (complete):** topology DRC, atomic batches, safe trim/extend/break/join/constraints, native 3D solids, non-switching DXF export, and verified PNG previews.
-- **v3.8 entity truth (complete):** immutable entity contracts, semantic topology, no-focus desktop behavior, and postcondition rollback.
-- **v3.9 document/output reliability (complete):** document identity, transactions, crash classification, offline audits, atomic outputs, plot verification, and exact viewer suppression.
-- **v3.10 product 3D foundation (complete):** analytic rounded products, controlled module envelopes, motion screening, fixed-camera evidence, semantic DRC, and independent product reviews.
+- **v3.6 reliability (compatibility foundation):** self-healing startup, dispatcher version handshake, machine-readable MCP failures, controlled variables, geometry DRC, DXF units/digests, and enforced plot configuration; live AutoCAD profile repairs remain opt-in.
+- **v3.7 geometry control (compatibility foundation):** topology DRC, bounded batches, safe trim/extend/break/join/constraints, native 3D solids, non-switching DXF export, and verified file/framing checks; COM rollback remains explicitly bounded.
+- **v3.8 entity truth (implemented with gates):** immutable entity contracts, semantic topology, no-focus desktop behavior, and postcondition readback; unresolved context failures are terminal and require reconciliation.
+- **v3.9 document/output reliability (implemented with gates):** document identity, transactions, crash classification, offline audits, atomic outputs, plot verification, and viewer suppression; exact guarantees require the native worker.
+- **v3.10 product 3D foundation (concept/engineering candidate):** analytic rounded products, controlled module envelopes, broad-phase motion screening, fixed-camera evidence, semantic DRC, and independent product reviews; exact assemblies, material rendering, and continuous sweeps remain unsupported.
 - **v4.0 hybrid CAD:** FreeCAD CLI/MCP as the parameterized 3D and STEP executor, AutoCAD as the visible DWG/2D drafting and release executor, with shared specs and acceptance reports.
 
 ### `system` — Server management
@@ -381,22 +473,47 @@ The File IPC backend sends `(c:mcp-dispatch)` to the active drawing. Full AutoCA
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AUTOCAD_MCP_BACKEND` | `auto` | Backend selection: `auto`, `file_ipc`, `ezdxf` |
+| `AUTOCAD_MCP_NATIVE_PLUGIN` | `auto` | Native worker policy: `auto`, `required`, or `off` |
+| `AUTOCAD_MCP_NATIVE_WORKER_DIR` | `%LOCALAPPDATA%/AutoCAD-MCP/workers` | Native worker descriptor directory |
+| `AUTOCAD_MCP_PLUGIN_TOKEN` | empty | Optional shared token required by the current-user native pipe |
+| `AUTOCAD_MCP_SUPERVISOR_DIR` | `%LOCALAPPDATA%/AutoCAD-MCP/supervisor` | Desktop supervisor state, stop request, and UTF-8 BOM log directory |
 | `AUTOCAD_MCP_IPC_DIR` | `C:/temp` | Directory for IPC command/result JSON files (must match on both Python and LISP sides) |
 | `AUTOCAD_MCP_IPC_TIMEOUT` | `10.0` | IPC command timeout in seconds (1-300) |
 | `AUTOCAD_MCP_DOCUMENT_TIMEOUT` | `30.0` | Seconds to wait for COM registration and an active document after the window appears (5-120) |
 | `AUTOCAD_MCP_ONLY_TEXT` | `true` | Disable automatic screenshot attachments; direct diagnostic capture remains available |
 | `AUTOCAD_MCP_AUTOSTART` | `false` | Start AutoCAD automatically when File IPC is requested and no AutoCAD window exists |
+| `AUTOCAD_MCP_ACAD_PROFILE` | empty | Optional existing profile name or exported `.arg` path passed through `/p`; never changes the user's current profile |
+| `AUTOCAD_MCP_PROFILE_MODE` | `existing` | `existing`/`explicit`; `isolated` or `required` fails closed unless an explicit profile/ARG is supplied |
+| `AUTOCAD_MCP_ACAD_EXTRA_ARGS` | empty | Additional shell-free AutoCAD startup switches, parsed as an argument list |
+| `AUTOCAD_MCP_STARTUP_STABILITY_READS` | `3` | Consecutive identical non-fatal HWND observations required before readiness (1-10) |
+| `AUTOCAD_MCP_STARTUP_SETTLE` | `0.75` | Seconds to recheck the fatal-dialog state after the stable HWND gate |
+| `AUTOCAD_MCP_AUTOSTART_FAILURE_COOLDOWN` | `900` | Seconds to refuse an identical failed autostart signature, preventing retry loops |
+| `AUTOCAD_MCP_AUTOSTART_FORCE_RETRY` | `false` | One-shot escape hatch after the profile or installation has been repaired |
+| `AUTOCAD_MCP_START_MINIMIZED` | `true` | Launch with a minimize hint so AutoCAD does not jump in front of other work |
+| `AUTOCAD_MCP_CER_FILE` | empty | Optional explicit Autodesk CER `rawdata-t1.pb`/`rawdata-t2.pb` path for offline crash evidence |
 | `AUTOCAD_MCP_VISIBLE` | `true` | Keep AutoCAD as a visible desktop application rather than a hidden automation session |
-| `AUTOCAD_MCP_WINDOW_MODE` | `minimized` | Initial policy: `minimized` (taskbar, no activation), `visible` (show without activation), or `foreground` |
+| `AUTOCAD_MCP_WINDOW_MODE` | `quiet_minimized` | `preserve` for an existing user window, `quiet_minimized` (backend-owned taskbar window), `visible`, or explicit `recording`; legacy aliases remain accepted |
 | `AUTOCAD_MCP_ACTIVATE_ON_DRAW` | `false` | Allow per-command activation only when `AUTOCAD_MCP_WINDOW_MODE=foreground` |
+| `AUTOCAD_MCP_APPLY_ACTIVITY_POLICY` | `false` | Permit Activity Insights variable writes after a backend-owned launch |
+| `AUTOCAD_MCP_APPLY_WINDOW_POLICY_TO_EXISTING` | `false` | Permit implicit visibility/minimize changes to a user-owned AutoCAD window |
+| `AUTOCAD_MCP_COM_MUTEX_TIMEOUT` | `5` | Seconds to wait for another MCP process to release the per-user COM mutex |
 | `AUTOCAD_MCP_AUTO_FIT` | `true` | Automatically center and fit drawing extents after geometry changes |
-| `AUTOCAD_MCP_OUTPUT_ROOT` | `~/Documents/AutoCAD-MCP` | Unified root for specs, scripts, models, drawings, reports, outputs, jobs, templates, logs, and archives |
+| `AUTOCAD_MCP_OUTPUT_ROOT` | `~/Documents/AutoCAD-MCP` | Unified output root; this workstation should set `D:/Codex/AutoCAD-MCP` |
 | `AUTOCAD_MCP_LOG_PATH` | `<output-root>/logs/autocad-mcp.log` | BOM-prefixed UTF-8 diagnostic log readable by Windows PowerShell |
 | `AUTOCAD_MCP_ALLOW_EXTERNAL_OUTPUTS` | `false` | Permit writes outside the managed output root; disabled by default |
 | `AUTOCAD_MCP_ACAD_EXE` | empty | Full path to `acad.exe` used by automatic startup |
 | `AUTOCAD_MCP_ACAD_SCRIPT` | empty | Optional AutoCAD `.scr` file passed with `/b` during startup |
 | `AUTOCAD_MCP_ACAD_STARTUP_TIMEOUT` | `75` | Seconds to wait for the AutoCAD main window, clamped to 5-180 |
 | `AUTOCAD_MCP_LISP_PATH` | empty | Dispatcher path loaded for the current AutoCAD session only |
+| `AUTOCAD_MCP_CAMPAIGN_OPERATION_TIMEOUT` | `120` | Hard timeout for one live-CAD regression operation (5-300) |
+| `AUTOCAD_MCP_CAMPAIGN_TIMEOUT` | `900` | Hard timeout for the complete live-CAD regression campaign (30-3600) |
+
+The managed regression runners are deliberately fail-closed. A timed-out COM
+call quarantines its STA worker (`E_COM_STA_TIMEOUT`) and refuses follow-up
+requests until the MCP worker is restarted; a timed-out pytest slice attempts
+to terminate its complete process tree and records any cleanup limitation.
+This prevents a stalled AutoCAD/COM process from holding an MCP client turn
+indefinitely.
 
 > `mcp_dispatch.lsp` reads `AUTOCAD_MCP_IPC_DIR` from the AutoCAD process environment and falls back to `C:/temp`.
 
@@ -423,7 +540,16 @@ AutoLISP was added to AutoCAD LT in the **2024 release (Windows only)**. AutoCAD
 
 The `mcp_dispatch.lsp` dispatcher is fully compatible with LT 2024+.
 
-## What's New in v3.10
+## What's New in v4.0
+
+- **Native transaction worker** - current-user named pipes connect standard MCP clients to a .NET worker using `DocumentLock`, database transactions, database-event revisions, and stable XData feature IDs.
+- **Fail-closed document fencing** - native writes require session, document ID, expected revision, and a stable idempotency key; active-document mismatch or stale revision prevents all mutation.
+- **Durable replay safety** - Python journals accepted/committed/failed jobs; the plugin caches only committed successes and hashes semantic requests without transport IDs or credentials.
+- **Desktop supervisor** - a user-owned process manages PID/HWND/profile health while keeping AutoCAD taskbar-visible, minimized, focus-safe, and independent of Codex, Claude Code, or another client's sandbox.
+- **Signed bundle flow** - source builds can Authenticode-sign, verify, and install the AutoCAD bundle without disabling `SECURELOAD`.
+- **Managed test cleanup** - CAD artifacts are deleted only inside a confirmed job directory while hashes, manifests, audits, reports, and logs remain.
+
+### v3.10
 
 - **Analytic native rounded products** - `rounded_box` creates real radius geometry without relying on volatile native edge indices.
 - **Controlled module authority** - concept, supplier-controlled, and measured modules carry explicit dimension authority; unverified USB apertures are rejected.

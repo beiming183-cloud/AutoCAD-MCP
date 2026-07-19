@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import math
+import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any
-import uuid
 
 from autocad_mcp.errors import LayerNotFoundError, error_payload
 from autocad_mcp.contracts import EntityExpectation, build_entity_expectation, compare_entity
@@ -80,6 +81,10 @@ class AutoCADBackend(ABC):
     async def status(self) -> CommandResult:
         """Return backend health/status info."""
 
+    async def shutdown(self) -> None:
+        """Release backend-owned workers without closing the user's CAD app."""
+        return None
+
     def _local_document_state(self) -> dict[str, Any]:
         state = getattr(self, "_document_state", None)
         if state is None:
@@ -107,7 +112,11 @@ class AutoCADBackend(ABC):
         )
 
     async def require_document_context(
-        self, doc_id: str | None, expected_revision: int | None
+        self,
+        doc_id: str | None,
+        expected_revision: int | None,
+        lease_token: str | None = None,
+        worker_generation: int | None = None,
     ) -> CommandResult:
         context = await self.document_context()
         if not context.ok:
@@ -152,11 +161,100 @@ class AutoCADBackend(ABC):
         state["revision"] = int(state["revision"]) + 1
         return await self.document_context()
 
-    async def drawing_activate(self, doc_id: str) -> CommandResult:
+    @staticmethod
+    def _validate_activation_request(
+        doc_id: str | None, expected_revision: int | None
+    ) -> tuple[str | None, int | None, CommandResult | None]:
+        """Validate the identity fence before a backend can touch AutoCAD.
+
+        Activation is a document-state mutation even though it does not change
+        drawing geometry.  Keeping this check in the common backend interface
+        prevents compatibility callers from accidentally falling back to the
+        previously active document when either fence field is omitted.
+        """
+        if not isinstance(doc_id, str) or not doc_id.strip():
+            return None, None, CommandResult(
+                ok=False,
+                error="drawing.activate requires a non-empty doc_id",
+                error_code="E_PARAMETER_REJECTED",
+                recoverable=False,
+                recommended_action="read_document_context_and_retry",
+                payload={"required": ["doc_id", "expected_revision"]},
+            )
+        if expected_revision is None or isinstance(expected_revision, bool):
+            return None, None, CommandResult(
+                ok=False,
+                error="drawing.activate requires expected_revision",
+                error_code="E_PARAMETER_REJECTED",
+                recoverable=False,
+                recommended_action="read_document_context_and_retry",
+                payload={"required": ["doc_id", "expected_revision"]},
+            )
+        try:
+            revision = int(expected_revision)
+        except (TypeError, ValueError, OverflowError):
+            return None, None, CommandResult(
+                ok=False,
+                error="drawing.activate expected_revision must be an integer",
+                error_code="E_PARAMETER_REJECTED",
+                recoverable=False,
+                recommended_action="read_document_context_and_retry",
+                payload={"expected_revision": expected_revision},
+            )
+        if isinstance(expected_revision, float) and not expected_revision.is_integer():
+            return None, None, CommandResult(
+                ok=False,
+                error="drawing.activate expected_revision must be an integer",
+                error_code="E_PARAMETER_REJECTED",
+                recoverable=False,
+                recommended_action="read_document_context_and_retry",
+                payload={"expected_revision": expected_revision},
+            )
+        if revision < 0:
+            return None, None, CommandResult(
+                ok=False,
+                error="drawing.activate expected_revision must be non-negative",
+                error_code="E_PARAMETER_REJECTED",
+                recoverable=False,
+                recommended_action="read_document_context_and_retry",
+                payload={"expected_revision": expected_revision},
+            )
+        return doc_id.strip(), revision, None
+
+    async def drawing_activate(
+        self,
+        doc_id: str | None,
+        expected_revision: int | None = None,
+        lease_token: str | None = None,
+        worker_generation: int | None = None,
+    ) -> CommandResult:
+        del lease_token, worker_generation
+        normalized_doc_id, _, validation = self._validate_activation_request(
+            doc_id, expected_revision
+        )
+        if validation is not None:
+            return validation
         context = await self.document_context()
-        if context.ok and context.payload["doc_id"] == doc_id:
-            return context
-        return CommandResult(ok=False, error="Document activation is not supported on this backend")
+        if context.ok and context.payload["doc_id"] == normalized_doc_id:
+            if int(context.payload.get("revision", -1)) == int(expected_revision):
+                return context
+            return CommandResult(
+                ok=False,
+                error="Requested document revision is stale",
+                error_code="E_DOCUMENT_REVISION_MISMATCH",
+                recoverable=False,
+                recommended_action="read_latest_document_revision_and_retry",
+                payload={
+                    "requested_doc_id": normalized_doc_id,
+                    "expected_revision": expected_revision,
+                    "actual": context.payload,
+                },
+            )
+        return CommandResult(
+            ok=False,
+            error="Document activation is not supported on this backend",
+            error_code="E_DOCUMENT_ACTIVATION_UNSUPPORTED",
+        )
 
     async def transaction_begin(
         self, doc_id: str, expected_revision: int
@@ -187,8 +285,34 @@ class AutoCADBackend(ABC):
     async def drawing_save_as_dxf(self, path: str) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
 
-    async def drawing_create(self, name: str | None = None) -> CommandResult:
+    async def drawing_create(
+        self, name: str | None = None, idempotency_key: str | None = None
+    ) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def native_transaction_execute(
+        self,
+        doc_id: str,
+        expected_revision: int,
+        idempotency_key: str,
+        operations: list[dict[str, Any]],
+        *,
+        session_id: str | None = None,
+    ) -> CommandResult:
+        return CommandResult(
+            ok=False,
+            error="The native transactional worker is not available on this backend",
+            error_code="E_NATIVE_PLUGIN_UNAVAILABLE",
+            recoverable=False,
+        )
+
+    async def drawing_close(self, save: bool = False) -> CommandResult:
+        return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def apply_presentation_style(
+        self, colors: dict[str, list[int] | tuple[int, int, int]], visual_style: str
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Presentation styling is not supported")
 
     async def drawing_purge(self) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
@@ -200,7 +324,7 @@ class AutoCADBackend(ABC):
         orientation: str = "landscape",
         plot_style: str = "monochrome.ctb",
         scale_mode: str = "fit",
-        scale: str = "1:1",
+        scale: str = "fit",
         center: bool = True,
     ) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
@@ -217,8 +341,19 @@ class AutoCADBackend(ABC):
         plot_type: str = "extents",
         normalize_framing: bool = False,
         framing_fill: float = 0.82,
+        visual_style: str | None = None,
+        preserve_visual_style: bool = True,
     ) -> CommandResult:
         return CommandResult(ok=False, error="Not supported on this backend")
+
+    async def prepare_recording_view(
+        self,
+        bounds: dict[str, list[float]],
+        view: str = "iso",
+        margin_scale: float = 0.82,
+        output_aspect: float = 16 / 9,
+    ) -> CommandResult:
+        return CommandResult(ok=False, error="Recording view preparation is not supported")
 
     async def drawing_audit(
         self,
@@ -411,12 +546,29 @@ class AutoCADBackend(ABC):
                     entity_id = item.get("entity_id")
                     if entity_id in (None, "last", "$last"):
                         entity_id = last_handle or "last"
+                    pattern = str(item.get("pattern", "ANSI31"))
+                    angle = float(item.get("angle", 0.0))
+                    scale = float(item.get("scale", 1.0))
+                    if not pattern.strip():
+                        raise ValueError("hatch pattern must not be empty")
+                    if not math.isfinite(angle):
+                        raise ValueError("hatch angle must be finite")
+                    if not math.isfinite(scale) or scale <= 0:
+                        raise ValueError("hatch scale must be positive")
                     result = await self.create_hatch(
                         entity_id,
-                        item.get("pattern", "ANSI31"),
-                        item.get("angle", 0.0),
-                        item.get("scale", 1.0),
+                        pattern,
+                        angle,
+                        scale,
                         layer,
+                    )
+                    result = await self.verify_created_hatch(
+                        result,
+                        entity_id=str(entity_id),
+                        pattern=pattern,
+                        angle=angle,
+                        scale=scale,
+                        layer=layer,
                     )
                 else:
                     result = CommandResult(ok=False, error=f"Unsupported batch type: {kind}")
@@ -545,6 +697,118 @@ class AutoCADBackend(ABC):
                 "requested": expectation.requested(),
                 "actual": actual,
                 "diff": [],
+            },
+        )
+
+    async def verify_created_hatch(
+        self,
+        result: CommandResult,
+        *,
+        entity_id: str,
+        pattern: str,
+        angle: float,
+        scale: float,
+        layer: str | None = None,
+        tolerance: float = 0.000001,
+    ) -> CommandResult:
+        """Read back a HATCH and erase it when its contract is not true.
+
+        HATCH is intentionally kept separate from ``EntityExpectation``: its
+        boundary is an existing entity, while the created object still has a
+        strict type/layer/pattern/angle/scale postcondition.
+        """
+        if not result.ok or not isinstance(result.payload, dict):
+            return result
+        handle = result.payload.get("handle")
+        requested_layer = str(layer or "0")
+        requested = {
+            "type": "HATCH",
+            "layer": requested_layer,
+            "pattern": str(pattern),
+            "angle": float(angle),
+            "scale": float(scale),
+            "boundary_entity_id": str(entity_id),
+        }
+        if not handle:
+            return CommandResult(
+                ok=False,
+                error="HATCH creation returned no handle for postcondition verification",
+                error_code="E_POSTCONDITION_MISMATCH",
+                recoverable=False,
+                payload={
+                    "requested": requested,
+                    "actual": None,
+                    "diff": [{"path": "handle", "requested": "created handle", "actual": None}],
+                    "deleted": False,
+                },
+            )
+
+        readback = await self.entity_get(str(handle))
+        actual = readback.payload if readback.ok and isinstance(readback.payload, dict) else None
+        differences: list[dict[str, Any]] = []
+        if actual is None:
+            differences.append(
+                {"path": "entity_get", "requested": "readable HATCH", "actual": readback.error}
+            )
+        else:
+            if str(actual.get("type", "")).upper() != "HATCH":
+                differences.append({"path": "type", "requested": "HATCH", "actual": actual.get("type")})
+            if str(actual.get("layer", "")).casefold() != requested_layer.casefold():
+                differences.append({"path": "layer", "requested": requested_layer, "actual": actual.get("layer")})
+            if str(actual.get("pattern", "")).casefold() != str(pattern).casefold():
+                differences.append({"path": "pattern", "requested": str(pattern), "actual": actual.get("pattern")})
+            for field, expected in (("angle", float(angle)), ("scale", float(scale))):
+                value = actual.get(field)
+                try:
+                    actual_number = float(value)
+                except (TypeError, ValueError):
+                    differences.append({"path": field, "requested": expected, "actual": value})
+                    continue
+                if not math.isfinite(actual_number):
+                    differences.append({"path": field, "requested": expected, "actual": value})
+                    continue
+                delta = actual_number - expected
+                if field == "angle":
+                    delta = (delta + 180.0) % 360.0 - 180.0
+                if abs(delta) > tolerance:
+                    differences.append(
+                        {
+                            "path": field,
+                            "requested": expected,
+                            "actual": actual_number,
+                            "delta": delta,
+                            "tolerance": tolerance,
+                        }
+                    )
+        if differences:
+            deletion = await self.entity_erase(str(handle))
+            self._semantic_store().pop(str(handle), None)
+            return CommandResult(
+                ok=False,
+                error=f"Created HATCH {handle} did not match its immutable request",
+                error_code="E_POSTCONDITION_MISMATCH",
+                recoverable=False,
+                recommended_action="stop_and_inspect_backend_state",
+                payload={
+                    "handle": str(handle),
+                    "requested": requested,
+                    "actual": actual,
+                    "diff": differences,
+                    "deleted": deletion.ok,
+                    "delete_error": deletion.error,
+                },
+            )
+        return CommandResult(
+            ok=True,
+            payload={
+                **result.payload,
+                "verified": True,
+                "requested": requested,
+                "actual": actual,
+                "diff": [],
+                "layer": actual.get("layer") if actual else requested_layer,
+                "bounds": actual.get("bounds") if actual else None,
+                "volume": actual.get("volume") if actual else None,
             },
         )
 

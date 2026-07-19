@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import functools
+import inspect
 import json
 from typing import Any
 
@@ -13,7 +14,7 @@ from mcp.types import CallToolResult, ImageContent, TextContent
 
 from autocad_mcp.backends.base import AutoCADBackend, CommandResult
 from autocad_mcp.config import ONLY_TEXT_FEEDBACK, _current_backend_env, detect_backend
-from autocad_mcp.errors import error_payload, exception_context
+from autocad_mcp.errors import error_payload, exception_context, infer_error_code
 
 log = structlog.get_logger()
 
@@ -23,6 +24,29 @@ log = structlog.get_logger()
 
 _backend: AutoCADBackend | None = None
 _init_lock = asyncio.Lock()
+
+
+async def reset_backend() -> None:
+    """Dispose the current backend before a forced re-initialization.
+
+    This is a transport-only shutdown.  It never closes the user's AutoCAD
+    document or terminates AutoCAD; it only releases MCP-owned workers.
+    """
+    global _backend
+    async with _init_lock:
+        backend = _backend
+        _backend = None
+        if backend is None:
+            return
+        shutdown = getattr(backend, "shutdown", None)
+        if shutdown is None:
+            return
+        try:
+            result = shutdown()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            log.warning("backend_shutdown_failed", backend=backend.name, exc_info=True)
 
 
 async def get_backend() -> AutoCADBackend:
@@ -175,6 +199,98 @@ def _error(
 # ---------------------------------------------------------------------------
 
 
+def _journal_call_identity(fn, args, kwargs) -> tuple[str | None, str | None]:
+    """Extract the operation/key without assuming FastMCP's call style.
+
+    FastMCP normally invokes tools with keyword arguments, while unit tests
+    and direct integrations often use positional arguments.  Binding against
+    the original function keeps the abandoned-journal recovery path correct in
+    both cases.  ``drawing`` historically carries its key inside ``data``;
+    retain that compatibility while all other tools use a top-level field.
+    """
+    operation = kwargs.get("operation")
+    idempotency_key = kwargs.get("idempotency_key")
+    try:
+        bound = inspect.signature(fn).bind_partial(*args, **kwargs)
+        operation = bound.arguments.get("operation", operation)
+        idempotency_key = bound.arguments.get("idempotency_key", idempotency_key)
+        data = bound.arguments.get("data")
+    except (TypeError, ValueError):
+        data = kwargs.get("data")
+    if not idempotency_key and isinstance(data, dict):
+        idempotency_key = data.get("idempotency_key")
+    operation_text = str(operation).strip() if operation is not None else None
+    key_text = str(idempotency_key).strip() if idempotency_key else None
+    return operation_text or None, key_text or None
+
+
+def _close_abandoned_journal(
+    *,
+    tool_name: str,
+    operation: str | None,
+    idempotency_key: str | None,
+    exception: Exception,
+    parameters: dict[str, Any],
+) -> None:
+    """Best-effort terminalization for a journal record left by an exception.
+
+    This function must never mask the original tool error.  It only touches a
+    matching ``accepted`` record, so a concurrent normal commit/failure cannot
+    be overwritten.  The journal is intentionally independent of the backend
+    lifecycle: no AutoCAD/COM call is made here.
+    """
+    if not idempotency_key or not operation:
+        return
+    message, details = exception_context(
+        exception,
+        operation=f"{tool_name}.{operation}",
+        parameters=parameters,
+        system_call="tool-handler",
+    )
+    code = getattr(exception, "error_code", None) or infer_error_code(message)
+    recoverable = getattr(exception, "recoverable", False)
+    stored = {
+        "ok": False,
+        "error": error_payload(
+            message,
+            code=code,
+            recoverable=recoverable,
+            recommended_action=getattr(exception, "recommended_action", None),
+        ),
+        "details": details,
+    }
+    try:
+        # Reuse the server's singleton so tests/integrations that inject a
+        # managed journal root are finalized in the same file, rather than
+        # creating a second journal under a different workspace.
+        from autocad_mcp.server import _operation_journal
+
+        record = _operation_journal().fail_if_accepted(
+            idempotency_key,
+            stored,
+            retryable=bool(recoverable),
+            operation=f"{tool_name}.{operation}",
+        )
+        if record is not None and record.get("abandoned"):
+            log.warning(
+                "journal_abandoned_request_closed",
+                tool=tool_name,
+                operation=operation,
+                idempotency_key=idempotency_key,
+            )
+    except Exception as journal_error:
+        # Returning the original structured tool error is more useful than
+        # crashing the MCP process because its diagnostic journal is locked or
+        # unavailable.
+        log.warning(
+            "journal_abandoned_request_close_failed",
+            tool=tool_name,
+            operation=operation,
+            idempotency_key=idempotency_key,
+            error=str(journal_error),
+        )
+
+
 def _safe(tool_name: str):
     """Wrap an async tool handler with uniform error handling."""
 
@@ -186,6 +302,14 @@ def _safe(tool_name: str):
             except Exception as e:
                 op = kwargs.get("operation", "unknown")
                 log.error("tool_error", tool=tool_name, operation=op, error=str(e))
+                operation, idempotency_key = _journal_call_identity(fn, args, kwargs)
+                _close_abandoned_journal(
+                    tool_name=tool_name,
+                    operation=operation,
+                    idempotency_key=idempotency_key,
+                    exception=e,
+                    parameters=kwargs,
+                )
                 return _error(e, f"{tool_name}.{op}", parameters=kwargs)
 
         return wrapper

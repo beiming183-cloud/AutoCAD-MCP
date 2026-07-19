@@ -28,16 +28,34 @@ import structlog
 from autocad_mcp import __version__
 from autocad_mcp.audit import INSUNITS_NAMES, audit_dxf_file, build_audit, geometry_digest
 from autocad_mcp.backends.base import AutoCADBackend, BackendCapabilities, CommandResult
-from autocad_mcp.config import DOCUMENT_TIMEOUT, IPC_DIR, IPC_TIMEOUT, LISP_DIR, _autostart_autocad
+from autocad_mcp.com_sta import ComStaExecutor, com_hresult, sta_async_method, sta_sync_method
+from autocad_mcp.config import (
+    AutoCADStartupError,
+    DOCUMENT_TIMEOUT,
+    IPC_DIR,
+    IPC_TIMEOUT,
+    LISP_DIR,
+    _autostart_autocad,
+    last_autostart_record,
+)
 from autocad_mcp.drafting import encode_autocad_text
 from autocad_mcp.errors import LayerNotFoundError, exception_context
 from autocad_mcp.product_design import feature_bounds, normalize_feature
 from autocad_mcp.runtime_health import (
     RuntimeHealthError,
     activity_insights_write_preflight,
+    autocad_cer_snapshot,
     list_autocad_processes,
     win32_runtime_health,
 )
+from autocad_mcp.session import (
+    DocumentState,
+    ProcessState,
+    SessionRegistry,
+    TransportState,
+    UiState,
+)
+from autocad_mcp.native_pipe import NativePipeClient, NativePipeError, camel_case_keys
 from autocad_mcp.variables import mechanical_variable_updates, validate_variable_updates
 
 log = structlog.get_logger()
@@ -46,24 +64,53 @@ log = structlog.get_logger()
 POLL_INTERVAL = 0.1  # seconds
 TIMEOUT = IPC_TIMEOUT  # seconds (configurable via AUTOCAD_MCP_IPC_TIMEOUT)
 STALE_THRESHOLD = 60.0  # clean up files older than this
+_LAST_WINDOW_DISCOVERY: dict = {"candidates": [], "fatal_windows": [], "selection": None}
 
 
-def find_autocad_window() -> int | None:
+def window_discovery_status() -> dict:
+    return {
+        "candidates": [dict(item) for item in _LAST_WINDOW_DISCOVERY["candidates"]],
+        "fatal_windows": [dict(item) for item in _LAST_WINDOW_DISCOVERY.get("fatal_windows", [])],
+        "selection": _LAST_WINDOW_DISCOVERY.get("selection"),
+    }
+
+
+def find_autocad_window(preferred_process_id: int | None = None) -> int | None:
     """Find the AutoCAD main window, including hidden automation sessions."""
     if sys.platform != "win32":
         return None
+    if preferred_process_id is None:
+        configured_pid = os.environ.get("AUTOCAD_MCP_ACAD_PID", "").strip()
+        if configured_pid:
+            try:
+                preferred_process_id = int(configured_pid)
+            except ValueError:
+                _LAST_WINDOW_DISCOVERY["candidates"] = []
+                _LAST_WINDOW_DISCOVERY["selection"] = "invalid-preferred-process"
+                return None
     try:
         import win32api
         import win32con
         import win32gui
         import win32process
 
-        windows: list[int] = []
+        windows: list[dict] = []
+        fatal_windows: list[dict] = []
+        fatal_tokens = (
+            "fatal error",
+            "error abort",
+            "unhandled exception",
+            "致命错误",
+            "错误中断",
+            "无法继续",
+            "\u9519\u8bef\u4e2d\u65ad",
+        )
 
         def callback(hwnd, result):
             if win32gui.IsWindowVisible(hwnd):
                 is_autocad = False
                 process_handle = None
+                process_id = None
                 try:
                     _, process_id = win32process.GetWindowThreadProcessId(hwnd)
                     process_handle = win32api.OpenProcess(
@@ -76,7 +123,7 @@ def find_autocad_window() -> int | None:
                 except Exception:
                     # A title fallback supports restricted process-query environments.
                     title = win32gui.GetWindowText(hwnd).lower()
-                    is_autocad = "autodesk autocad" in title
+                    is_autocad = "autocad" in title or "autodesk" in title
                 finally:
                     if process_handle is not None:
                         try:
@@ -85,23 +132,89 @@ def find_autocad_window() -> int | None:
                             pass
 
                 if is_autocad:
-                    result.append(hwnd)
+                    title = str(win32gui.GetWindowText(hwnd) or "")
+                    item = {
+                        "hwnd": int(hwnd),
+                        "process_id": int(process_id) if process_id is not None else None,
+                        "visible": True,
+                        "minimized": bool(win32gui.IsIconic(hwnd)),
+                        "title": title,
+                    }
+                    if any(token in title.casefold() for token in fatal_tokens):
+                        fatal_windows.append(item)
+                    else:
+                        result.append(item)
             return True
 
         win32gui.EnumWindows(callback, windows)
-        if windows:
-            return windows[0]
+        _LAST_WINDOW_DISCOVERY["candidates"] = windows
+        _LAST_WINDOW_DISCOVERY["fatal_windows"] = fatal_windows
+        if preferred_process_id is not None:
+            preferred = next(
+                (
+                    item
+                    for item in windows
+                    if item["process_id"] == int(preferred_process_id)
+                ),
+                None,
+            )
+            if preferred:
+                _LAST_WINDOW_DISCOVERY["selection"] = "preferred-process"
+                return preferred["hwnd"]
+        if len(windows) == 1 and preferred_process_id is None:
+            _LAST_WINDOW_DISCOVERY["selection"] = "single-visible-window"
+            return windows[0]["hwnd"]
 
+        executor = ComStaExecutor(name="autocad-mcp-window-discovery")
         try:
-            import pythoncom
-            import win32com.client
+            def discover_from_com():
+                import win32com.client
 
-            pythoncom.CoInitialize()
-            application = win32com.client.GetActiveObject("AutoCAD.Application")
-            hwnd = int(application.HWND)
-            return hwnd if hwnd else None
-        except Exception:
+                application = win32com.client.GetActiveObject("AutoCAD.Application")
+                hwnd = int(application.HWND)
+                return hwnd if hwnd else None
+
+            com_hwnd = executor.call(
+                "window.discovery",
+                discover_from_com,
+                idempotent=True,
+                timeout=5.0,
+            )
+            # COM's HWND is the authoritative fallback for a hidden startup
+            # window.  It may not be present in EnumWindows until the UI has
+            # finished creating its visible frame.
+            if com_hwnd:
+                com_hwnd = int(com_hwnd)
+                com_pid = _window_process_id(com_hwnd)
+                if preferred_process_id is not None and com_pid not in (
+                    None,
+                    int(preferred_process_id),
+                ):
+                    _LAST_WINDOW_DISCOVERY["selection"] = "com-pid-mismatch"
+                    return None
+                com_executable = _process_executable_name(com_pid)
+                if com_executable not in (None, "acad.exe"):
+                    _LAST_WINDOW_DISCOVERY["selection"] = "com-non-autocad-process"
+                    return None
+                # COM remains authoritative even when the frame is hidden or
+                # has not entered EnumWindows yet.  A visible candidate from
+                # another AutoCAD process must not suppress this verified
+                # active object.
+                _LAST_WINDOW_DISCOVERY["selection"] = (
+                    "com-hwnd-visible"
+                    if any(item["hwnd"] == com_hwnd for item in windows)
+                    else "com-hwnd-hidden"
+                )
+                return com_hwnd
+            _LAST_WINDOW_DISCOVERY["selection"] = "ambiguous" if windows else "not-found"
             return None
+        except Exception:
+            _LAST_WINDOW_DISCOVERY["selection"] = (
+                "ambiguous" if len(windows) > 1 else "not-found"
+            )
+            return None
+        finally:
+            executor.close()
     except ImportError:
         return None
 
@@ -170,11 +283,13 @@ def detect_autocad_crash_state(
         return {"crashed": False}
     pid = process_id or _window_process_id(hwnd)
     if process_id and _process_is_alive(process_id) is False:
-        return {
+        result = {
             "crashed": True,
             "reason": "process_exited",
             "process_id": int(process_id),
         }
+        result["cer"] = autocad_cer_snapshot()
+        return result
 
     try:
         import win32gui
@@ -185,6 +300,11 @@ def detect_autocad_crash_state(
             "unhandled exception",
             "致命错误",
             "无法继续",
+        )
+        fatal_tokens = fatal_tokens + (
+            "\u81f4\u547d\u9519\u8bef",
+            "\u9519\u8bef\u4e2d\u65ad",
+            "\u65e0\u6cd5\u7ee7\u7eed",
         )
         product_tokens = ("autocad", "autodesk")
         dialogs: list[dict] = []
@@ -210,7 +330,14 @@ def detect_autocad_crash_state(
             same_process = bool(pid and window_pid == pid)
             identified_product = any(token in combined for token in product_tokens)
             fatal = any(token in combined for token in fatal_tokens)
-            if fatal and (same_process or identified_product):
+            # Once a managed PID is known, only a dialog owned by that exact
+            # process is evidence of its crash.  A stale CER/WebView report
+            # often contains the word AutoCAD in its title but belongs to a
+            # different process and must not poison startup detection.
+            executable_name = _process_executable_name(window_pid)
+            owned_by_autocad = executable_name == "acad.exe"
+            relevant = same_process if pid else (identified_product and owned_by_autocad)
+            if fatal and relevant:
                 dialogs.append(
                     {
                         "hwnd": int(window),
@@ -223,12 +350,14 @@ def detect_autocad_crash_state(
 
         win32gui.EnumWindows(callback, None)
         if dialogs:
-            return {
+            result = {
                 "crashed": True,
                 "reason": "fatal_error_dialog",
                 "process_id": pid,
                 "dialog": dialogs[0],
             }
+            result["cer"] = autocad_cer_snapshot()
+            return result
     except Exception:
         pass
     return {"crashed": False, "process_id": pid}
@@ -351,8 +480,15 @@ def _com_entity_to_dict(entity) -> dict:
             text_position=_com_point(_com_value(entity, "TextPosition")),
         )
     elif entity_type == "HATCH":
+        raw_pattern_angle = _com_value(entity, "PatternAngle", None)
+        try:
+            pattern_angle = math.degrees(float(raw_pattern_angle)) if raw_pattern_angle is not None else None
+        except (TypeError, ValueError):
+            pattern_angle = raw_pattern_angle
         result.update(
             pattern=str(_com_value(entity, "PatternName", "")),
+            angle=pattern_angle,
+            scale=_com_value(entity, "PatternScale", 1.0),
             area=_com_value(entity, "Area"),
         )
 
@@ -372,7 +508,9 @@ def _com_entity_to_dict(entity) -> dict:
 class FileIPCBackend(AutoCADBackend):
     """File IPC for full AutoCAD and AutoCAD LT via mcp_dispatch.lsp."""
 
-    def __init__(self):
+    def __init__(self, *, com_executor: ComStaExecutor | None = None):
+        self._com_executor = com_executor or ComStaExecutor()
+        self._session = SessionRegistry()
         self._hwnd: int | None = None
         self._command_hwnd: int | None = None
         self._ipc_dir = Path(IPC_DIR)
@@ -384,12 +522,37 @@ class FileIPCBackend(AutoCADBackend):
         self._dispatcher_version: str | None = None
         self._product_info: dict = {}
         self._window_policy_applied = False
+        # A user-owned CAD window is never minimized or activated implicitly.
+        # This flips to True only when this backend launched the process.
+        self._window_policy_owned = False
         self._acad_process_id: int | None = None
-        self._doc_ids_by_key: dict[str, str] = {}
-        self._doc_revisions: dict[str, int] = {}
+        self._doc_ids_by_key = self._session.doc_ids_by_key
+        self._doc_revisions = self._session.doc_revisions
         self._transactions: dict[str, dict] = {}
         self._deferred_output_cleanup: set[Path] = set()
         self._user_foreground_hwnd: int | None = None
+        self._native_client: NativePipeClient | None = None
+        self._native_initialization_error: dict | None = None
+
+    async def shutdown(self) -> None:
+        """Release MCP-owned transports without closing the AutoCAD session.
+
+        A forced MCP re-initialization must not leave the old COM STA alive.
+        Dropping the native client is safe because it opens one named-pipe
+        connection per request; it does not send a document-close command.
+        """
+        executor = self._com_executor
+        try:
+            executor.close()
+        except Exception:
+            log.warning("backend_shutdown_executor_failed", exc_info=True)
+        finally:
+            # Clear identity only after the STA has been asked to stop, so a
+            # late callback never observes a half-reset PID/HWND pair.
+            self._native_client = None
+            self._command_hwnd = None
+            self._hwnd = None
+            self._acad_process_id = None
 
     @property
     def name(self) -> str:
@@ -438,6 +601,7 @@ class FileIPCBackend(AutoCADBackend):
                 "offline_dxf_audit",
                 "native_pdf_plot",
                 "native_png_plot",
+                "controlled_visual_style_readback",
                 "read_only_dwg_copy",
             ],
             "unsupported": {
@@ -450,12 +614,221 @@ class FileIPCBackend(AutoCADBackend):
                 "draft": "not implemented by the current safe backend",
                 "parametric_assembly": "component identity, mates, configurations, and DOF solving are not implemented",
                 "exact_motion_sweep_interference": "only broad-phase AABB screening is available; exact B-rep sweep remains unavailable",
-                "offscreen_3d_render": "current native PNG output is a deterministic plot, not a material 3D renderer",
+                "offscreen_3d_render": "material/offscreen rendering still requires the native PlotEngine plugin; controlled shaded visual-style plots are supported",
                 "surface_continuity_g0_g1_g2": "not implemented",
                 "wall_thickness": "not implemented",
                 "draft_angle_analysis": "not implemented",
             },
         }
+
+    @staticmethod
+    def _native_plugin_mode() -> str:
+        mode = os.environ.get("AUTOCAD_MCP_NATIVE_PLUGIN", "auto").strip().lower()
+        return mode if mode in {"auto", "required", "off"} else "auto"
+
+    def _get_autocad_application(self):
+        """Bind COM to the same AutoCAD process selected during preflight.
+
+        ``GetActiveObject`` is global on Windows and can silently return a
+        different AutoCAD instance when more than one is open.  Once this
+        backend has a PID/HWND, refuse an unverified COM identity instead of
+        risking a write to the wrong document.
+        """
+        import win32com.client
+
+        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        expected_pid = int(self._acad_process_id or 0)
+        expected_hwnd = int(self._hwnd or 0)
+        actual_hwnd = int(getattr(application, "HWND", 0) or 0)
+        if expected_pid:
+            if not actual_hwnd:
+                raise RuntimeError(
+                    "E_AUTOCAD_INSTANCE_UNVERIFIED: COM application has no HWND "
+                    f"for expected PID {expected_pid}"
+                )
+            actual_pid = _window_process_id(actual_hwnd)
+            if actual_pid != expected_pid:
+                raise RuntimeError(
+                    "E_AUTOCAD_INSTANCE_MISMATCH: COM HWND/PID does not match "
+                    f"selected AutoCAD PID {expected_pid} (actual PID {actual_pid})"
+                )
+        elif expected_hwnd and actual_hwnd and actual_hwnd != expected_hwnd:
+            raise RuntimeError(
+                "E_AUTOCAD_INSTANCE_MISMATCH: COM HWND does not match the "
+                f"selected AutoCAD HWND {expected_hwnd} (actual HWND {actual_hwnd})"
+            )
+        return application
+
+    def _native_window_policy(self, *, activate: bool = False) -> dict:
+        """Apply the UI policy through user32 without requiring COM/pywin32."""
+        configured = os.environ.get("AUTOCAD_MCP_VISIBLE", "true").lower() in (
+            "1", "true", "yes", "on"
+        )
+        mode, requested_mode = self._configured_window_mode()
+        if activate:
+            mode = "foreground"
+        if mode == "preserve":
+            return {
+                "configured_visible": configured,
+                "shown": bool(self._hwnd),
+                "window_mode": "preserve",
+                "requested_window_mode": requested_mode,
+                "activated": False,
+                "preserved_user_window": True,
+                "transport": "none",
+                "hwnd": self._hwnd,
+            }
+        result = {
+            "configured_visible": configured,
+            "shown": False,
+            "window_mode": mode,
+            "requested_window_mode": requested_mode,
+            "activated": False,
+            "transport": "user32",
+            "hwnd": self._hwnd,
+        }
+        if not configured or sys.platform != "win32" or not self._hwnd:
+            return result
+        try:
+            import ctypes
+
+            user32 = ctypes.windll.user32
+            hwnd = int(self._hwnd)
+            if not user32.IsWindow(hwnd):
+                result["reason"] = "invalid-window-handle"
+                return result
+            foreground_before = int(user32.GetForegroundWindow() or 0)
+            if mode == "foreground":
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                user32.SetForegroundWindow(hwnd)
+                result["activated"] = True
+            elif mode == "visible":
+                user32.ShowWindow(hwnd, 4)  # SW_SHOWNOACTIVATE
+            elif not self._window_policy_applied:
+                user32.ShowWindow(hwnd, 7)  # SW_SHOWMINNOACTIVE
+            self._window_policy_applied = True
+            result.update(
+                shown=bool(user32.IsWindowVisible(hwnd)),
+                minimized=bool(user32.IsIconic(hwnd)),
+                foreground_before=foreground_before or None,
+                foreground_after=int(user32.GetForegroundWindow() or 0) or None,
+            )
+            return result
+        except Exception as exc:
+            result.update(reason="window-policy-failed", exception_type=type(exc).__name__)
+            return result
+
+    async def _initialize_native_transport(self) -> CommandResult | None:
+        mode = self._native_plugin_mode()
+        if mode == "off":
+            return None
+        try:
+            client = NativePipeClient.discover(timeout=IPC_TIMEOUT)
+        except NativePipeError as exc:
+            return CommandResult(
+                ok=False,
+                error=str(exc),
+                error_code=exc.error_code,
+                recoverable=exc.recoverable,
+                recommended_action=exc.recommended_action,
+                payload=exc.details,
+            )
+        if client is None:
+            if mode == "required":
+                return CommandResult(
+                    ok=False,
+                    error="No live AutoCAD native worker descriptor was found",
+                    error_code="E_NATIVE_PLUGIN_UNAVAILABLE",
+                    recoverable=True,
+                    recommended_action="install_and_load_the_signed_autocad_mcp_native_bundle",
+                    payload={"mode": mode},
+                )
+            return None
+
+        ping = await client.ping()
+        if not ping.ok:
+            return ping
+        payload = ping.payload if isinstance(ping.payload, dict) else {}
+        if int(payload.get("protocol_version", -1)) != client.descriptor.protocol_version:
+            return CommandResult(
+                ok=False,
+                error="Native worker ping does not match its published descriptor",
+                error_code="E_NATIVE_PROTOCOL_MISMATCH",
+                recoverable=False,
+                payload={"descriptor": client.descriptor.to_dict(), "ping": payload},
+            )
+        if str(payload.get("session_id")) != client.descriptor.session_id:
+            return CommandResult(
+                ok=False,
+                error="Native worker session changed during connection",
+                error_code="E_SESSION_GENERATION_MISMATCH",
+                recoverable=True,
+                recommended_action="rediscover_the_native_worker_and_read_document_context",
+                payload={"descriptor": client.descriptor.to_dict(), "ping": payload},
+            )
+
+        self._native_client = client
+        self._acad_process_id = client.descriptor.process_id
+        self._hwnd = client.descriptor.hwnd
+        worker = self._session.bind_worker(
+            process_id=self._acad_process_id,
+            hwnd=self._hwnd,
+            owned=False,
+            session_id=client.descriptor.session_id,
+            generation=self._acad_process_id,
+        )
+        context = await client.request("document.context")
+        created_first_document = False
+        if not context.ok and context.error_code == "E_NO_ACTIVE_DOCUMENT":
+            context = await client.request(
+                "document.create",
+                data={"template": os.environ.get("AUTOCAD_MCP_TEMPLATE", "acadiso.dwt")},
+                idempotency_key=f"bootstrap-document:{client.descriptor.session_id}",
+            )
+            created_first_document = context.ok
+        if not context.ok:
+            self._native_client = None
+            return context
+
+        self._session.process_state = ProcessState.READY
+        self._session.transport_state = TransportState.PLUGIN_READY
+        self._session.document_state = DocumentState.READY
+        self._session.ui_state = UiState.IDLE
+        self._product_info = {
+            "product": "AutoCAD",
+            "native_plugin_version": payload.get("plugin_version"),
+            "process_id": self._acad_process_id,
+        }
+        visibility = self._native_window_policy()
+        return CommandResult(
+            ok=True,
+            payload={
+                "autocad": {
+                    **self._product_info,
+                    "running": True,
+                    "hwnd": self._hwnd,
+                    "active_document": context.payload.get("document_name"),
+                    "active_document_path": context.payload.get("active_path"),
+                    "created_first_document": created_first_document,
+                },
+                "native_worker": {
+                    **client.descriptor.to_dict(),
+                    "ping": payload,
+                    "context": context.payload,
+                },
+                "transport": "native_pipe",
+                "dispatcher_isolation": "native-plugin-with-external-supervisor",
+                "worker": {
+                    "session_id": worker.session_id,
+                    "generation": worker.generation,
+                    "process_id": worker.process_id,
+                    "hwnd": worker.hwnd,
+                    "owned": worker.owned,
+                },
+                "ready": True,
+                "visibility": visibility,
+            },
+        )
 
     async def initialize(self) -> CommandResult:
         """Make AutoCAD and its versioned dispatcher ready for commands."""
@@ -463,6 +836,16 @@ class FileIPCBackend(AutoCADBackend):
 
     async def ensure_ready(self) -> CommandResult:
         """Discover, start, connect, load, handshake, and ping AutoCAD."""
+        self._session.process_state = ProcessState.STARTING
+        # Re-initialization must not inherit ownership of a prior CAD process.
+        # Native/user-owned sessions are read-only unless this call launches
+        # the process itself.
+        self._window_policy_owned = False
+        native = await self._initialize_native_transport()
+        if native is not None:
+            if native.ok or self._native_plugin_mode() == "required":
+                return native
+            self._native_initialization_error = native.to_dict()
         runtime = win32_runtime_health()
         if sys.platform == "win32" and not runtime["ok"]:
             return CommandResult(
@@ -475,8 +858,19 @@ class FileIPCBackend(AutoCADBackend):
             )
 
         processes = list_autocad_processes()
+        started_by_backend = False
         self._hwnd = find_autocad_window()
         if not self._hwnd:
+            discovery = window_discovery_status()
+            if discovery.get("selection") == "ambiguous":
+                return CommandResult(
+                    ok=False,
+                    error="Multiple AutoCAD windows are available and no owned instance could be selected",
+                    error_code="E_AUTOCAD_INSTANCE_AMBIGUOUS",
+                    recoverable=True,
+                    recommended_action="set_AUTOCAD_MCP_ACAD_PID_or_close_unrelated_instances",
+                    payload=discovery,
+                )
             if processes:
                 return CommandResult(
                     ok=False,
@@ -490,7 +884,21 @@ class FileIPCBackend(AutoCADBackend):
             if prior_crash.get("crashed"):
                 return self._autocad_crashed_result(prior_crash, "system.ensure_ready")
             try:
-                self._hwnd = _autostart_autocad(find_autocad_window)
+                self._hwnd = _autostart_autocad(
+                    find_autocad_window,
+                    crash_probe=detect_autocad_crash_state,
+                )
+                started_by_backend = bool(self._hwnd)
+                self._window_policy_owned = started_by_backend
+            except AutoCADStartupError as exc:
+                return CommandResult(
+                    ok=False,
+                    error=str(exc),
+                    error_code=exc.error_code,
+                    recoverable=exc.recoverable,
+                    recommended_action=exc.recommended_action,
+                    payload=exc.details,
+                )
             except RuntimeHealthError as exc:
                 return CommandResult(
                     ok=False,
@@ -515,11 +923,34 @@ class FileIPCBackend(AutoCADBackend):
                 error_code="E_AUTOCAD_NOT_RUNNING",
             )
         self._acad_process_id = _window_process_id(self._hwnd)
+        launch = last_autostart_record() if started_by_backend else None
+        owned = bool(
+            launch
+            and launch.get("launcher_pid") is not None
+            and int(launch["launcher_pid"]) == int(self._acad_process_id or -1)
+            and int(launch.get("hwnd") or 0) == int(self._hwnd or 0)
+        )
+        worker = self._session.bind_worker(
+            process_id=self._acad_process_id,
+            hwnd=self._hwnd,
+            owned=owned,
+            launch_token=launch.get("launch_token") if owned and launch else None,
+        )
         crash = detect_autocad_crash_state(self._hwnd, self._acad_process_id)
         if crash.get("crashed"):
             return self._autocad_crashed_result(crash, "system.ensure_ready")
 
-        visibility = self._ensure_autocad_visible()
+        if self._window_policy_owned or os.environ.get(
+            "AUTOCAD_MCP_APPLY_WINDOW_POLICY_TO_EXISTING", "false"
+        ).strip().lower() in ("1", "true", "yes", "on"):
+            visibility = self._ensure_autocad_visible()
+        else:
+            visibility = {
+                "configured_visible": True,
+                "shown": bool(self._hwnd),
+                "preserved_user_window": True,
+                "hwnd": self._hwnd,
+            }
         log.info("autocad_visibility", **visibility)
 
         document = self._ensure_active_document()
@@ -530,8 +961,14 @@ class FileIPCBackend(AutoCADBackend):
                 error_code=document.get("error_code", "E_NO_ACTIVE_DOCUMENT"),
                 payload=document.get("details"),
             )
-        activity_policy = self._apply_activity_insights_policy()
+        # Attaching to a CAD instance opened by the user must be read-only.
+        # Startup policy is allowed to mutate only an instance launched by
+        # this backend, and only when the caller explicitly opts in.
+        activity_policy = self._apply_activity_insights_policy(
+            allow_mutation=started_by_backend
+        )
         self._product_info = self._discover_product()
+        self._session.transport_state = TransportState.COM_READY
 
         # Set up screenshot provider
         try:
@@ -607,6 +1044,10 @@ class FileIPCBackend(AutoCADBackend):
                 error_code="E_DISPATCHER_VERSION_MISMATCH",
             )
 
+        self._session.transport_state = TransportState.COM_READY
+        self._session.document_state = DocumentState.READY
+        self._session.ui_state = UiState.IDLE
+
         return CommandResult(
             ok=True,
             payload={
@@ -627,13 +1068,28 @@ class FileIPCBackend(AutoCADBackend):
                 },
                 "transport": "file_ipc",
                 "dispatcher_isolation": "external-python-process",
+                "native_initialization_error": self._native_initialization_error,
+                "worker": {
+                    "session_id": worker.session_id,
+                    "generation": worker.generation,
+                    "process_id": worker.process_id,
+                    "hwnd": worker.hwnd,
+                    "owned": worker.owned,
+                },
+                "com_sta": self._com_executor.snapshot(),
                 "ready": True,
                 "visibility": visibility,
             },
         )
 
-    def _apply_activity_insights_policy(self) -> dict:
-        """Persist an optional Activity Insights policy for the next restart."""
+    @sta_sync_method("activity_insights.apply", idempotent=True)
+    def _apply_activity_insights_policy(self, *, allow_mutation: bool = False) -> dict:
+        """Report Activity Insights policy without mutating user-owned CAD.
+
+        Environment variables describe a desired startup policy, but they are
+        not permission to rewrite an already-open document.  Mutation requires
+        both a backend-owned launch and ``AUTOCAD_MCP_APPLY_ACTIVITY_POLICY``.
+        """
         disable = os.environ.get("AUTOCAD_MCP_DISABLE_ACTIVITY_INSIGHTS", "").strip().lower() in (
             "1", "true", "yes", "on"
         )
@@ -645,15 +1101,27 @@ class FileIPCBackend(AutoCADBackend):
             "disable_requested": disable,
             "path_requested": configured_path or None,
             "restart_required": True,
+            "mutation_allowed": bool(allow_mutation),
             "applied": {},
             "errors": [],
         }
+        apply_requested = os.environ.get(
+            "AUTOCAD_MCP_APPLY_ACTIVITY_POLICY", "false"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        result["apply_requested"] = apply_requested
+        if not allow_mutation or not apply_requested:
+            result["deferred"] = True
+            result["reason"] = (
+                "existing_user_owned_instance"
+                if not allow_mutation
+                else "explicit_opt_in_required"
+            )
+            return result
         try:
             import pythoncom
             import win32com.client
 
-            pythoncom.CoInitialize()
-            document = win32com.client.GetActiveObject("AutoCAD.Application").ActiveDocument
+            document = self._get_autocad_application().ActiveDocument
             if disable:
                 document.SetVariable("ACTIVITYINSIGHTSSUPPORT", 0)
                 result["applied"]["ACTIVITYINSIGHTSSUPPORT"] = document.GetVariable(
@@ -674,6 +1142,7 @@ class FileIPCBackend(AutoCADBackend):
         return result
 
     async def status(self) -> CommandResult:
+        native_health = await self._native_client.ping() if self._native_client else None
         crash = detect_autocad_crash_state(self._hwnd, self._acad_process_id)
         if crash.get("crashed"):
             return self._autocad_crashed_result(crash, "system.status")
@@ -691,9 +1160,28 @@ class FileIPCBackend(AutoCADBackend):
                 "version": self._dispatcher_version,
                 "expected_version": __version__,
             },
-            "ready": bool(self._hwnd and self._dispatcher_version == __version__),
-            "dispatcher_isolation": "external-python-process",
+            "native_worker": (
+                {
+                    **self._native_client.descriptor.to_dict(),
+                    "health": native_health.to_dict(),
+                }
+                if self._native_client and native_health
+                else None
+            ),
+            "native_initialization_error": self._native_initialization_error,
+            "transport": "native_pipe" if self._native_client else "file_ipc",
+            "ready": bool(
+                (native_health and native_health.ok)
+                or (self._hwnd and self._dispatcher_version == __version__)
+            ),
+            "dispatcher_isolation": (
+                "native-plugin-with-external-supervisor"
+                if self._native_client
+                else "external-python-process"
+            ),
             "industrial_capabilities": self._industrial_capability_matrix(),
+            "session": self._session.snapshot(),
+            "com_sta": self._com_executor.snapshot(),
         }
         return CommandResult(ok=True, payload=info)
 
@@ -704,13 +1192,25 @@ class FileIPCBackend(AutoCADBackend):
         description = f"AutoCAD crashed or entered a fatal error state ({reason})"
         if title:
             description += f": {title}"
+        cer_records = ((state.get("cer") or {}).get("records") or [])
+        cer_stack = " ".join(str(item.get("stack_excerpt") or "") for item in cer_records)
+        theme_failure = "OverridePaletteTheme" in cer_stack or "AdUiMgdPaletteTheme" in cer_stack
+        recommended_action = (
+            "reset_or_repair_the_autocad_profile_or_installation_then_retry_with_an_isolated_ARG_profile"
+            if theme_failure
+            else "close_fatal_dialog_restart_autocad_and_retry"
+        )
         return CommandResult(
             ok=False,
             error=description,
             error_code="E_AUTOCAD_CRASHED",
             recoverable=True,
-            recommended_action="close_fatal_dialog_restart_autocad_and_retry",
-            payload={"operation": operation, "crash": state},
+            recommended_action=recommended_action,
+            payload={
+                "operation": operation,
+                "crash": state,
+                "diagnosis": "palette_theme_initialization" if theme_failure else "startup_failure_unclassified",
+            },
         )
 
     @staticmethod
@@ -724,37 +1224,66 @@ class FileIPCBackend(AutoCADBackend):
 
     def _bind_document(self, document, *, force_new: bool = False) -> dict:
         key = self._document_key(document)
-        doc_id = None if force_new else self._doc_ids_by_key.get(key)
-        if not doc_id:
-            doc_id = f"acad-{uuid.uuid4().hex}"
-            self._doc_ids_by_key[key] = doc_id
-            self._doc_revisions.setdefault(doc_id, 0)
         path = str(_com_value(document, "FullName", "") or _com_value(document, "Name", ""))
-        return {
-            "doc_id": doc_id,
-            "active_doc_id": doc_id,
-            "requested_path": path,
-            "active_path": path,
-            "revision": int(self._doc_revisions.get(doc_id, 0)),
-            "document_name": str(_com_value(document, "Name", "")),
-            "backend": self.name,
-        }
+        name = str(_com_value(document, "Name", ""))
+        lease = self._session.bind_document(
+            key,
+            path=path,
+            name=name,
+            force_new=force_new,
+        )
+        return {**self._session.context(lease), "backend": self.name}
 
     async def document_context(self) -> CommandResult:
+        if self._native_client is not None:
+            result = await self._native_client.request("document.context")
+            if result.ok and isinstance(result.payload, dict):
+                result.payload.update(backend=self.name, transport="native_pipe")
+            return result
+        return await self._document_context_com()
+
+    @sta_async_method("drawing.context", idempotent=True)
+    async def _document_context_com(self) -> CommandResult:
         try:
             import pythoncom
             import win32com.client
 
-            pythoncom.CoInitialize()
-            application = win32com.client.GetActiveObject("AutoCAD.Application")
-            if int(application.Documents.Count) == 0:
+            application = self._get_autocad_application()
+            # Some AutoCAD builds expose ``Documents.Count`` as a deferred
+            # COM proxy while the application is minimized or still settling.
+            # ActiveDocument is the authoritative readiness probe; use Count
+            # only as an optional secondary check so a transient proxy failure
+            # does not become a false "no document" result.
+            try:
+                document = application.ActiveDocument
+            except Exception:
+                document = None
+            if document is None:
                 return CommandResult(
                     ok=False,
                     error="AutoCAD has no document",
                     error_code="E_NO_ACTIVE_DOCUMENT",
                 )
+            try:
+                if int(application.Documents.Count) == 0:
+                    return CommandResult(
+                        ok=False,
+                        error="AutoCAD has no document",
+                        error_code="E_NO_ACTIVE_DOCUMENT",
+                    )
+            except Exception:
+                # Keep the active-document result and expose the degraded
+                # collection probe to callers as a diagnostic warning.
+                count_warning = True
+            else:
+                count_warning = False
+            payload = self._bind_document(document)
+            if count_warning:
+                payload["warnings"] = [
+                    "AutoCAD.Documents.Count was unavailable; ActiveDocument was used"
+                ]
             return CommandResult(
-                ok=True, payload=self._bind_document(application.ActiveDocument)
+                ok=True, payload=payload
             )
         except Exception as exc:
             crash = detect_autocad_crash_state(self._hwnd, self._acad_process_id)
@@ -767,7 +1296,11 @@ class FileIPCBackend(AutoCADBackend):
             )
 
     async def require_document_context(
-        self, doc_id: str | None, expected_revision: int | None
+        self,
+        doc_id: str | None,
+        expected_revision: int | None,
+        lease_token: str | None = None,
+        worker_generation: int | None = None,
     ) -> CommandResult:
         context = await self.document_context()
         if not context.ok:
@@ -789,17 +1322,49 @@ class FileIPCBackend(AutoCADBackend):
                 recoverable=False,
                 payload={"requested_doc_id": doc_id, "actual": actual},
             )
-        if expected_revision is None or int(expected_revision) != int(actual["revision"]):
+        # Compatibility contexts from alternate backends and test adapters do
+        # not expose a native lease yet.  They still receive revision fencing.
+        if not actual.get("lease_token"):
+            if expected_revision is None or int(expected_revision) != int(actual["revision"]):
+                return CommandResult(
+                    ok=False,
+                    error="The active AutoCAD document revision is stale or missing",
+                    error_code="E_DOCUMENT_REVISION_MISMATCH",
+                    recoverable=False,
+                    payload={"expected_revision": expected_revision, "actual": actual},
+                )
+            return CommandResult(ok=True, payload=actual)
+        valid, error_code, lease_actual = self._session.validate(
+            doc_id=doc_id,
+            expected_revision=expected_revision,
+            lease_token=lease_token,
+            worker_generation=worker_generation,
+        )
+        if not valid:
+            messages = {
+                "E_SESSION_GENERATION_MISMATCH": "The AutoCAD worker generation changed",
+                "E_DOCUMENT_LEASE_MISMATCH": "The AutoCAD document lease is stale",
+                "E_DOCUMENT_REVISION_MISMATCH": "The active AutoCAD document revision is stale or missing",
+            }
             return CommandResult(
                 ok=False,
-                error="The active AutoCAD document revision is stale or missing",
-                error_code="E_DOCUMENT_REVISION_MISMATCH",
+                error=messages.get(error_code, "The AutoCAD document lease is invalid"),
+                error_code=error_code,
                 recoverable=False,
-                payload={"expected_revision": expected_revision, "actual": actual},
+                recommended_action="read_latest_document_context_and_retry",
+                payload={
+                    "expected_revision": expected_revision,
+                    "lease_token_supplied": lease_token is not None,
+                    "worker_generation": worker_generation,
+                    "actual": lease_actual or actual,
+                },
             )
         return CommandResult(ok=True, payload=actual)
 
     async def record_document_mutation(self, doc_id: str) -> CommandResult:
+        if self._native_client is not None:
+            # Native database events are the sole revision authority.
+            return await self.document_context()
         context = await self.document_context()
         if not context.ok:
             return context
@@ -809,42 +1374,170 @@ class FileIPCBackend(AutoCADBackend):
                 error="Cannot advance revision for a non-active document",
                 error_code="E_DOCUMENT_ID_MISMATCH",
             )
-        self._doc_revisions[doc_id] = int(self._doc_revisions.get(doc_id, 0)) + 1
-        context.payload["revision"] = self._doc_revisions[doc_id]
+        if not context.payload.get("lease_token"):
+            context.payload["revision"] = int(context.payload.get("revision", 0)) + 1
+            return context
+        lease = self._session.record_mutation(doc_id)
+        if lease is None:
+            return CommandResult(
+                ok=False,
+                error="Cannot advance revision for an unknown document lease",
+                error_code="E_DOCUMENT_ID_MISMATCH",
+            )
+        context.payload.update(self._session.context(lease))
         return context
 
-    async def drawing_activate(self, doc_id: str) -> CommandResult:
+    async def drawing_activate(
+        self,
+        doc_id: str | None,
+        expected_revision: int | None = None,
+        lease_token: str | None = None,
+        worker_generation: int | None = None,
+    ) -> CommandResult:
+        normalized_doc_id, revision, validation = self._validate_activation_request(
+            doc_id, expected_revision
+        )
+        if validation is not None:
+            return validation
+        if self._native_client is not None:
+            result = await self._native_client.request(
+                "document.activate",
+                doc_id=normalized_doc_id,
+                expected_revision=revision,
+            )
+            if result.ok and isinstance(result.payload, dict):
+                result.payload.update(
+                    backend=self.name,
+                    transport="native_pipe",
+                    requested_doc_id=normalized_doc_id,
+                    expected_revision=revision,
+                )
+            return result
+        return await self._drawing_activate_com(
+            normalized_doc_id,
+            revision,
+            lease_token=lease_token,
+            worker_generation=worker_generation,
+        )
+
+    @sta_async_method("drawing.activate", idempotent=True)
+    async def _drawing_activate_com(
+        self,
+        doc_id: str,
+        expected_revision: int,
+        *,
+        lease_token: str | None = None,
+        worker_generation: int | None = None,
+    ) -> CommandResult:
         try:
             import pythoncom
             import win32com.client
 
-            pythoncom.CoInitialize()
-            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            application = self._get_autocad_application()
+            target_document = None
+            target_context = None
             for index in range(int(application.Documents.Count)):
                 document = application.Documents.Item(index)
                 context = self._bind_document(document)
                 if context["doc_id"] == doc_id:
-                    document.Activate()
-                    actual = self._bind_document(application.ActiveDocument)
-                    differences = [] if actual["active_doc_id"] == doc_id else [
-                        {"path": "active_doc_id", "requested": doc_id, "actual": actual["active_doc_id"]}
-                    ]
-                    return CommandResult(
-                        ok=not differences,
-                        payload={**actual, "requested_doc_id": doc_id, "diff": differences},
-                        error="AutoCAD activated a different document" if differences else None,
-                        error_code="E_DOCUMENT_ID_MISMATCH" if differences else None,
-                    )
+                    target_document = document
+                    target_context = context
+                    break
+            if target_document is None or target_context is None:
+                return CommandResult(
+                    ok=False,
+                    error=f"Unknown document id: {doc_id}",
+                    error_code="E_DOCUMENT_ID_MISMATCH",
+                    recoverable=False,
+                    recommended_action="read_document_context_and_retry",
+                    payload={
+                        "requested_doc_id": doc_id,
+                        "expected_revision": expected_revision,
+                    },
+                )
+
+            valid, error_code, lease_actual = self._session.validate(
+                doc_id=doc_id,
+                expected_revision=expected_revision,
+                lease_token=lease_token,
+                worker_generation=worker_generation,
+            )
+            if not valid:
+                messages = {
+                    "E_SESSION_GENERATION_MISMATCH": "The AutoCAD worker generation changed",
+                    "E_DOCUMENT_LEASE_MISMATCH": "The AutoCAD document lease is stale",
+                    "E_DOCUMENT_REVISION_MISMATCH": "The requested document revision is stale",
+                }
+                return CommandResult(
+                    ok=False,
+                    error=messages.get(error_code, "The document activation fence is invalid"),
+                    error_code=error_code or "E_DOCUMENT_ID_MISMATCH",
+                    recoverable=False,
+                    recommended_action="read_latest_document_context_and_retry",
+                    payload={
+                        "requested_doc_id": doc_id,
+                        "expected_revision": expected_revision,
+                        "actual": lease_actual or target_context,
+                    },
+                )
+
+            # This changes only AutoCAD's active document.  It deliberately
+            # does not call the window policy or foreground APIs, so attaching
+            # to a user's CAD session cannot steal focus.
+            target_document.Activate()
+            active_document = application.ActiveDocument
+            actual = self._bind_document(active_document)
+            differences = []
+            if actual["active_doc_id"] != doc_id:
+                differences.append(
+                    {
+                        "path": "active_doc_id",
+                        "requested": doc_id,
+                        "actual": actual["active_doc_id"],
+                    }
+                )
+            if int(actual.get("revision", -1)) != int(expected_revision):
+                differences.append(
+                    {
+                        "path": "revision",
+                        "requested": expected_revision,
+                        "actual": actual.get("revision"),
+                    }
+                )
+            payload = {
+                **actual,
+                "requested_doc_id": doc_id,
+                "expected_revision": expected_revision,
+                "requested": target_context,
+                "actual": actual,
+                "diff": differences,
+            }
             return CommandResult(
-                ok=False,
-                error=f"Unknown document id: {doc_id}",
-                error_code="E_DOCUMENT_ID_MISMATCH",
+                ok=not differences,
+                payload=payload,
+                error="AutoCAD activation postcondition did not match the request"
+                if differences
+                else None,
+                error_code=(
+                    "E_DOCUMENT_ID_MISMATCH"
+                    if any(item["path"] == "active_doc_id" for item in differences)
+                    else "E_DOCUMENT_REVISION_MISMATCH"
+                    if differences
+                    else None
+                ),
+                recoverable=False if differences else None,
+                recommended_action="read_latest_document_context_and_retry"
+                if differences
+                else None,
             )
         except Exception as exc:
             return self._exception_result(
                 exc,
                 operation="drawing.activate",
-                parameters={"doc_id": doc_id},
+                parameters={
+                    "doc_id": doc_id,
+                    "expected_revision": expected_revision,
+                },
                 system_call="AutoCAD.Document.Activate",
             )
 
@@ -925,6 +1618,46 @@ class FileIPCBackend(AutoCADBackend):
             transaction_id, doc_id, expected_revision, rollback=True
         )
 
+    async def native_transaction_execute(
+        self,
+        doc_id: str,
+        expected_revision: int,
+        idempotency_key: str,
+        operations: list[dict],
+        *,
+        session_id: str | None = None,
+    ) -> CommandResult:
+        if self._native_client is None:
+            return CommandResult(
+                ok=False,
+                error="The transactional AutoCAD native worker is not connected",
+                error_code="E_NATIVE_PLUGIN_UNAVAILABLE",
+                recoverable=True,
+                recommended_action="install_or_load_the_signed_native_bundle_then_call_system.ensure_ready",
+            )
+        if not str(idempotency_key or "").strip():
+            return CommandResult(
+                ok=False,
+                error="A native transaction requires idempotency_key",
+                error_code="E_PARAMETER_REJECTED",
+                recoverable=False,
+            )
+        if not isinstance(operations, list) or not operations:
+            return CommandResult(
+                ok=False,
+                error="A native transaction requires a non-empty operations array",
+                error_code="E_PARAMETER_REJECTED",
+                recoverable=False,
+            )
+        return await self._native_client.request(
+            "transaction.execute",
+            doc_id=doc_id,
+            expected_revision=expected_revision,
+            idempotency_key=str(idempotency_key),
+            session_id=session_id,
+            data={"operations": camel_case_keys(operations)},
+        )
+
     @staticmethod
     def _exception_result(
         exc: Exception,
@@ -943,14 +1676,28 @@ class FileIPCBackend(AutoCADBackend):
             system_call=system_call,
             file_path=file_path,
         )
+        # Transport wrappers such as the COM STA quarantine attach a stable
+        # error contract to the exception. Preserve it instead of flattening
+        # a poisoned worker into the generic ``E_SYSTEM_CALL_FAILED`` code.
+        error_code = str(getattr(exc, "error_code", error_code))
+        recommended_action = getattr(exc, "recommended_action", recommended_action)
+        if getattr(exc, "recoverable", None) is not None:
+            recoverable = bool(getattr(exc, "recoverable"))
+        else:
+            recoverable = None
+        exception_details = getattr(exc, "details", None)
+        if isinstance(exception_details, dict):
+            details = {**details, "transport": exception_details}
         return CommandResult(
             ok=False,
             error=message,
             error_code=error_code,
+            recoverable=recoverable,
             recommended_action=recommended_action,
             payload=details,
         )
 
+    @sta_sync_method("product.discover", idempotent=True)
     def _discover_product(self) -> dict:
         executable = os.environ.get("AUTOCAD_MCP_ACAD_EXE", "").strip()
         product = None
@@ -959,8 +1706,7 @@ class FileIPCBackend(AutoCADBackend):
             import pythoncom
             import win32com.client
 
-            pythoncom.CoInitialize()
-            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            application = self._get_autocad_application()
             product = str(getattr(application, "Name", "AutoCAD"))
             version = str(getattr(application, "Version", ""))
         except Exception:
@@ -977,6 +1723,7 @@ class FileIPCBackend(AutoCADBackend):
             "exe": executable or None,
         }
 
+    @sta_sync_method("drawing.ensure_active", timeout=DOCUMENT_TIMEOUT + 5.0)
     def _ensure_active_document(self) -> dict:
         deadline = time.monotonic() + DOCUMENT_TIMEOUT
         last_error = None
@@ -988,8 +1735,7 @@ class FileIPCBackend(AutoCADBackend):
                 import pythoncom
                 import win32com.client
 
-                pythoncom.CoInitialize()
-                application = win32com.client.GetActiveObject("AutoCAD.Application")
+                application = self._get_autocad_application()
                 document_count = int(application.Documents.Count)
                 if document_count == 0 and not created_first_document:
                     document = application.Documents.Add()
@@ -1005,7 +1751,7 @@ class FileIPCBackend(AutoCADBackend):
                     stable_key = document_key
                     stable_reads = 1
                 if stable_reads < 3:
-                    time.sleep(0.25)
+                    self._com_executor.cooperative_sleep(0.25)
                     continue
                 context = self._bind_document(document)
                 return {
@@ -1026,7 +1772,7 @@ class FileIPCBackend(AutoCADBackend):
                         "error_code": "E_AUTOCAD_CRASHED",
                         "details": crash,
                     }
-                time.sleep(0.25)
+                self._com_executor.cooperative_sleep(0.25)
         return {
             "ready": False,
             "error": f"No active document after {DOCUMENT_TIMEOUT:g}s: {last_error}",
@@ -1147,18 +1893,25 @@ class FileIPCBackend(AutoCADBackend):
         Sends ESC keystrokes first to cancel any stale pending command
         (e.g. from a previous timeout leaving AutoCAD in a command prompt).
         """
-        mode = os.environ.get("AUTOCAD_MCP_WINDOW_MODE", "minimized").strip().lower()
+        mode, _ = self._configured_window_mode()
         activate = mode == "foreground" and os.environ.get(
             "AUTOCAD_MCP_ACTIVATE_ON_DRAW", "false"
         ).lower() in ("1", "true", "yes", "on")
-        self._ensure_autocad_visible(activate=activate)
+        if self._window_policy_owned or os.environ.get(
+            "AUTOCAD_MCP_APPLY_WINDOW_POLICY_TO_EXISTING", "false"
+        ).strip().lower() in ("1", "true", "yes", "on"):
+            self._ensure_autocad_visible(activate=activate)
         if not self._wait_for_autocad_idle(timeout=5.0):
             self._cancel_active_command()
             if not self._wait_for_autocad_idle(timeout=2.0):
                 return False
-        self._type_command("(c:mcp-dispatch)")
-        return True
+        # A missing command target used to be treated as a successful trigger;
+        # the dispatcher then waited for the full IPC timeout even though no
+        # command could possibly arrive in AutoCAD.  Keep the failure at the
+        # transport boundary so callers receive a bounded, actionable result.
+        return bool(self._type_command("(c:mcp-dispatch)"))
 
+    @sta_sync_method("autocad.wait_idle", idempotent=True, timeout=15.0)
     def _wait_for_autocad_idle(self, timeout: float = 2.0) -> bool:
         """Wait for AutoCAD to finish unwinding the previous dispatched command."""
         if sys.platform != "win32":
@@ -1169,18 +1922,32 @@ class FileIPCBackend(AutoCADBackend):
                 import pythoncom
                 import win32com.client
 
-                pythoncom.CoInitialize()
-                application = win32com.client.GetActiveObject("AutoCAD.Application")
+                application = self._get_autocad_application()
                 document = application.ActiveDocument
                 if int(document.GetVariable("CMDACTIVE")) == 0:
                     return True
             except Exception as exc:
-                hresult = getattr(exc, "hresult", exc.args[0] if exc.args else None)
-                if hresult != -2147418111:
+                if com_hresult(exc) not in {-2147418111, -2147417846}:
                     return False
             if time.time() >= deadline:
                 return False
-            time.sleep(0.05)
+            self._com_executor.cooperative_sleep(0.05)
+
+    @staticmethod
+    def _configured_window_mode() -> tuple[str, str]:
+        requested = os.environ.get(
+            "AUTOCAD_MCP_WINDOW_MODE", "quiet_minimized"
+        ).strip().lower()
+        aliases = {
+            "quiet_minimized": "minimized",
+            "recording": "foreground",
+            "user": "preserve",
+            "unchanged": "preserve",
+        }
+        mode = aliases.get(requested, requested)
+        if mode not in {"minimized", "visible", "foreground", "preserve"}:
+            mode = "minimized"
+        return mode, requested
 
     def _window_visibility_status(self) -> dict:
         configured = os.environ.get("AUTOCAD_MCP_VISIBLE", "true").lower() in (
@@ -1189,9 +1956,11 @@ class FileIPCBackend(AutoCADBackend):
             "yes",
             "on",
         )
+        mode, requested_mode = self._configured_window_mode()
         status = {
             "configured_visible": configured,
-            "window_mode": os.environ.get("AUTOCAD_MCP_WINDOW_MODE", "minimized").lower(),
+            "window_mode": mode,
+            "requested_window_mode": requested_mode,
             "hwnd": self._hwnd,
         }
         if sys.platform == "win32" and self._hwnd:
@@ -1203,7 +1972,16 @@ class FileIPCBackend(AutoCADBackend):
                     minimized=bool(win32gui.IsIconic(self._hwnd)),
                 )
             except Exception:
-                pass
+                try:
+                    import ctypes
+
+                    user32 = ctypes.windll.user32
+                    status.update(
+                        visible=bool(user32.IsWindowVisible(int(self._hwnd))),
+                        minimized=bool(user32.IsIconic(int(self._hwnd))),
+                    )
+                except Exception:
+                    pass
         return status
 
     @staticmethod
@@ -1235,6 +2013,7 @@ class FileIPCBackend(AutoCADBackend):
             "pid-insert-tank",
         }
 
+    @sta_sync_method("view.fit", idempotent=True)
     def _auto_fit_view(self, force: bool = False) -> dict:
         """Center all drawing extents in the viewport after geometry changes."""
         configured = os.environ.get("AUTOCAD_MCP_AUTO_FIT", "true").lower() in (
@@ -1256,8 +2035,7 @@ class FileIPCBackend(AutoCADBackend):
             import pythoncom
             import win32com.client
 
-            pythoncom.CoInitialize()
-            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            application = self._get_autocad_application()
             application.ZoomExtents()
             application.Update()
             return {"configured": configured, "fitted": True, "renderer": "autocad-com"}
@@ -1266,6 +2044,7 @@ class FileIPCBackend(AutoCADBackend):
             self._wait_for_autocad_idle(timeout=2.0)
             return {"configured": configured, "fitted": True, "renderer": "autocad-command"}
 
+    @sta_sync_method("window.apply_policy", idempotent=True)
     def _ensure_autocad_visible(self, activate: bool = False) -> dict:
         """Apply a non-disruptive window policy without stealing the user's focus."""
         configured = os.environ.get("AUTOCAD_MCP_VISIBLE", "true").lower() in (
@@ -1277,11 +2056,20 @@ class FileIPCBackend(AutoCADBackend):
         if not configured:
             return {"configured_visible": False, "shown": False}
 
-        mode = os.environ.get("AUTOCAD_MCP_WINDOW_MODE", "minimized").strip().lower()
-        if mode not in {"minimized", "visible", "foreground"}:
-            mode = "minimized"
+        mode, requested_mode = self._configured_window_mode()
         if activate:
             mode = "foreground"
+        if mode == "preserve":
+            return {
+                "configured_visible": configured,
+                "shown": bool(self._hwnd),
+                "window_mode": "preserve",
+                "requested_window_mode": requested_mode,
+                "activated": False,
+                "preserved_user_window": True,
+                "transport": "none",
+                "hwnd": self._hwnd,
+            }
 
         foreground_before = None
         if sys.platform == "win32":
@@ -1299,8 +2087,7 @@ class FileIPCBackend(AutoCADBackend):
             import pythoncom
             import win32com.client
 
-            pythoncom.CoInitialize()
-            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            application = self._get_autocad_application()
             application.Visible = True
             self._hwnd = int(application.HWND) or self._hwnd
             application.Update()
@@ -1337,10 +2124,12 @@ class FileIPCBackend(AutoCADBackend):
             "configured_visible": True,
             "shown": bool(self._hwnd),
             "window_mode": mode,
+            "requested_window_mode": requested_mode,
             "activated": mode == "foreground",
             "transport": transport,
         }
 
+    @sta_sync_method("command.cancel")
     def _cancel_active_command(self) -> str:
         """Cancel command-line state without requiring the IPC dispatcher."""
         if sys.platform != "win32":
@@ -1349,13 +2138,12 @@ class FileIPCBackend(AutoCADBackend):
             import pythoncom
             import win32com.client
 
-            pythoncom.CoInitialize()
-            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            application = self._get_autocad_application()
             document = application.ActiveDocument
             active = int(document.GetVariable("CMDACTIVE"))
             if active:
                 document.SendCommand("\x1b\x1b")
-                time.sleep(0.1)
+                self._com_executor.cooperative_sleep(0.1)
             return "autocad-com"
         except Exception:
             pass
@@ -1375,10 +2163,10 @@ class FileIPCBackend(AutoCADBackend):
         except Exception:
             return "failed"
 
-    def _type_command(self, command: str):
+    def _type_command(self, command: str) -> bool:
         """Post a command-line expression to the active AutoCAD session."""
         if self._send_command_via_com(command):
-            return
+            return True
 
         try:
             import ctypes
@@ -1388,6 +2176,9 @@ class FileIPCBackend(AutoCADBackend):
             WM_KEYUP = 0x0101
             VK_ESCAPE = 0x1B
             target = self._command_hwnd or self._hwnd
+            if not target:
+                log.error("command_trigger_failed", error="no AutoCAD command window is bound")
+                return False
             post = ctypes.windll.user32.PostMessageW
 
             # Cancel any pending command (2x ESC for nested commands)
@@ -1401,9 +2192,12 @@ class FileIPCBackend(AutoCADBackend):
             # Enter = carriage return
             post(target, WM_CHAR, 0x0D, 0)
             time.sleep(0.05)
+            return True
         except Exception as e:
             log.error("command_trigger_failed", error=str(e))
+            return False
 
+    @sta_sync_method("command.send")
     def _send_command_via_com(self, command: str) -> bool:
         """Use full AutoCAD's COM API before falling back to window messages."""
         if sys.platform != "win32":
@@ -1414,16 +2208,14 @@ class FileIPCBackend(AutoCADBackend):
                 import pythoncom
                 import win32com.client
 
-                pythoncom.CoInitialize()
-                application = win32com.client.GetActiveObject("AutoCAD.Application")
+                application = self._get_autocad_application()
                 document = application.ActiveDocument
                 document.SendCommand(command + "\n")
                 log.debug("command_sent_via_com")
                 return True
             except Exception as exc:
-                hresult = getattr(exc, "hresult", exc.args[0] if exc.args else None)
-                if hresult == -2147418111 and time.time() < deadline:
-                    time.sleep(0.25)
+                if com_hresult(exc) in {-2147418111, -2147417846} and time.time() < deadline:
+                    self._com_executor.cooperative_sleep(0.25)
                     continue
                 log.debug("com_command_unavailable", error=str(exc))
                 return False
@@ -1526,6 +2318,7 @@ class FileIPCBackend(AutoCADBackend):
                 recommended_action="verify_dxf_output_path_and_export_settings",
             )
 
+    @sta_async_method("drawing.copy_dwg", timeout=45.0)
     async def drawing_copy_dwg(self, path: str) -> CommandResult:
         try:
             import pythoncom
@@ -1534,8 +2327,7 @@ class FileIPCBackend(AutoCADBackend):
             output = Path(path).expanduser().resolve()
             output.parent.mkdir(parents=True, exist_ok=True)
             output.unlink(missing_ok=True)
-            pythoncom.CoInitialize()
-            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            application = self._get_autocad_application()
             document = application.ActiveDocument
             before = self._bind_document(document)
             selection_name = f"MCP_WBLOCK_{uuid.uuid4().hex[:8]}"
@@ -1550,7 +2342,7 @@ class FileIPCBackend(AutoCADBackend):
                     pass
             deadline = time.monotonic() + 10.0
             while time.monotonic() < deadline and not output.is_file():
-                time.sleep(0.1)
+                self._com_executor.cooperative_sleep(0.1)
             if not output.is_file() or output.stat().st_size <= 0:
                 raise RuntimeError(f"AutoCAD Wblock did not create a non-empty DWG: {output}")
             after = self._bind_document(application.ActiveDocument)
@@ -1589,7 +2381,53 @@ class FileIPCBackend(AutoCADBackend):
                 file_path=path,
                 recommended_action="verify_output_path_and_wblock_availability",
             )
-    async def drawing_create(self, name: str | None = None) -> CommandResult:
+    async def drawing_create(
+        self, name: str | None = None, idempotency_key: str | None = None
+    ) -> CommandResult:
+        if self._native_client is not None:
+            if not str(idempotency_key or "").strip():
+                return CommandResult(
+                    ok=False,
+                    error="Native drawing.create requires idempotency_key",
+                    error_code="E_PARAMETER_REJECTED",
+                    recoverable=False,
+                    recommended_action="retry_with_a_unique_stable_idempotency_key",
+                )
+            requested = str(name).strip() if name else None
+            data = {"template": os.environ.get("AUTOCAD_MCP_TEMPLATE", "acadiso.dwt")}
+            if requested:
+                output = Path(requested).expanduser().resolve()
+                if output.suffix.lower() != ".dwg":
+                    output = output.with_suffix(".dwg")
+                data["path"] = str(output)
+            result = await self._native_client.request(
+                "document.create",
+                data=data,
+                idempotency_key=str(idempotency_key),
+            )
+            if result.ok and isinstance(result.payload, dict):
+                differences = result.payload.get("diff", [])
+                if differences:
+                    return CommandResult(
+                        ok=False,
+                        error="AutoCAD created a document that did not match the requested path",
+                        error_code="E_POSTCONDITION_MISMATCH",
+                        recoverable=False,
+                        payload={"requested": data, "actual": result.payload, "diff": differences},
+                    )
+                result.payload.update(
+                    requested_name=requested,
+                    actual_name=result.payload.get("document_name"),
+                    actual_path=result.payload.get("active_path"),
+                    name_honored=True,
+                    backend=self.name,
+                    transport="native_pipe",
+                )
+            return result
+        return await self._drawing_create_com(name)
+
+    @sta_async_method("drawing.create", timeout=60.0)
+    async def _drawing_create_com(self, name: str | None = None) -> CommandResult:
         requested = str(name).strip() if name else None
         foreground_before = None
         focus_restored = False
@@ -1605,12 +2443,10 @@ class FileIPCBackend(AutoCADBackend):
                 except Exception:
                     pass
 
-            pythoncom.CoInitialize()
-            application = win32com.client.GetActiveObject("AutoCAD.Application")
+            application = self._get_autocad_application()
             document = application.Documents.Add()
-            if sys.platform == "win32" and os.environ.get(
-                "AUTOCAD_MCP_WINDOW_MODE", "minimized"
-            ).strip().lower() == "minimized":
+            mode, _ = self._configured_window_mode()
+            if sys.platform == "win32" and mode == "minimized":
                 try:
                     import win32con
                     import win32gui
@@ -1673,6 +2509,114 @@ class FileIPCBackend(AutoCADBackend):
                 file_path=requested,
                 recommended_action="restart_autocad_or_choose_a_valid_managed_dwg_path",
             )
+
+    @sta_async_method("drawing.close")
+    async def drawing_close(self, save: bool = False) -> CommandResult:
+        try:
+            import win32com.client
+
+            application = self._get_autocad_application()
+            document = application.ActiveDocument
+            context = self._bind_document(document)
+            document.Close(bool(save))
+            self._session.invalidate_document(context["doc_id"])
+            return CommandResult(
+                ok=True,
+                payload={
+                    "closed_doc_id": context["doc_id"],
+                    "saved": bool(save),
+                    "document_state": self._session.document_state.value,
+                },
+            )
+        except Exception as exc:
+            return self._exception_result(
+                exc,
+                operation="drawing.close",
+                parameters={"save": bool(save)},
+                system_call="AutoCAD.Document.Close",
+            )
+
+    @sta_async_method("presentation.apply", idempotent=True)
+    async def apply_presentation_style(
+        self, colors: dict[str, list[int] | tuple[int, int, int]], visual_style: str
+    ) -> CommandResult:
+        try:
+            import win32com.client
+
+            application = self._get_autocad_application()
+            document = application.ActiveDocument
+            applied = []
+            requested_colors = {
+                str(handle): [int(value) for value in rgb]
+                for handle, rgb in colors.items()
+            }
+            actual_colors = {}
+            color_readback_errors = []
+            for handle, rgb in colors.items():
+                entity = document.HandleToObject(str(handle))
+                red, green, blue = (max(0, min(255, int(value))) for value in rgb)
+                try:
+                    true_color = entity.TrueColor
+                    true_color.SetRGB(red, green, blue)
+                    entity.TrueColor = true_color
+                except Exception:
+                    entity.Color = 5
+                entity.Update()
+                applied.append(str(handle))
+                try:
+                    true_color = entity.TrueColor
+                    actual_colors[str(handle)] = [
+                        int(true_color.Red),
+                        int(true_color.Green),
+                        int(true_color.Blue),
+                    ]
+                except Exception as readback_error:
+                    color_readback_errors.append(
+                        {"handle": str(handle), "error": str(readback_error)}
+                    )
+            from autocad_mcp.visual_styles import autocad_visual_style_name
+
+            document.SetVariable(
+                "VSCURRENT", autocad_visual_style_name(str(visual_style))
+            )
+            # Force a regeneration before the plot/readback.  This is a
+            # display-only operation; it does not alter model geometry.
+            try:
+                document.Regen(0)
+            except Exception:
+                pass
+            application.Update()
+            actual_style = str(document.GetVariable("VSCURRENT"))
+            return CommandResult(
+                ok=True,
+                payload={
+                    "colored_handles": applied,
+                    "color_count": len(applied),
+                    "requested_colors": requested_colors,
+                    "actual_colors": actual_colors,
+                    "color_readback_errors": color_readback_errors,
+                    "visual_style": actual_style,
+                    "view_mode": _com_value(document, "ViewMode", None),
+                },
+            )
+        except Exception as exc:
+            return self._exception_result(
+                exc,
+                operation="presentation.apply",
+                parameters={"handle_count": len(colors), "visual_style": visual_style},
+                system_call="AutoCAD.Entity.TrueColor + VSCURRENT",
+            )
+
+    @sta_sync_method("presentation.read", idempotent=True)
+    def _read_visual_style(self) -> dict[str, object]:
+        """Read the active viewport style on the shared COM STA."""
+        import win32com.client
+
+        document = self._get_autocad_application().ActiveDocument
+        return {
+            "visual_style": str(document.GetVariable("VSCURRENT")),
+            "view_mode": _com_value(document, "ViewMode", None),
+        }
 
     async def drawing_purge(self) -> CommandResult:
         return await self._dispatch("drawing-purge", {})
@@ -1802,6 +2746,7 @@ class FileIPCBackend(AutoCADBackend):
 
             def watch() -> None:
                 seen = set()
+                viewer_pids: set[int] = set()
                 while not state["stop"].is_set():
                     def inspect(hwnd, _):
                         try:
@@ -1810,6 +2755,7 @@ class FileIPCBackend(AutoCADBackend):
                                 return True
                             seen.add(hwnd)
                             process_id = win32process.GetWindowThreadProcessId(hwnd)[1]
+                            viewer_pids.add(int(process_id))
                             was_foreground = win32gui.GetForegroundWindow() == hwnd
                             win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
                             win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
@@ -1847,21 +2793,26 @@ class FileIPCBackend(AutoCADBackend):
                             )
                             previous = state["foreground_before"]
                             process_name = _process_executable_name(foreground_pid)
-                            is_new_process = foreground_pid not in state["preexisting_pids"]
-                            is_focus_stealer = process_name in {
-                                "acad.exe",
+                            title = win32gui.GetWindowText(foreground) or ""
+                            known_viewer = process_name in {
                                 "wpspdf.exe",
                                 "acrord32.exe",
                                 "foxitpdfreader.exe",
                                 "sumatrapdf.exe",
                             }
-                            if foreground != previous and (is_new_process or is_focus_stealer):
-                                title = win32gui.GetWindowText(foreground) or ""
-                                if is_new_process:
-                                    win32gui.ShowWindow(foreground, win32con.SW_HIDE)
-                                    win32gui.PostMessage(
-                                        foreground, win32con.WM_CLOSE, 0, 0
-                                    )
+                            # Only suppress the exact viewer process/window
+                            # observed for this staging filename.  Never close
+                            # an unrelated newly launched foreground process;
+                            # the user may be working in it while plotting.
+                            is_target_viewer = (
+                                foreground_pid in viewer_pids
+                                or (known_viewer and target_name in title.casefold())
+                            )
+                            if foreground != previous and is_target_viewer:
+                                win32gui.ShowWindow(foreground, win32con.SW_HIDE)
+                                win32gui.PostMessage(
+                                    foreground, win32con.WM_CLOSE, 0, 0
+                                )
                                 restored = False
                                 if previous and win32gui.IsWindow(previous):
                                     try:
@@ -1875,10 +2826,10 @@ class FileIPCBackend(AutoCADBackend):
                                         "process_id": foreground_pid,
                                         "process_name": process_name,
                                         "title": title,
-                                        "hidden": is_new_process,
-                                        "close_requested": is_new_process,
+                                        "hidden": True,
+                                        "close_requested": True,
                                         "foreground_restored": restored,
-                                        "new_viewer_process": is_new_process,
+                                        "new_viewer_process": foreground_pid not in state["preexisting_pids"],
                                         "focus_recovered": True,
                                     }
                                 )
@@ -1920,7 +2871,7 @@ class FileIPCBackend(AutoCADBackend):
         orientation: str = "landscape",
         plot_style: str = "monochrome.ctb",
         scale_mode: str = "fit",
-        scale: str = "1:1",
+        scale: str = "fit",
         center: bool = True,
     ) -> CommandResult:
         output = Path(path).expanduser().resolve()
@@ -2036,6 +2987,7 @@ class FileIPCBackend(AutoCADBackend):
         payload["publication"] = publication
         return CommandResult(ok=True, payload=payload)
 
+    @sta_async_method("drawing.audit", idempotent=True, timeout=60.0)
     async def drawing_audit(
         self,
         limit=50,
@@ -2086,8 +3038,7 @@ class FileIPCBackend(AutoCADBackend):
             import pythoncom
             import win32com.client
 
-            pythoncom.CoInitialize()
-            document = win32com.client.GetActiveObject("AutoCAD.Application").ActiveDocument
+            document = self._get_autocad_application().ActiveDocument
             units_code = int(document.GetVariable("INSUNITS"))
             payload["units"] = {
                 "code": units_code,
@@ -2128,6 +3079,8 @@ class FileIPCBackend(AutoCADBackend):
         plot_type="extents",
         normalize_framing=False,
         framing_fill=0.82,
+        visual_style=None,
+        preserve_visual_style=True,
     ) -> CommandResult:
         output = Path(path).expanduser().resolve()
         if output.suffix.lower() != ".png":
@@ -2144,12 +3097,54 @@ class FileIPCBackend(AutoCADBackend):
             )
         output.parent.mkdir(parents=True, exist_ok=True)
         staging = output.with_name(f".{output.stem}.{uuid.uuid4().hex}.tmp.png")
+        previous_visual_style = None
+        requested_visual_style = None
+        response: CommandResult | None = None
         try:
-            raster = self._plot_png_via_com(
-                staging, paper=paper, orientation=orientation, plot_style=plot_style,
-                dpi=int(dpi), plot_type=plot_type,
-                normalize_framing=normalize_framing, framing_fill=framing_fill,
-            )
+            if visual_style is not None:
+                # Validate again at the backend boundary for direct callers.
+                from autocad_mcp.visual_styles import normalize_visual_style
+
+                try:
+                    requested_visual_style = normalize_visual_style(visual_style)
+                except ValueError as exc:
+                    response = CommandResult(
+                        ok=False,
+                        error=str(exc),
+                        error_code="E_VISUAL_STYLE_NOT_ALLOWED",
+                        recoverable=False,
+                        recommended_action="choose_a_builtin_visual_style_and_retry",
+                    )
+                    return response
+                try:
+                    previous_visual_style = self._read_visual_style()
+                except Exception as exc:
+                    response = self._exception_result(
+                        exc,
+                        operation="drawing.render_preview.visual_style.read",
+                        parameters={"visual_style": requested_visual_style},
+                        system_call="AutoCAD.Document.GetVariable(VSCURRENT)",
+                    )
+                    return response
+                applied_style = await self.apply_presentation_style({}, requested_visual_style)
+                if not applied_style.ok:
+                    applied_style.error_code = applied_style.error_code or "E_VISUAL_STYLE_APPLY_FAILED"
+                    applied_style.recoverable = True
+                    applied_style.recommended_action = "retry_after_autocad_becomes_idle"
+                    response = applied_style
+                    return response
+            plot_options = {
+                "paper": paper,
+                "orientation": orientation,
+                "plot_style": plot_style,
+                "dpi": int(dpi),
+                "plot_type": plot_type,
+                "normalize_framing": normalize_framing,
+                "framing_fill": framing_fill,
+            }
+            if requested_visual_style is not None:
+                plot_options["visual_style"] = requested_visual_style
+            raster = self._plot_png_via_com(staging, **plot_options)
             try:
                 digest = geometry_digest(self._collect_entities_via_com())
             except Exception:
@@ -2171,20 +3166,26 @@ class FileIPCBackend(AutoCADBackend):
                     recommended_action="close_the_file_owner_and_retry",
                 )
                 failure.payload["staging_removed"] = staging_removed
-                return failure
+                response = failure
+                return response
             raster["path"] = str(output)
             raster["publication"] = publication
-            return CommandResult(
+            response = CommandResult(
                 ok=True,
                 payload={
                     **raster,
                     "geometry_digest": digest,
                     "force_overwrite": bool(force),
+                    "requested_visual_style": requested_visual_style,
+                    # This is provisional until the finally block reads back
+                    # the user's original style after restoration.
+                    "visual_style_preserved": requested_visual_style is None,
                 },
             )
+            return response
         except Exception as exc:
             self._remove_staging_file(staging)
-            return self._exception_result(
+            response = self._exception_result(
                 exc,
                 operation="drawing.render_preview",
                 parameters={
@@ -2195,6 +3196,52 @@ class FileIPCBackend(AutoCADBackend):
                 system_call="AutoCAD.Plot.PlotToFile",
                 file_path=str(output),
             )
+            return response
+        finally:
+            if previous_visual_style and preserve_visual_style:
+                restoration: dict[str, Any] = {
+                    "attempted": True,
+                    "expected": previous_visual_style.get("visual_style"),
+                    "verified": False,
+                }
+                try:
+                    old_style = previous_visual_style.get("visual_style")
+                    if old_style:
+                        restore_result = await self.apply_presentation_style({}, str(old_style))
+                        restoration["result"] = restore_result.to_dict()
+                        if restore_result.ok:
+                            actual_restore = self._read_visual_style()
+                            restoration["actual"] = actual_restore.get("visual_style")
+                            try:
+                                expected_canonical = normalize_visual_style(str(old_style))
+                                actual_canonical = normalize_visual_style(
+                                    str(actual_restore.get("visual_style", ""))
+                                )
+                                restoration["verified"] = (
+                                    expected_canonical == actual_canonical
+                                )
+                            except ValueError:
+                                restoration["verified"] = str(
+                                    actual_restore.get("visual_style", "")
+                                ).casefold() == str(old_style).casefold()
+                except Exception as restore_error:
+                    restoration["error"] = str(restore_error)
+                if response is not None:
+                    payload = response.payload if isinstance(response.payload, dict) else {}
+                    payload["visual_style_restore"] = restoration
+                    payload["visual_style_preserved"] = bool(restoration["verified"])
+                    response.payload = payload
+                    if not restoration["verified"]:
+                        response.ok = False
+                        response.error = (
+                            "AutoCAD preview was written, but the user's visual style "
+                            "could not be verified after restoration"
+                        )
+                        response.error_code = "E_PRESENTATION_RESTORE_FAILED"
+                        response.recoverable = False
+                        response.recommended_action = (
+                            "restore_the_previous_visual_style_manually_before_new_CAD_operations"
+                        )
 
     @staticmethod
     def _correct_png_orientation(
@@ -2267,17 +3314,17 @@ class FileIPCBackend(AutoCADBackend):
             "native_plot_pixels_preserved": True,
         }
 
+    @sta_sync_method("drawing.plot_png", timeout=120.0)
     def _plot_png_via_com(
         self, output: Path, *, paper: str, orientation: str, plot_style: str,
         dpi: int, plot_type: str = "extents", normalize_framing: bool = False,
-        framing_fill: float = 0.82,
+        framing_fill: float = 0.82, visual_style: str | None = None,
     ) -> dict:
         import pythoncom
         import win32com.client
         from PIL import Image
 
-        pythoncom.CoInitialize()
-        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        application = self._get_autocad_application()
         document = application.ActiveDocument
         layout = document.ActiveLayout
         device = "PublishToWeb PNG.pc3"
@@ -2388,6 +3435,10 @@ class FileIPCBackend(AutoCADBackend):
                 "device": device,
                 "plot_type": selected_plot_type,
                 "framing_normalization": framing_normalization,
+                "visual_style": visual_style,
+                "shaded_display_requested": visual_style is not None,
+                "material_render_verified": False,
+                "render_truth": "native_plot_style_readback_only",
             }
         finally:
             for name, value in saved.items():
@@ -2486,6 +3537,7 @@ class FileIPCBackend(AutoCADBackend):
             names_str = ""
         return await self._dispatch("drawing-get-variables", {"names_str": names_str})
 
+    @sta_async_method("drawing.set_variables", idempotent=True)
     async def drawing_set_variables(self, values: dict) -> CommandResult:
         try:
             updates = validate_variable_updates(values)
@@ -2497,8 +3549,7 @@ class FileIPCBackend(AutoCADBackend):
             import pythoncom
             import win32com.client
 
-            pythoncom.CoInitialize()
-            document = win32com.client.GetActiveObject("AutoCAD.Application").ActiveDocument
+            document = self._get_autocad_application().ActiveDocument
             previous = {name: document.GetVariable(name) for name in updates}
             for name, value in updates.items():
                 document.SetVariable(name, value)
@@ -2538,12 +3589,12 @@ class FileIPCBackend(AutoCADBackend):
                 )
         return result
 
+    @sta_sync_method("drawing.save", timeout=60.0)
     def _save_via_com(self, path: str | None, file_type: int | None = None) -> dict:
         import pythoncom
         import win32com.client
 
-        pythoncom.CoInitialize()
-        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        application = self._get_autocad_application()
         document = application.ActiveDocument
         identity = self._bind_document(document)
         if not path:
@@ -2575,6 +3626,7 @@ class FileIPCBackend(AutoCADBackend):
             "renderer": "autocad-com-saveas",
         }
 
+    @sta_sync_method("drawing.export_dxf", timeout=60.0)
     def _export_dxf_via_com(self, path: str) -> dict:
         import pythoncom
         import win32com.client
@@ -2585,8 +3637,7 @@ class FileIPCBackend(AutoCADBackend):
         output.parent.mkdir(parents=True, exist_ok=True)
         output.unlink(missing_ok=True)
 
-        pythoncom.CoInitialize()
-        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        application = self._get_autocad_application()
         document = application.ActiveDocument
         active_before = str(document.FullName or document.Name)
         selection_name = f"MCP_EXPORT_{uuid.uuid4().hex[:8]}"
@@ -2620,12 +3671,12 @@ class FileIPCBackend(AutoCADBackend):
             "selection_count": selection_count,
         }
 
+    @sta_sync_method("entity.collect", idempotent=True, timeout=60.0)
     def _collect_entities_via_com(self, layer=None, space="model") -> list[dict]:
         import pythoncom
         import win32com.client
 
-        pythoncom.CoInitialize()
-        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        application = self._get_autocad_application()
         document = application.ActiveDocument
         collection = document.PaperSpace if space.lower() == "paper" else document.ModelSpace
         entities = []
@@ -2636,17 +3687,18 @@ class FileIPCBackend(AutoCADBackend):
             entities.append(_com_entity_to_dict(entity))
         return entities
 
+    @sta_sync_method("entity.get", idempotent=True)
     def _get_entity_via_com(self, entity_id: str) -> dict:
         import pythoncom
         import win32com.client
 
-        pythoncom.CoInitialize()
-        document = win32com.client.GetActiveObject("AutoCAD.Application").ActiveDocument
+        document = self._get_autocad_application().ActiveDocument
         entity = document.HandleToObject(str(entity_id))
         return _com_entity_to_dict(entity)
 
+    @sta_sync_method("drawing.plot_preview", timeout=120.0)
     def _plot_preview_via_com(
-        self, path, paper, orientation, plot_style, scale_mode="fit", scale="1:1", center=True
+        self, path, paper, orientation, plot_style, scale_mode="fit", scale="fit", center=True
     ) -> dict:
         import pythoncom
         import win32com.client
@@ -2657,8 +3709,7 @@ class FileIPCBackend(AutoCADBackend):
         output.parent.mkdir(parents=True, exist_ok=True)
         output.unlink(missing_ok=True)
 
-        pythoncom.CoInitialize()
-        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        application = self._get_autocad_application()
         document = application.ActiveDocument
         layout = document.ActiveLayout
         saved = {}
@@ -2828,6 +3879,7 @@ class FileIPCBackend(AutoCADBackend):
 
     # --- Entity operations ---
 
+    @sta_sync_method("entity.create")
     def _create_entity_via_com(self, kind: str, params: dict, layer: str | None):
         pythoncom, win32com, document, modelspace = self._solid_context()
         target_layer = str(layer or "0")
@@ -3041,6 +4093,19 @@ class FileIPCBackend(AutoCADBackend):
     async def create_hatch(
         self, entity_id, pattern="ANSI31", angle=0.0, scale=1.0, layer=None
     ) -> CommandResult:
+        if layer:
+            layer_check = await self.layer_exists(str(layer))
+            if not layer_check.ok:
+                return layer_check
+            if not layer_check.payload.get("exists"):
+                return CommandResult(
+                    ok=False,
+                    error=f"Layer does not exist: {layer}",
+                    error_code="E_LAYER_NOT_FOUND",
+                    recoverable=False,
+                    recommended_action="create_or_select_an_existing_layer",
+                    payload={"layer": str(layer), "entity_created": False},
+                )
         return await self._dispatch(
             "create-hatch",
             {
@@ -3227,6 +4292,7 @@ class FileIPCBackend(AutoCADBackend):
         result.payload = payload
         return result
 
+    @sta_sync_method("entity.join")
     def _join_lines_via_com(self, entity_ids, tolerance: float) -> dict:
         pythoncom, win32com, document, modelspace = self._solid_context()
         entities = [document.HandleToObject(str(handle)) for handle in entity_ids]
@@ -3326,8 +4392,9 @@ class FileIPCBackend(AutoCADBackend):
         import pythoncom
         import win32com.client
 
-        pythoncom.CoInitialize()
-        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        if not self._com_executor.in_executor_thread:
+            raise RuntimeError("AutoCAD COM context requested outside the dedicated STA thread")
+        application = self._get_autocad_application()
         document = application.ActiveDocument
         return pythoncom, win32com, document, document.ModelSpace
 
@@ -3342,6 +4409,7 @@ class FileIPCBackend(AutoCADBackend):
         )
         return {key: value for key, value in payload.items() if value is not None}
 
+    @sta_sync_method("solid.region_from_profile")
     def _region_from_profile(self, profile_id: str):
         pythoncom, win32com, document, modelspace = self._solid_context()
         profile = document.HandleToObject(str(profile_id))
@@ -3358,6 +4426,7 @@ class FileIPCBackend(AutoCADBackend):
             raise ValueError("Profile must create exactly one planar closed region")
         return pythoncom, win32com, document, modelspace, profile, regions[0]
 
+    @sta_async_method("solid.create_box")
     async def solid_create_box(self, center, length, width, height, layer=None) -> CommandResult:
         try:
             if min(float(length), float(width), float(height)) <= 0:
@@ -3381,6 +4450,7 @@ class FileIPCBackend(AutoCADBackend):
                 system_call="AutoCAD.ModelSpace.AddBox", error_code="E_SOLID_OPERATION",
             )
 
+    @sta_async_method("solid.create_cylinder")
     async def solid_create_cylinder(self, base_center, radius, height, layer=None) -> CommandResult:
         try:
             if float(radius) <= 0 or float(height) == 0:
@@ -3507,6 +4577,7 @@ class FileIPCBackend(AutoCADBackend):
                     pass
             self._auto_fit_view()
 
+    @sta_async_method("solid.boolean")
     async def solid_boolean(self, primary_id, tool_id, operation) -> CommandResult:
         operation_name = str(operation).lower()
         operation_codes = {"union": 0, "intersection": 1, "subtract": 2}
@@ -3664,9 +4735,44 @@ class FileIPCBackend(AutoCADBackend):
             self._delete_com_entities([entity for entity in (inner, outer) if entity is not None])
             raise
 
+    @sta_async_method("product.create_feature", timeout=60.0)
     async def product_create_feature(self, kind: str, data: dict) -> CommandResult:
         try:
             feature = normalize_feature(kind, data)
+            destructive_compatibility_feature = feature["kind"] in {
+                "recessed_panel",
+                "port_cutout_usb_a",
+                "port_cutout_usb_c",
+            }
+            if (
+                destructive_compatibility_feature
+                and os.environ.get(
+                    "AUTOCAD_MCP_ALLOW_UNVERIFIED_COMPAT_CUTOUTS", "false"
+                ).strip().lower()
+                not in {"1", "true", "yes", "on"}
+            ):
+                # Reject before touching COM.  The compatibility API cannot
+                # prove an atomic replacement, so the native transactional
+                # worker is required for these destructive features.
+                return CommandResult(
+                    ok=False,
+                    error=(
+                        "Destructive product cutouts require the native "
+                        "transactional worker on the compatibility backend"
+                    ),
+                    error_code="E_COMPAT_FEATURE_TRANSACTION_UNAVAILABLE",
+                    recoverable=False,
+                    recommended_action=(
+                        "install_the_signed_native_worker_or_explicitly_enable_"
+                        "AUTOCAD_MCP_ALLOW_UNVERIFIED_COMPAT_CUTOUTS"
+                    ),
+                    payload={
+                        "feature_kind": feature["kind"],
+                        "target_id": feature.get("target_id"),
+                        "source_unchanged": True,
+                        "native_transaction_required": True,
+                    },
+                )
             pythoncom, win32com, document, modelspace = self._solid_context()
             created = None
             replaced_target = None
@@ -3796,13 +4902,16 @@ class FileIPCBackend(AutoCADBackend):
         target: list[float],
         margin_scale: float,
         output_aspect: float,
+        planned_bounds: dict | None = None,
     ) -> dict:
         if margin_scale <= 0.1 or margin_scale >= 0.98:
             raise ValueError("margin_scale must be between 0.1 and 0.98")
-        entities = self._collect_entities_via_com()
+        entities = [] if planned_bounds is not None else self._collect_entities_via_com()
+        bounds_list = [planned_bounds] if planned_bounds is not None else [
+            entity.get("bounds") for entity in entities
+        ]
         corners = []
-        for entity in entities:
-            bounds = entity.get("bounds")
+        for bounds in bounds_list:
             if not bounds or not bounds.get("min") or not bounds.get("max"):
                 continue
             corners.extend(
@@ -3872,7 +4981,162 @@ class FileIPCBackend(AutoCADBackend):
             "horizontal_axis": horizontal,
             "vertical_axis": vertical,
             "entity_count": len(entities),
+            "planned_bounds": planned_bounds,
         }
+
+    @sta_async_method("view.prepare_recording", idempotent=True)
+    async def prepare_recording_view(
+        self,
+        bounds: dict[str, list[float]],
+        view: str = "iso",
+        margin_scale: float = 0.82,
+        output_aspect: float = 16 / 9,
+    ) -> CommandResult:
+        try:
+            minimum = [float(value) for value in bounds["min"][:3]]
+            maximum = [float(value) for value in bounds["max"][:3]]
+            if len(minimum) != 3 or len(maximum) != 3:
+                raise ValueError("bounds.min and bounds.max must contain three coordinates")
+            if any(maximum[index] <= minimum[index] for index in range(3)):
+                raise ValueError("Each bounds.max coordinate must exceed bounds.min")
+            normalized_bounds = {"min": minimum, "max": maximum}
+            pythoncom, win32com, document, _ = self._solid_context()
+            application = self._get_autocad_application()
+            viewport = document.ActiveViewport
+            direction = self._camera_direction(str(view).lower())
+            target = [
+                (minimum[index] + maximum[index]) / 2.0 for index in range(3)
+            ]
+            document.SetVariable("PERSPECTIVE", 0)
+            viewport.Direction = self._solid_point(pythoncom, win32com, direction)
+            viewport.Target = self._solid_point(pythoncom, win32com, target)
+            framing = self._fit_fixed_camera_viewport(
+                viewport,
+                direction,
+                target,
+                float(margin_scale),
+                float(output_aspect),
+                planned_bounds=normalized_bounds,
+            )
+            document.ActiveViewport = viewport
+            view_size_before = float(document.GetVariable("VIEWSIZE"))
+            desired_view_height = float(framing["view_size"][1])
+            application.ZoomScaled(view_size_before / desired_view_height, 1)
+            application.Update()
+            framing["view_size_after"] = float(document.GetVariable("VIEWSIZE"))
+            return CommandResult(
+                ok=True,
+                payload={
+                    "mode": "recording",
+                    "view": str(view).lower(),
+                    "camera": {"direction": direction, "target": target},
+                    "framing": framing,
+                    "final_refit_required": True,
+                },
+            )
+        except Exception as exc:
+            return self._exception_result(
+                exc,
+                operation="view.prepare_recording",
+                parameters={
+                    "bounds": bounds,
+                    "view": view,
+                    "margin_scale": margin_scale,
+                    "output_aspect": output_aspect,
+                },
+                system_call="AutoCAD.ActiveViewport",
+                error_code="E_VIEW_FRAMING_FAILED",
+            )
+
+    @sta_sync_method("product.view.prepare", idempotent=True)
+    def _prepare_product_view(self, view_name: str, options: dict) -> dict:
+        pythoncom, win32com, document, _ = self._solid_context()
+        application = self._get_autocad_application()
+        viewport = document.ActiveViewport
+        saved = {
+            "direction": list(viewport.Direction),
+            "target": list(viewport.Target),
+            "twist": _com_value(viewport, "TwistAngle"),
+            "perspective": document.GetVariable("PERSPECTIVE"),
+        }
+        direction = self._camera_direction(view_name)
+        minimum = list(document.GetVariable("EXTMIN"))
+        maximum = list(document.GetVariable("EXTMAX"))
+        default_target = [
+            (float(minimum[index]) + float(maximum[index])) / 2
+            for index in range(3)
+        ]
+        target = options.get("target", default_target)
+        paper_dimensions = {
+            "A0": (841.0, 1189.0),
+            "A1": (594.0, 841.0),
+            "A2": (420.0, 594.0),
+            "A3": (297.0, 420.0),
+            "A4": (210.0, 297.0),
+        }
+        paper_size = paper_dimensions.get(
+            str(options.get("paper", "A4")).upper(), paper_dimensions["A4"]
+        )
+        selected_orientation = str(options.get("orientation", "landscape")).lower()
+        output_aspect = (
+            max(paper_size) / min(paper_size)
+            if selected_orientation != "portrait"
+            else min(paper_size) / max(paper_size)
+        )
+        document.SetVariable("PERSPECTIVE", 0)
+        viewport.Direction = self._solid_point(pythoncom, win32com, direction)
+        viewport.Target = self._solid_point(pythoncom, win32com, target)
+        twist_reset = False
+        if saved["twist"] is not None:
+            try:
+                viewport.TwistAngle = 0.0
+                twist_reset = True
+            except Exception:
+                pass
+        framing = self._fit_fixed_camera_viewport(
+            viewport,
+            direction,
+            target,
+            float(options.get("margin_scale", 0.82)),
+            output_aspect,
+        )
+        document.ActiveViewport = viewport
+        view_size_before = float(document.GetVariable("VIEWSIZE"))
+        desired_view_height = float(framing["view_size"][1])
+        zoom_magnification = view_size_before / desired_view_height
+        application.ZoomScaled(zoom_magnification, 1)
+        application.Update()
+        framing.update(
+            view_size_before=view_size_before,
+            desired_view_height=desired_view_height,
+            zoom_magnification=zoom_magnification,
+            view_size_after=float(document.GetVariable("VIEWSIZE")),
+            twist_reset=twist_reset,
+        )
+        return {
+            "direction": direction,
+            "target": target,
+            "framing": framing,
+            "saved": saved,
+        }
+
+    @sta_sync_method("product.view.restore", idempotent=True)
+    def _restore_product_view(self, saved: dict) -> dict:
+        pythoncom, win32com, document, _ = self._solid_context()
+        viewport = document.ActiveViewport
+        viewport.Direction = self._solid_point(pythoncom, win32com, saved["direction"])
+        viewport.Target = self._solid_point(pythoncom, win32com, saved["target"])
+        twist_restored = False
+        if saved.get("twist") is not None:
+            try:
+                viewport.TwistAngle = saved["twist"]
+                twist_restored = True
+            except Exception:
+                pass
+        document.ActiveViewport = viewport
+        if saved.get("perspective") is not None:
+            document.SetVariable("PERSPECTIVE", saved["perspective"])
+        return {"restored": True, "twist_restored": twist_restored}
 
     async def product_render_view(
         self, view_name: str, path: str, options: dict | None = None
@@ -3886,63 +5150,9 @@ class FileIPCBackend(AutoCADBackend):
                 recoverable=True,
                 recommended_action="prepare_the_named_geometry_state_and_retry",
             )
-        document = None
-        pythoncom = win32com = None
-        saved_direction = saved_target = saved_twist = saved_perspective = None
+        prepared = None
         try:
-            pythoncom, win32com, document, _ = self._solid_context()
-            application = win32com.client.GetActiveObject("AutoCAD.Application")
-            viewport = document.ActiveViewport
-            saved_direction = list(viewport.Direction)
-            saved_target = list(viewport.Target)
-            saved_twist = _com_value(viewport, "TwistAngle")
-            saved_perspective = document.GetVariable("PERSPECTIVE")
-            direction = self._camera_direction(view_name)
-            minimum = list(document.GetVariable("EXTMIN"))
-            maximum = list(document.GetVariable("EXTMAX"))
-            default_target = [
-                (float(minimum[index]) + float(maximum[index])) / 2
-                for index in range(3)
-            ]
-            target = options.get("target", default_target)
-            paper_dimensions = {
-                "A0": (841.0, 1189.0), "A1": (594.0, 841.0),
-                "A2": (420.0, 594.0), "A3": (297.0, 420.0),
-                "A4": (210.0, 297.0),
-            }
-            paper_size = paper_dimensions.get(
-                str(options.get("paper", "A4")).upper(), paper_dimensions["A4"]
-            )
-            selected_orientation = str(options.get("orientation", "landscape")).lower()
-            output_aspect = (
-                max(paper_size) / min(paper_size)
-                if selected_orientation != "portrait"
-                else min(paper_size) / max(paper_size)
-            )
-            document.SetVariable("PERSPECTIVE", 0)
-            viewport.Direction = self._solid_point(pythoncom, win32com, direction)
-            viewport.Target = self._solid_point(pythoncom, win32com, target)
-            if saved_twist is not None:
-                viewport.TwistAngle = 0.0
-            framing = self._fit_fixed_camera_viewport(
-                viewport,
-                direction,
-                target,
-                float(options.get("margin_scale", 0.82)),
-                output_aspect,
-            )
-            document.ActiveViewport = viewport
-            view_size_before = float(document.GetVariable("VIEWSIZE"))
-            desired_view_height = float(framing["view_size"][1])
-            zoom_magnification = view_size_before / desired_view_height
-            application.ZoomScaled(zoom_magnification, 1)
-            application.Update()
-            framing.update(
-                view_size_before=view_size_before,
-                desired_view_height=desired_view_height,
-                zoom_magnification=zoom_magnification,
-                view_size_after=float(document.GetVariable("VIEWSIZE")),
-            )
+            prepared = self._prepare_product_view(view_name, options)
             result = await self.drawing_render_preview(
                 path,
                 paper=options.get("paper", "A4"),
@@ -3953,16 +5163,33 @@ class FileIPCBackend(AutoCADBackend):
                 plot_type="display",
                 normalize_framing=True,
                 framing_fill=float(options.get("framing_fill", 0.82)),
+                visual_style=options.get("visual_style"),
+                preserve_visual_style=bool(options.get("preserve_visual_style", True)),
             )
             if result.ok:
                 result.payload.update(
                     view_name=view_name,
-                    requested_camera={"direction": direction, "target": target},
-                    actual_camera={"direction": direction, "target": target},
-                    camera_framing=framing,
+                    requested_camera={
+                        "direction": prepared["direction"],
+                        "target": prepared["target"],
+                    },
+                    actual_camera={
+                        "direction": prepared["direction"],
+                        "target": prepared["target"],
+                    },
+                    camera_framing=prepared["framing"],
                     projection="orthographic",
                     prepared_geometry=bool(options.get("prepared_geometry", False)),
+                    # A visual-style request proves only that a style was
+                    # requested/read back.  PlotToFile does not prove a
+                    # material renderer was used, so remain conservative.
                     material_render=False,
+                    material_render_verified=False,
+                    render_mode=(
+                        "native_plot_visual_style_unverified"
+                        if options.get("visual_style")
+                        else "wireframe_or_current"
+                    ),
                 )
             return result
         except Exception as exc:
@@ -3975,35 +5202,42 @@ class FileIPCBackend(AutoCADBackend):
                 error_code="E_PRODUCT_VIEW_FAILED",
             )
         finally:
-            if document is not None and saved_direction is not None and saved_target is not None:
+            if prepared is not None:
+                restore_result = None
                 try:
-                    viewport = document.ActiveViewport
-                    viewport.Direction = self._solid_point(
-                        pythoncom, win32com, saved_direction
+                    restore_result = self._restore_product_view(prepared["saved"])
+                except Exception as restore_error:
+                    restore_result = {"restored": False, "error": str(restore_error)}
+                if "result" in locals() and isinstance(result, CommandResult):
+                    payload = result.payload if isinstance(result.payload, dict) else {}
+                    payload["camera_restore"] = restore_result
+                    payload["camera_restored"] = bool(
+                        isinstance(restore_result, dict) and restore_result.get("restored")
                     )
-                    viewport.Target = self._solid_point(
-                        pythoncom, win32com, saved_target
-                    )
-                    if saved_twist is not None:
-                        viewport.TwistAngle = saved_twist
-                    document.ActiveViewport = viewport
-                    if saved_perspective is not None:
-                        document.SetVariable("PERSPECTIVE", saved_perspective)
-                except Exception:
-                    pass
+                    result.payload = payload
+                    if not payload["camera_restored"]:
+                        result.ok = False
+                        result.error = (
+                            "Product preview was written, but the previous camera could not be restored"
+                        )
+                        result.error_code = "E_CAMERA_RESTORE_FAILED"
+                        result.recoverable = False
+                        result.recommended_action = (
+                            "restore_the_previous_camera_manually_before_new_CAD_operations"
+                        )
 
     # --- Layer operations ---
 
     async def layer_list(self) -> CommandResult:
         return await self._dispatch("layer-list", {})
 
+    @sta_async_method("layer.exists", idempotent=True)
     async def layer_exists(self, name: str) -> CommandResult:
         try:
             import pythoncom
             import win32com.client
 
-            pythoncom.CoInitialize()
-            document = win32com.client.GetActiveObject("AutoCAD.Application").ActiveDocument
+            document = self._get_autocad_application().ActiveDocument
             try:
                 document.Layers.Item(str(name))
                 exists = True
@@ -4130,12 +5364,12 @@ class FileIPCBackend(AutoCADBackend):
         except Exception:
             return await self._dispatch("create-dimension-radius", {"cx": cx, "cy": cy, "radius": radius, "angle": angle})
 
+    @sta_sync_method("dimension.create")
     def _create_dimension_via_com(self, kind: str, **data) -> dict:
         import pythoncom
         import win32com.client
 
-        pythoncom.CoInitialize()
-        application = win32com.client.GetActiveObject("AutoCAD.Application")
+        application = self._get_autocad_application()
         modelspace = application.ActiveDocument.ModelSpace
 
         def point(x, y):
@@ -4256,11 +5490,33 @@ class FileIPCBackend(AutoCADBackend):
         return await self._dispatch("zoom-window", {"x1": x1, "y1": y1, "x2": x2, "y2": y2})
 
     async def show_window(self, activate: bool = True) -> CommandResult:
-        return CommandResult(ok=True, payload=self._ensure_autocad_visible(activate=activate))
+        policy = (
+            self._native_window_policy(activate=activate)
+            if self._native_client is not None
+            else self._ensure_autocad_visible(activate=activate)
+        )
+        return CommandResult(ok=True, payload=policy)
 
     async def minimize_window(self) -> CommandResult:
         if sys.platform != "win32" or not self._hwnd:
             return CommandResult(ok=False, error="AutoCAD window is unavailable")
+        if self._native_client is not None:
+            try:
+                import ctypes
+
+                ctypes.windll.user32.ShowWindow(int(self._hwnd), 7)
+                self._window_policy_applied = True
+                return CommandResult(
+                    ok=True,
+                    payload={
+                        "window_mode": "minimized",
+                        "activated": False,
+                        "hwnd": self._hwnd,
+                        "transport": "user32",
+                    },
+                )
+            except Exception as exc:
+                return CommandResult(ok=False, error=f"Failed to minimize AutoCAD: {exc}")
         try:
             import win32con
             import win32gui

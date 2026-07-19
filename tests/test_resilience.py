@@ -271,13 +271,17 @@ async def test_two_documents_switch_100_times_without_identity_or_revision_leak(
     second_context = backend._bind_document(second)
 
     for expected_revision in range(100):
-        activated_first = await backend.drawing_activate(first_context["doc_id"])
+        activated_first = await backend.drawing_activate(
+            first_context["doc_id"], expected_revision
+        )
         assert activated_first.ok is True
         assert activated_first.payload["active_doc_id"] == first_context["doc_id"]
         first_mutation = await backend.record_document_mutation(first_context["doc_id"])
         assert first_mutation.payload["revision"] == expected_revision + 1
 
-        activated_second = await backend.drawing_activate(second_context["doc_id"])
+        activated_second = await backend.drawing_activate(
+            second_context["doc_id"], expected_revision
+        )
         assert activated_second.ok is True
         assert activated_second.payload["active_doc_id"] == second_context["doc_id"]
         second_mutation = await backend.record_document_mutation(second_context["doc_id"])
@@ -286,6 +290,103 @@ async def test_two_documents_switch_100_times_without_identity_or_revision_leak(
     assert first_context["doc_id"] != second_context["doc_id"]
     assert backend._doc_revisions[first_context["doc_id"]] == 100
     assert backend._doc_revisions[second_context["doc_id"]] == 100
+
+
+async def test_drawing_activate_requires_revision_before_transport_access(monkeypatch):
+    backend = FileIPCBackend()
+
+    async def should_not_be_called(*args, **kwargs):
+        raise AssertionError("activation transport must not run without a revision")
+
+    monkeypatch.setattr(backend, "_drawing_activate_com", should_not_be_called)
+
+    missing = await backend.drawing_activate("acad-doc")
+    invalid = await backend.drawing_activate("acad-doc", "not-an-integer")
+    negative = await backend.drawing_activate("acad-doc", -1)
+
+    assert missing.error_code == "E_PARAMETER_REJECTED"
+    assert invalid.error_code == "E_PARAMETER_REJECTED"
+    assert negative.error_code == "E_PARAMETER_REJECTED"
+
+
+async def test_drawing_activate_forwards_revision_to_native_worker():
+    calls = []
+
+    class FakeNativeClient:
+        async def request(self, operation, **kwargs):
+            calls.append((operation, kwargs))
+            return CommandResult(
+                ok=True,
+                payload={
+                    "doc_id": kwargs["doc_id"],
+                    "active_doc_id": kwargs["doc_id"],
+                    "revision": kwargs["expected_revision"],
+                    "diff": [],
+                },
+            )
+
+    backend = FileIPCBackend()
+    backend._native_client = FakeNativeClient()
+
+    activated = await backend.drawing_activate("acad-native", 7)
+
+    assert activated.ok is True
+    assert calls == [
+        (
+            "document.activate",
+            {"doc_id": "acad-native", "expected_revision": 7},
+        )
+    ]
+    assert activated.payload["transport"] == "native_pipe"
+    assert activated.payload["expected_revision"] == 7
+
+
+async def test_drawing_activate_rejects_stale_target_without_switching(monkeypatch):
+    class FakeDocument:
+        def __init__(self, application, name):
+            self._application = application
+            self.Name = name
+            self.FullName = f"D:/CAD-Automation/drawings/{name}"
+            self.HWND = 2000 if name == "first.dwg" else 2001
+            self.activate_calls = 0
+
+        def Activate(self):
+            self.activate_calls += 1
+            self._application.ActiveDocument = self
+
+    class FakeDocuments:
+        def __init__(self, documents):
+            self._documents = documents
+
+        @property
+        def Count(self):
+            return len(self._documents)
+
+        def Item(self, index):
+            return self._documents[index]
+
+    application = types.SimpleNamespace()
+    first = FakeDocument(application, "first.dwg")
+    second = FakeDocument(application, "second.dwg")
+    application.Documents = FakeDocuments([first, second])
+    application.ActiveDocument = first
+    client = types.SimpleNamespace(GetActiveObject=MagicMock(return_value=application))
+    monkeypatch.setitem(sys.modules, "pythoncom", types.SimpleNamespace(CoInitialize=lambda: None))
+    monkeypatch.setitem(sys.modules, "win32com", types.SimpleNamespace(client=client))
+    monkeypatch.setitem(sys.modules, "win32com.client", client)
+
+    backend = FileIPCBackend()
+    first_context = backend._bind_document(first)
+    second_context = backend._bind_document(second)
+
+    stale = await backend.drawing_activate(second_context["doc_id"], 1)
+
+    assert stale.ok is False
+    assert stale.error_code == "E_DOCUMENT_REVISION_MISMATCH"
+    assert stale.payload["expected_revision"] == 1
+    assert second.activate_calls == 0
+    assert application.ActiveDocument is first
+    assert first_context["doc_id"] != second_context["doc_id"]
 
 
 async def test_transaction_begin_commit_and_rollback_have_scoped_state(monkeypatch):

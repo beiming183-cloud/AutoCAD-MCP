@@ -55,12 +55,18 @@ Any failed identity, transaction, topology, or output-integrity gate is a hard s
 ## Evidence Rules
 
 - Require `requested`, `actual`, and `diff` for mutable CAD operations. Treat unexplained postcondition differences as failure.
+- Treat the semantic registry, native entity registry, and B-rep as one commit unit. When a native handle is erased or replaced, invalidate or replace its registry record in the same transaction; stale feature records block release.
 - Prefer stable semantic feature IDs, named datums, and component IDs. Do not rely on volatile face or edge sequence numbers for automation.
 - Require atomic transactions for multi-entity or multi-feature stages. A partial result is not a recoverable success.
+- Require rollback evidence for entity/feature counts, registry rows, document revision, layers, and temporary outputs. An exception message alone does not prove rollback.
 - Verify B-rep validity, body count, bounds, mass properties where meaningful, wall thickness, draft, surface continuity, and interference according to maturity and process.
+- Label AABB overlap and sampled motion checks as broad-phase only. Distinguish containment, contact, permitted crossing, intentional motion overlays, and exact B-rep interference.
 - Re-import required exchange formats and compare units, body count, bounds, critical dimensions, and configuration identity.
 - Use deterministic named cameras and native/offscreen rendering for product review. Window screenshots and `SendKeys` are diagnostic fallbacks, not release evidence.
-- Bind every render to document ID, revision, configuration, camera, style, resolution, output path, and content hash.
+- Bind every render to document ID, revision, configuration, camera, style, resolution, output path, content hash, clipping state, visible components, and `material_render_verified`. A linework image cannot pass a shaded/material review.
+- Prepare revision-bound section planes/cut sets and exploded component transforms before requesting section or exploded evidence. Camera movement alone does not create either state.
+- Treat `FIT`/`NTS` and fixed numeric plot scales as mutually exclusive. Verify paper, orientation, PDF MediaBox, viewport scale, and title-block declaration before release.
+- Preserve a machine-written `reports/round.json` for each validation round with identity, transaction/rollback, readback diffs, DRC, render truth, plot truth, artifact hashes, cleanup, and lessons.
 - Never infer strength, fatigue, thermal, fluid, electrical, safety, or compliance performance without inputs, method, thresholds, and evidence.
 
 ## Workspace Contract
@@ -82,4 +88,3 @@ Do not retain disposable CAD/PDF/PNG test artifacts after validation. Preserve c
 ## Final Response
 
 State the current maturity, selected design decisions, user-confirmed requirements, assumptions, authoritative source/revision/configuration, checks that passed, checks that failed or were not evaluated, produced files, and the highest-value next test.
-

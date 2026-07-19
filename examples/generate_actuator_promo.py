@@ -8,49 +8,16 @@ import os
 from pathlib import Path
 
 
-async def rotate_view(document, *, steps: int = 48, duration: float = 8.0) -> None:
-    """Rotate the active AutoCAD viewport smoothly without changing geometry."""
-    import math
-
-    import pythoncom
-    import win32com.client
-
-    application = win32com.client.GetActiveObject("AutoCAD.Application")
-    viewport = document.ActiveViewport
-    target = list(viewport.Target)
-    steps = max(12, int(steps))
-    interval = max(0.02, float(duration) / steps)
-    for index in range(steps + 1):
-        angle = 2.0 * math.pi * index / steps
-        direction = [math.cos(angle), math.sin(angle), 0.8]
-        viewport.Direction = win32com.client.VARIANT(
-            pythoncom.VT_ARRAY | pythoncom.VT_R8, direction
-        )
-        viewport.Target = win32com.client.VARIANT(
-            pythoncom.VT_ARRAY | pythoncom.VT_R8, target
-        )
-        viewport.TwistAngle = 0.0
-        document.ActiveViewport = viewport
-        application.Update()
-        await asyncio.sleep(interval)
-
-
 async def main(
     output: Path,
     *,
     pause: float = 0.0,
     keep_open: bool = True,
     reuse_active: bool = False,
-    rotate: bool = False,
-    rotation_steps: int = 48,
-    rotation_seconds: float = 8.0,
+    render_preview: bool = True,
+    recording: bool = False,
 ) -> None:
-    import pythoncom
-    import win32com.client
-
     from autocad_mcp.backends.file_ipc import FileIPCBackend
-
-    pythoncom.CoInitialize()
     backend = FileIPCBackend()
     ready = await backend.ensure_ready()
     if not ready.ok:
@@ -65,11 +32,21 @@ async def main(
                 "--reuse-active requires an empty active document; delete the previous promo geometry first"
             )
     else:
-        created = await backend.drawing_create(None)
+        created = await backend.drawing_create(
+            None, idempotency_key=f"promo-document:{os.getpid()}"
+        )
         if not created.ok:
             raise RuntimeError(created.to_dict())
 
-    document = win32com.client.GetActiveObject("AutoCAD.Application").ActiveDocument
+    if recording:
+        framed = await backend.prepare_recording_view(
+            {"min": [-100, -70, -5], "max": [105, 70, 105]},
+            view="iso",
+            margin_scale=0.78,
+            output_aspect=16 / 9,
+        )
+        if not framed.ok:
+            raise RuntimeError(framed.to_dict())
 
     async def wait_for_recording() -> None:
         if pause > 0:
@@ -83,24 +60,22 @@ async def main(
         return result.payload["handle"]
 
     async def ring(feature_id, center, outer_radius, inner_radius, height):
-        result = await backend.product_create_feature(
-            "rotary_layer",
-            {
-                "feature_id": feature_id,
-                "component_id": "ROTARY_ACTUATOR",
-                "center": center,
-                "outer_radius": outer_radius,
-                "inner_radius": inner_radius,
-                "height": height,
-                "axis_point": center,
-                "axis_direction": [0, 0, 1],
-                "rotation_angle": 0,
-                "motion_limit": [-90, 90],
-                "clearance": 2,
-                "source_authority": "concept",
-                "layer": "0",
-            },
-        )
+        data = {
+            "feature_id": feature_id,
+            "component_id": "ROTARY_ACTUATOR",
+            "center": center,
+            "outer_radius": outer_radius,
+            "inner_radius": inner_radius,
+            "height": height,
+            "axis_point": center,
+            "axis_direction": [0, 0, 1],
+            "rotation_angle": 0,
+            "motion_limit": [-90, 90],
+            "clearance": 2,
+            "source_authority": "concept",
+            "layer": "0",
+        }
+        result = await backend.product_create_feature("rotary_layer", data)
         if not result.ok or result.payload.get("diff"):
             raise RuntimeError(result.to_dict())
         await wait_for_recording()
@@ -181,46 +156,43 @@ async def main(
     for handle, color in zip(indicators, indicator_colors):
         colors[handle] = color
 
-    for handle, color in colors.items():
-        entity = document.HandleToObject(handle)
-        try:
-            true_color = entity.TrueColor
-            true_color.SetRGB(*color)
-            entity.TrueColor = true_color
-        except Exception:
-            entity.Color = 5
+    styled = await backend.apply_presentation_style(colors, "ShadedWithEdges")
+    if not styled.ok:
+        raise RuntimeError(styled.to_dict())
+    await wait_for_recording()
 
-    document.SendCommand("_.VSCURRENT _ShadedWithEdges ")
-    if not backend._wait_for_autocad_idle(timeout=8.0):
-        raise RuntimeError("AutoCAD did not finish changing visual style")
+    fitted = await backend.zoom_extents()
+    if not fitted.ok:
+        raise RuntimeError(fitted.to_dict())
 
     output.parent.mkdir(parents=True, exist_ok=True)
-    rendered = await backend.product_render_view(
-        "iso",
-        str(output.resolve()),
-        {
-            "paper": "A3",
-            "orientation": "landscape",
-            "dpi": 180,
-            "framing_fill": 0.78,
-            "plot_style": "",
-            "force": True,
-        },
-    )
-    if not rendered.ok:
-        raise RuntimeError(rendered.to_dict())
-    if rotate:
-        await rotate_view(
-            document,
-            steps=rotation_steps,
-            duration=rotation_seconds,
+    if render_preview:
+        rendered = await backend.product_render_view(
+            "iso",
+            str(output.resolve()),
+            {
+                "paper": "A3",
+                "orientation": "landscape",
+                "dpi": 180,
+                "framing_fill": 0.78,
+                "plot_style": "",
+                "force": True,
+            },
         )
-    print({"ok": True, "preview": str(output.resolve()), "document_left_open": keep_open})
+        if not rendered.ok:
+            raise RuntimeError(rendered.to_dict())
+    print(
+        {
+            "ok": True,
+            "preview": str(output.resolve()) if render_preview else None,
+            "document_left_open": keep_open,
+        }
+    )
 
     if not keep_open:
-        document.SendCommand("_.VSCURRENT _2dwireframe ")
-        backend._wait_for_autocad_idle(timeout=5.0)
-        document.Close(False)
+        closed = await backend.drawing_close(save=False)
+        if not closed.ok:
+            raise RuntimeError(closed.to_dict())
 
 
 if __name__ == "__main__":
@@ -238,27 +210,27 @@ if __name__ == "__main__":
         help="draw in the current empty document instead of creating a new document",
     )
     parser.add_argument(
-        "--rotate",
+        "--no-render",
         action="store_true",
-        help="slowly rotate the final 3D viewport for a full-angle presentation",
+        help="skip PDF/PNG preview rendering and leave only the live AutoCAD model",
     )
-    parser.add_argument("--rotation-steps", type=int, default=48)
-    parser.add_argument("--rotation-seconds", type=float, default=8.0)
     args = parser.parse_args()
     if args.record:
-        os.environ["AUTOCAD_MCP_WINDOW_MODE"] = "foreground"
+        os.environ["AUTOCAD_MCP_WINDOW_MODE"] = "recording"
         os.environ["AUTOCAD_MCP_ACTIVATE_ON_DRAW"] = "true"
     else:
         os.environ.setdefault("AUTOCAD_MCP_WINDOW_MODE", "visible")
         os.environ.setdefault("AUTOCAD_MCP_ACTIVATE_ON_DRAW", "false")
+    # The final fixed-camera render handles framing; per-entity ZoomExtents adds
+    # unnecessary COM traffic during a fast presentation build.
+    os.environ["AUTOCAD_MCP_AUTO_FIT"] = "false"
     asyncio.run(
         main(
             Path(args.output),
             pause=max(0.0, args.pause),
             keep_open=args.keep_open or args.record,
             reuse_active=args.reuse_active,
-            rotate=args.rotate,
-            rotation_steps=args.rotation_steps,
-            rotation_seconds=args.rotation_seconds,
+            render_preview=not args.no_render and not args.record,
+            recording=args.record,
         )
     )

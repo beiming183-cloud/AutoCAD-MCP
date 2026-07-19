@@ -104,6 +104,8 @@ def normalize_ezdxf_entity(entity: Any) -> dict[str, Any]:
         )
     elif entity_type == "HATCH":
         data["pattern"] = entity.dxf.get("pattern_name", "")
+        data["angle"] = _number(entity.dxf.get("pattern_angle", 0.0))
+        data["scale"] = _number(entity.dxf.get("pattern_scale", 1.0))
         try:
             data["area"] = _number(entity.area)
         except Exception:

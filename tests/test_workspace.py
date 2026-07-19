@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 from autocad_mcp.workspace import (
+    cleanup_test_job_artifacts,
     create_job,
     ensure_workspace,
     resolve_output_target,
@@ -91,3 +92,23 @@ def test_sanitize_name_and_workspace_info(monkeypatch, tmp_path):
 
     assert sanitize_name(' bad<name>:01 ') == "bad_name__01"
     assert workspace_info()["root"] == str(root.resolve())
+
+
+def test_cleanup_test_job_deletes_artifacts_but_keeps_records(monkeypatch, tmp_path):
+    root = tmp_path / "workspace"
+    monkeypatch.setenv("AUTOCAD_MCP_OUTPUT_ROOT", str(root))
+    created = create_job("temporary-test")
+    drawing = created["drawings"] / "test.dwg"
+    preview = created["previews"] / "test.png"
+    log = created["logs"] / "run.log"
+    drawing.write_bytes(b"DWG")
+    preview.write_bytes(b"PNG")
+    log.write_text("kept", encoding="utf-8")
+
+    report = cleanup_test_job_artifacts(created["job_id"])
+
+    assert report["deleted_count"] == 2
+    assert not drawing.exists()
+    assert not preview.exists()
+    assert log.read_text(encoding="utf-8") == "kept"
+    assert (created["reports"] / "artifact-cleanup.json").is_file()
