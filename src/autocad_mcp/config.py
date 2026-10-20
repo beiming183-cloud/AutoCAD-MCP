@@ -527,6 +527,11 @@ def _autostart_autocad(
     stability reads, persists evidence, and trips a cooldown circuit breaker
     after a reproducible startup failure.
     """
+    from autocad_mcp.safety import dxf_safe_mode_enabled
+
+    if dxf_safe_mode_enabled():
+        log.warning("autocad_autostart_blocked_by_ngoc_viet_dxf_safe_mode")
+        return None
     if not WIN32_AVAILABLE or not _env_flag("AUTOCAD_MCP_AUTOSTART"):
         return None
 
@@ -937,6 +942,11 @@ def detect_backend() -> str:
 
     Raises RuntimeError with actionable message if explicit backend fails.
     """
+    from autocad_mcp.safety import dxf_safe_mode_enabled
+
+    if dxf_safe_mode_enabled():
+        log.info("ngoc_viet_dxf_safe_mode_forces_ezdxf")
+        return "ezdxf"
     backend_env = _current_backend_env()
     _write_debug_snapshot(backend_env)
 

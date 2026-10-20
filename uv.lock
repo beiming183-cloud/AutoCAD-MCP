@@ -53,35 +53,37 @@ version = "4.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "ezdxf" },
-    { name = "matplotlib" },
     { name = "mcp", extra = ["cli"] },
-    { name = "pillow" },
-    { name = "pymupdf" },
     { name = "pywin32", marker = "sys_platform == 'win32'" },
-    { name = "structlog" },
 ]
 
 [package.dev-dependencies]
 dev = [
+    { name = "dxfgrabber" },
+    { name = "matplotlib" },
+    { name = "pillow" },
+    { name = "pymupdf" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
+    { name = "structlog" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "ezdxf", specifier = ">=0.18" },
-    { name = "matplotlib", specifier = ">=3.7" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.2.1,<2.0" },
-    { name = "pillow", specifier = ">=10.0.0" },
-    { name = "pymupdf", specifier = ">=1.24.0" },
     { name = "pywin32", marker = "sys_platform == 'win32'", specifier = ">=305" },
-    { name = "structlog", specifier = ">=24.0.0" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "dxfgrabber", specifier = ">=1.0.1,<2.0" },
+    { name = "matplotlib", specifier = ">=3.7" },
+    { name = "pillow", specifier = ">=10.0.0" },
+    { name = "pymupdf", specifier = ">=1.24.0" },
     { name = "pytest", specifier = ">=7.0" },
     { name = "pytest-asyncio", specifier = ">=0.21" },
+    { name = "structlog", specifier = ">=24.0.0" },
 ]
 
 [[package]]
@@ -427,6 +429,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/a9/95/a3dbbb5028f35eafb79008e7522a75244477d2838f38cbb722248dabc2a8/cycler-0.12.1.tar.gz", hash = "sha256:88bb128f02ba341da8ef447245a9e138fae777f6a23943da4540077d3601eb1c", size = 7615, upload-time = "2023-10-07T05:32:18.335Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/e7/05/c19819d5e3d95294a6f5947fb9b9629efb316b96de511b418c53d245aae6/cycler-0.12.1-py3-none-any.whl", hash = "sha256:85cef7cff222d8644161529808465972e51340599459b8ac3ccbac5a854e0d30", size = 8321, upload-time = "2023-10-07T05:32:16.783Z" },
+]
+
+[[package]]
+name = "dxfgrabber"
+version = "1.0.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/01/f9/33f2c36f49b24ffae6d7be973f347d8846040a42c38634e8e96aa93b2d32/dxfgrabber-1.0.1.zip", hash = "sha256:329ddb5fa5a11c0fd4b83b14615686c62924a323ccf4ef2e7bc5771788d220a1", size = 114274, upload-time = "2020-01-01T05:53:46.971Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b9/23/54940748d3887e9f0939d839fac2699b9b3fb36d650ee93515f78cbe4d2a/dxfgrabber-1.0.1-py2.py3-none-any.whl", hash = "sha256:b54c6f93178551af5241dc0fe31bdb3a3ac61deb064bbcc5a0cebf769d74899a", size = 34595, upload-time = "2020-01-01T05:53:44.859Z" },
 ]
 
 [[package]]

@@ -19,10 +19,6 @@ classifiers = [
 dependencies = [
     "mcp[cli]>=1.2.1,<2.0",
     "ezdxf>=0.18",
-    "matplotlib>=3.7",
-    "Pillow>=10.0.0",
-    "PyMuPDF>=1.24.0",
-    "structlog>=24.0.0",
     "pywin32>=305; sys_platform == 'win32'",
 ]
 
@@ -33,13 +29,19 @@ Issues = "https://github.com/beiming183-cloud/AutoCAD-MCP/issues"
 Source = "https://github.com/beiming183-cloud/AutoCAD-MCP"
 
 [project.scripts]
-autocad-mcp = "autocad_mcp.server:main"
-autocad-mcp-supervisor = "autocad_mcp.supervisor:main"
+autocad-mcp = "autocad_mcp.safe_server:main"
+ngoc-viet-autocad-mcp = "autocad_mcp.safe_server:main"
+ngoc-viet-autocad-live-mcp = "autocad_mcp.live_autocad_server:main"
 
 [dependency-groups]
 dev = [
+    "dxfgrabber>=1.0.1,<2.0",
+    "matplotlib>=3.7",
+    "Pillow>=10.0.0",
+    "PyMuPDF>=1.24.0",
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
+    "structlog>=24.0.0",
 ]
 
 [build-system]

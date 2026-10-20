@@ -29,6 +29,8 @@ env/
 ENV/
 .venv/
 .venv-win/
+.sandbox-venv/
+.test-tmp/
 .mplconfig/
 
 # IDE

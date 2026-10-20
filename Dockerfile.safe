@@ -1,0 +1,19 @@
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    NGOC_VIET_DXF_ROOT=/workspace/dxf
+
+RUN useradd --create-home --uid 10001 mcp
+WORKDIR /app
+COPY pyproject.toml uv.lock README.md LICENSE ./
+COPY src ./src
+RUN python -m pip install --no-cache-dir --upgrade pip==26.2.1 uv==0.12.18 && \
+    uv sync --frozen --no-dev --no-editable
+
+ENV PATH="/app/.venv/bin:${PATH}"
+
+RUN mkdir -p /workspace/dxf && chown -R mcp:mcp /workspace /app
+USER 10001:10001
+VOLUME ["/workspace/dxf"]
+ENTRYPOINT ["ngoc-viet-autocad-mcp"]

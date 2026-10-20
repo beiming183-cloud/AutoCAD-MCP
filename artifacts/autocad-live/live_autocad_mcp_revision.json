@@ -1,0 +1,200 @@
+{
+  "status": "PASS",
+  "phase": "revision",
+  "scope": "fixed allowlisted AutoCAD ActiveX operations; no SendCommand",
+  "available_tools": [
+    "autocad_create_test_plate",
+    "autocad_inspect_test_drawing",
+    "autocad_modify_hole_revision",
+    "autocad_status"
+  ],
+  "calls": [
+    {
+      "tool": "autocad_status",
+      "arguments": {},
+      "result": {
+        "connected": true,
+        "application": "AutoCAD",
+        "version": "24.0s (LMS Tech)",
+        "active_document": "live_square_200_center20_4edge10.dxf",
+        "root": "D:\\CHAT GPT WORK\\CODEX\\AutocadMCP\\upstream\\beiming183-cloud-AutoCAD-MCP\\artifacts\\autocad-live",
+        "transport": "ActiveX object model; SendCommand forbidden"
+      }
+    },
+    {
+      "tool": "autocad_inspect_test_drawing",
+      "arguments": {
+        "name": "live_square_200_center20_4edge10.dxf"
+      },
+      "result": {
+        "document": "live_square_200_center20_4edge10.dxf",
+        "entity_count": 6,
+        "entity_counts": {
+          "LWPOLYLINE": 1,
+          "CIRCLE": 5
+        },
+        "entities": [
+          {
+            "type": "LWPOLYLINE",
+            "layer": "CUT_OUTER",
+            "closed": true,
+            "points_mm": [
+              [
+                0.0,
+                0.0
+              ],
+              [
+                200.0,
+                0.0
+              ],
+              [
+                200.0,
+                200.0
+              ],
+              [
+                0.0,
+                200.0
+              ]
+            ]
+          },
+          {
+            "type": "CIRCLE",
+            "layer": "CUT_INNER",
+            "center_mm": [
+              100.0,
+              100.0
+            ],
+            "radius_mm": 10.0
+          },
+          {
+            "type": "CIRCLE",
+            "layer": "CUT_INNER",
+            "center_mm": [
+              100.0,
+              20.0
+            ],
+            "radius_mm": 5.0
+          },
+          {
+            "type": "CIRCLE",
+            "layer": "CUT_INNER",
+            "center_mm": [
+              100.0,
+              180.0
+            ],
+            "radius_mm": 5.0
+          },
+          {
+            "type": "CIRCLE",
+            "layer": "CUT_INNER",
+            "center_mm": [
+              20.0,
+              100.0
+            ],
+            "radius_mm": 5.0
+          },
+          {
+            "type": "CIRCLE",
+            "layer": "CUT_INNER",
+            "center_mm": [
+              180.0,
+              100.0
+            ],
+            "radius_mm": 5.0
+          }
+        ]
+      }
+    },
+    {
+      "tool": "autocad_modify_hole_revision",
+      "arguments": {
+        "source_name": "live_square_200_center20_4edge10.dxf",
+        "output_name": "live_square_200_center24_4edge10_rev2.dxf",
+        "center_x_mm": 100.0,
+        "center_y_mm": 100.0,
+        "new_diameter_mm": 24.0
+      },
+      "result": {
+        "document": "live_square_200_center24_4edge10_rev2.dxf",
+        "entity_count": 6,
+        "entity_counts": {
+          "LWPOLYLINE": 1,
+          "CIRCLE": 5
+        },
+        "entities": [
+          {
+            "type": "LWPOLYLINE",
+            "layer": "CUT_OUTER",
+            "closed": true,
+            "points_mm": [
+              [
+                0.0,
+                0.0
+              ],
+              [
+                200.0,
+                0.0
+              ],
+              [
+                200.0,
+                200.0
+              ],
+              [
+                0.0,
+                200.0
+              ]
+            ]
+          },
+          {
+            "type": "CIRCLE",
+            "layer": "CUT_INNER",
+            "center_mm": [
+              100.0,
+              100.0
+            ],
+            "radius_mm": 12.0
+          },
+          {
+            "type": "CIRCLE",
+            "layer": "CUT_INNER",
+            "center_mm": [
+              100.0,
+              20.0
+            ],
+            "radius_mm": 5.0
+          },
+          {
+            "type": "CIRCLE",
+            "layer": "CUT_INNER",
+            "center_mm": [
+              100.0,
+              180.0
+            ],
+            "radius_mm": 5.0
+          },
+          {
+            "type": "CIRCLE",
+            "layer": "CUT_INNER",
+            "center_mm": [
+              20.0,
+              100.0
+            ],
+            "radius_mm": 5.0
+          },
+          {
+            "type": "CIRCLE",
+            "layer": "CUT_INNER",
+            "center_mm": [
+              180.0,
+              100.0
+            ],
+            "radius_mm": 5.0
+          }
+        ],
+        "modified": true,
+        "source": "live_square_200_center20_4edge10.dxf",
+        "file": "live_square_200_center24_4edge10_rev2.dxf"
+      }
+    }
+  ]
+}

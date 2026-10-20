@@ -2165,6 +2165,11 @@ class FileIPCBackend(AutoCADBackend):
 
     def _type_command(self, command: str) -> bool:
         """Post a command-line expression to the active AutoCAD session."""
+        from autocad_mcp.safety import autocad_command_transport_allowed
+
+        if not autocad_command_transport_allowed():
+            log.warning("autocad_command_transport_blocked", transport="window-message")
+            return False
         if self._send_command_via_com(command):
             return True
 
@@ -2200,6 +2205,11 @@ class FileIPCBackend(AutoCADBackend):
     @sta_sync_method("command.send")
     def _send_command_via_com(self, command: str) -> bool:
         """Use full AutoCAD's COM API before falling back to window messages."""
+        from autocad_mcp.safety import autocad_command_transport_allowed
+
+        if not autocad_command_transport_allowed():
+            log.warning("autocad_command_transport_blocked", transport="com-SendCommand")
+            return False
         if sys.platform != "win32":
             return False
         deadline = time.time() + 5.0

@@ -1,0 +1,17 @@
+services:
+  ngoc-viet-dxf-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.safe
+    network_mode: none
+    read_only: true
+    user: "10001:10001"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
+    volumes:
+      - ./staging/container-dxf:/workspace/dxf
+    stdin_open: true

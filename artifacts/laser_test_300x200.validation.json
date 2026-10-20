@@ -1,0 +1,183 @@
+{
+  "status": "PASS",
+  "scope": "headless DXF staging only; AutoCAD and laser hardware were not contacted",
+  "file": "D:\\CHAT GPT WORK\\CODEX\\AutocadMCP\\upstream\\beiming183-cloud-AutoCAD-MCP\\artifacts\\laser_test_300x200.dxf",
+  "sha256": "05c018f659ec14053ddc50b17e512fcc35d1cb70311a41502f3ccb67c67103a8",
+  "generator_validation": {
+    "valid": true,
+    "checks": {
+      "units_mm": true,
+      "entity_count_5": true,
+      "one_outer_polyline": true,
+      "outer_closed": true,
+      "outer_dimensions": true,
+      "four_holes": true,
+      "hole_diameter": true,
+      "hole_positions": true,
+      "layers": true,
+      "no_duplicates": true,
+      "no_unsupported_entities": true,
+      "no_dxf_audit_errors": true,
+      "five_closed_contours": true
+    },
+    "expected": {
+      "width_mm": 300.0,
+      "height_mm": 200.0,
+      "hole_diameter_mm": 10.0,
+      "edge_offset_mm": 20.0
+    },
+    "inspection": {
+      "name": "laser_test_300x200.dxf",
+      "path": "D:\\CHAT GPT WORK\\CODEX\\AutocadMCP\\upstream\\beiming183-cloud-AutoCAD-MCP\\artifacts\\laser_test_300x200.dxf",
+      "sha256": "05c018f659ec14053ddc50b17e512fcc35d1cb70311a41502f3ccb67c67103a8",
+      "dxf_version": "AC1027",
+      "units_code": 4,
+      "units": "mm",
+      "entity_count": 5,
+      "entity_counts": {
+        "LWPOLYLINE": 1,
+        "CIRCLE": 4
+      },
+      "layers": {
+        "CUT_OUTER": 1,
+        "CUT_INNER": 4
+      },
+      "closed_contours": 5,
+      "duplicate_count": 0,
+      "unsupported_entity_handles": [],
+      "audit_error_count": 0,
+      "audit_fix_count": 0,
+      "total_cut_length_mm": 1125.6637061435913,
+      "geometry": [
+        {
+          "type": "LWPOLYLINE",
+          "layer": "CUT_OUTER",
+          "closed": true,
+          "points_mm": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              300.0,
+              0.0
+            ],
+            [
+              300.0,
+              200.0
+            ],
+            [
+              0.0,
+              200.0
+            ]
+          ],
+          "length_mm": 1000.0
+        },
+        {
+          "type": "CIRCLE",
+          "layer": "CUT_INNER",
+          "center_mm": [
+            20.0,
+            20.0
+          ],
+          "radius_mm": 5.0
+        },
+        {
+          "type": "CIRCLE",
+          "layer": "CUT_INNER",
+          "center_mm": [
+            280.0,
+            20.0
+          ],
+          "radius_mm": 5.0
+        },
+        {
+          "type": "CIRCLE",
+          "layer": "CUT_INNER",
+          "center_mm": [
+            280.0,
+            180.0
+          ],
+          "radius_mm": 5.0
+        },
+        {
+          "type": "CIRCLE",
+          "layer": "CUT_INNER",
+          "center_mm": [
+            20.0,
+            180.0
+          ],
+          "radius_mm": 5.0
+        }
+      ]
+    },
+    "created": true,
+    "path": "D:\\CHAT GPT WORK\\CODEX\\AutocadMCP\\upstream\\beiming183-cloud-AutoCAD-MCP\\artifacts\\laser_test_300x200.dxf"
+  },
+  "independent_validation": {
+    "library": "dxfgrabber",
+    "library_version": "1.0.1",
+    "valid": true,
+    "checks": {
+      "units_mm": true,
+      "entity_count_5": true,
+      "one_outer_polyline": true,
+      "outer_closed": true,
+      "outer_300x200": true,
+      "four_holes": true,
+      "hole_diameter_10": true,
+      "hole_positions_20_from_edges": true,
+      "layers": true
+    },
+    "units_code": 4,
+    "entity_count": 5,
+    "layers": [
+      "CUT_INNER",
+      "CUT_OUTER"
+    ],
+    "outer_points_mm": [
+      [
+        0.0,
+        0.0
+      ],
+      [
+        300.0,
+        0.0
+      ],
+      [
+        300.0,
+        200.0
+      ],
+      [
+        0.0,
+        200.0
+      ]
+    ],
+    "outer_closed": true,
+    "hole_centres_mm": [
+      [
+        20.0,
+        20.0
+      ],
+      [
+        20.0,
+        180.0
+      ],
+      [
+        280.0,
+        20.0
+      ],
+      [
+        280.0,
+        180.0
+      ]
+    ],
+    "hole_radii_mm": [
+      5.0,
+      5.0,
+      5.0,
+      5.0
+    ],
+    "total_cut_length_mm": 1125.6637061435918
+  }
+}

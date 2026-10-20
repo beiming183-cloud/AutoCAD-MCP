@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+.sandbox-venv
+.test-tmp
+.pytest_cache
+__pycache__
+*.pyc
+artifacts
+docs
+examples
+lisp-code
+native
+skills
+tests
+tools

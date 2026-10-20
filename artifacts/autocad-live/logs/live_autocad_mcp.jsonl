@@ -1,0 +1,5 @@
+{"entity_count": 6, "file": "live_square_200_center20_4edge10.dxf", "operation": "create_plate", "status": "PASS", "timestamp_utc": "2026-10-20T08:40:36.120581+00:00"}
+{"entity_count": 6, "file": "live_square_200_center20_4edge10.dxf", "operation": "inspect_managed", "status": "PASS", "timestamp_utc": "2026-10-20T08:40:39.071252+00:00"}
+{"entity_count": 6, "file": "live_square_200_center20_4edge10.dxf", "operation": "inspect_managed", "status": "PASS", "timestamp_utc": "2026-10-20T08:44:48.845420+00:00"}
+{"entity_count": 6, "file": "live_square_200_center20_4edge10.dxf", "operation": "inspect_managed", "status": "PASS", "timestamp_utc": "2026-10-20T09:24:37.831930+00:00"}
+{"file": "live_square_200_center24_4edge10_rev2.dxf", "operation": "modify_hole_revision", "source": "live_square_200_center20_4edge10.dxf", "status": "PASS", "timestamp_utc": "2026-10-20T09:24:40.279771+00:00"}
